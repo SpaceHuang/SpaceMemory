@@ -271,3 +271,13 @@ R13 四项发布阻断（B9-1/2/3/4）**全部关闭，未发现新阻断，批�
 
 **验证基线**：`cargo check --workspace --all-targets` 零警告；`cargo test --workspace` 连续两遍 **181 项全绿**（175 + mem-assets 单测 4 + r14 e2e 2）；`cargo build --release` 通过；发布物组装脚本实跑冒烟通过。测试工具教训再录：python heredoc 转义致测试文件损坏两处（换行断裂、路径建错位）——已按既有纪律改用 Edit 工具修复。
 **未实测边界（继承）**：USN 提权分支（停用中，开放问题39）、macOS 真机、真实断电；发布物仅在 Windows x86_64 组装验收。
+
+---
+
+## 渠道与 CI 落地（2026-11-07，用户裁决）
+
+**裁决**（开放问题40 的渠道承诺部分据此收口）：正式渠道 = **GitHub Releases**；CI = **自写精简 workflow**（.github/workflows/ci.yml——windows/macos 测试矩阵 + tag 触发的发布组装复用 scripts/package-release.sh 契约）；仓库 SpaceHuang/SpaceMemory（Public，已创建）。理由与权衡见本轮讨论（cargo-dist 留作 v1.2 可选升级——产物契约已由脚本与 r14 测试钉死，迁移无损；NSIS 按需）。
+
+**当前状态**：git init -b main + 初始提交（132 文件含 CI workflow）本地完成；push 因本机到 github.com:443 网络受阻挂起（gh API 可通、传输被重置；仓库已建为空）——网络恢复后 `git push -u origin main` 即触发首轮测试矩阵。发布 job 静默待首个 `v*` tag（crate 版本号口径 0.1.0 vs 文档 v1.1 待用户定版）。
+
+**本地先行投入使用**（用户指示）：dist 产物重跑冒烟后装入 `%LOCALAPPDATA%\Programs\mem`（mem.exe + builtin-types 同级）并追加用户 PATH；真实用户店 `~/.agent-memory` 初始化（principal=spacehuang，asset_source=external 确认走安装目录播种）；CLI brief/add/find 与 stdio MCP 前端在安装版上验证通过。升级路径：改代码后重跑 scripts/package-release.sh，覆盖安装目录。
