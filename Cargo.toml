@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# ---- 内部 crate ----
+mem-core = { path = "crates/mem-core" }
+mem-schema = { path = "crates/mem-schema" }
+mem-index = { path = "crates/mem-index" }
+mem-git = { path = "crates/mem-git" }
+mem-mcp = { path = "crates/mem-mcp" }
+mem-assets = { path = "crates/mem-assets" }
+
+# ---- 机制层基础依赖（脚手架阶段仅引入立即需要的）----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v7", "rng"] }
+thiserror = "2"
+
+# ---- 后续实施逐步引入（设计文档 §6 依赖与许可）----
+# tokio        —— 异步运行时 / named pipe：sidecar、单实例握手（D2）
+# clap         —— CLI 命令面（§3.3）
+# rusqlite     —— 派生索引 index.sqlite（bundled；D5）
+# jsonschema   —— draft 2020-12 校验 + x-* 自定义关键字词汇表（D19）
+# rmcp         —— MCP 前端（3.0 stable，MIT；schema 携带 expect 全令牌）
+# notify       —— watcher 便利层；非新鲜度依据（D5/红线21）
+# ignore       —— 目录扫描：stat 枚举、直读回退（D5）
+# git2         —— Git trait 第二阶段实现（D4：CLI 子进程首发）
+# unicode 归一与 casefold 的具体 crate 随 paths.rs 实施定（D19 键字符集规则）
+
+[profile.release]
+# 面向 Windows / macOS 桌面分发的默认优化；后续按需细化
+lto = "thin"

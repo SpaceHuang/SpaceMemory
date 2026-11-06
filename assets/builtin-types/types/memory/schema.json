@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "memory",
+  "description": "记忆条目（lenient 分档示例，R8.6）",
+  "type": "object",
+  "x-grade": "lenient",
+  "x-unique-key": [],
+  "x-dag": false,
+  "x-topics": ["topic"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "topic": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "x-ref": { "target_type": "topic", "existence": true }, "description": "主题面 topic 记录 ID（信封镜像 rel=topic）" },
+    "salience": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "显著性 0–1（可用衰减，由维护例程提案）" }
+  },
+  "required": ["title"]
+}

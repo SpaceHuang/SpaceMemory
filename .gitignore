@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# 发布物组装产物（scripts/package-release.sh 的输出，不入库）
+/dist
+
+# 编辑器 / 操作系统
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本地杂项（数据目录 ~/.agent-memory 不在本仓库内，天然隔离）
+*.log

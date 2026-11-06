@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "project",
+  "description": "项目实体（D9 第一类建模）",
+  "type": "object",
+  "x-grade": "strict",
+  "x-unique-key": ["slug"],
+  "x-dag": false,
+  "x-topics": [],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["active", "paused", "archived"] },
+    "root_path": { "type": ["string", "null"], "description": "本地工作目录（信息性；不参与身份推断，红线11）" }
+  },
+  "required": ["slug", "title", "status"]
+}

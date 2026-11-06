@@ -1,0 +1,46 @@
+# CI：三支柱——(1) 测试矩阵（设计目标平台 Windows/macOS，§6 依赖选型）；
+# (2) tag 触发的发布物组装（复用已验收契约脚本 scripts/package-release.sh——
+# exe + builtin-types/ 同级 + 冒烟验收，禁止只发裸 exe）；(3) 零额外工具链
+#（正式渠道 = GitHub Releases，裁决 2026-11-07；cargo-dist 留作后续可选升级，
+# 产物契约已由脚本与 r14 测试钉死，迁移无损）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace
+
+  release:
+    # 仅 tag 触发；测试矩阵全绿才组装发布物（渠道：GitHub Releases）。
+    # macOS tarball/.app 组装待 macOS 外部验收（历轮继承）——届时在此加 macos job。
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/package-release.sh
+      - name: 上传 GitHub Release（zip 为正式发布物）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" (Get-Item dist/*.zip) --generate-notes --title "$env:GITHUB_REF_NAME"
+        shell: pwsh

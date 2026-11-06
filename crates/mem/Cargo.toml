@@ -1,0 +1,32 @@
+[package]
+name = "mem"
+description = "mem 多调用二进制：CLI 子命令 / mem serve（sidecar）/ mem mcp 三前端合一（D7）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mem"
+path = "src/main.rs"
+
+[dependencies]
+mem-core.workspace = true
+mem-assets.workspace = true
+mem-schema.workspace = true
+mem-git.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+mem-mcp.workspace = true
+mem-index.workspace = true
+
+# 实施时引入（§8-6/8-7）：
+# mem-mcp —— MCP 前端
+# tokio —— serve（sidecar）运行时
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

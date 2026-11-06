@@ -1,0 +1,14 @@
+[package]
+name = "mem-assets"
+description = "播种资产字节载体：混合分发的嵌入兜底；只搬运、永不 parse（红线1 裁决，见 assets/builtin-types/README.md）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# 刻意零依赖：本 crate 是纯数据载体——不依赖 mem-core，也不被机制逻辑引用其内容。
+# 唯一消费者：mem（mem init 播种）。
+
+[dev-dependencies]
+tempfile = "3"

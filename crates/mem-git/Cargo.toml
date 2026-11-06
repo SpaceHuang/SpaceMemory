@@ -1,0 +1,13 @@
+[package]
+name = "mem-git"
+description = "Git 基座：历史/审计/撤销/多机同步；path-scoped 提交，事件日志同批提交（D4）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mem-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

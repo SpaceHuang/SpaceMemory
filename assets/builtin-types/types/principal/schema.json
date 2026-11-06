@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "principal",
+  "description": "执行体身份（D9/红线12；经类型声明引入 = 红线13 自举检验）",
+  "type": "object",
+  "x-grade": "strict",
+  "x-unique-key": ["slug"],
+  "x-dag": false,
+  "x-topics": [],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "label": { "type": "string", "minLength": 1, "description": "展示名，如 codex_main / zcode_main" },
+    "host": { "type": ["string", "null"], "description": "宿主环境描述（信息性）" },
+    "description": { "type": ["string", "null"], "description": "该执行体的职责边界" }
+  },
+  "required": ["slug", "label"]
+}

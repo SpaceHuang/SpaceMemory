@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "view",
+  "description": "视图：角色的信息可见性是声明式数据（D10/红线11）",
+  "type": "object",
+  "x-grade": "strict",
+  "x-unique-key": ["slug"],
+  "x-dag": false,
+  "x-topics": [],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "title": { "type": "string", "minLength": 1 },
+    "filter": {
+      "type": "object",
+      "description": "查询模板：类型 × 引用 × principal × 时间（引用一律填 uuid v7）",
+      "properties": {
+        "types": { "type": "array", "items": { "type": "string" }, "description": "限定类型标识" },
+        "refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "rel": { "type": "string" }, "target": { "type": "string", "pattern": "^[0-9a-f-]{36}$" } },
+            "required": ["rel", "target"]
+          },
+          "description": "要求记录携带的引用（rel+target）"
+        },
+        "principals": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f-]{36}$" } },
+        "since": { "type": ["string", "null"], "description": "RFC 3339；只看此后 modified 的记录" }
+      }
+    },
+    "description": { "type": ["string", "null"] }
+  },
+  "required": ["slug", "title", "filter"]
+}

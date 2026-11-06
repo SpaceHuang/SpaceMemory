@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>给 AI 的外置档案室 —— SpaceMemory 架构导览</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --paper: #f5f5f5;
+    --paper-2: #ececec;
+    --ink: #2d3142;
+    --muted: #4f5d75;
+    --soft: #5a6580;
+    --rule: rgba(45,49,66,0.12);
+    --accent: #bf4520;
+    --accent-tint: rgba(191,69,32,0.08);
+    --link: #2e5aa8;
+    --sans: system-ui, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+    --serif: Georgia, 'Times New Roman', 'Songti SC', SimSun, serif;
+    --mono: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  }
+  body {
+    font-family: var(--sans);
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.8;
+    font-size: 16px;
+  }
+  .page { max-width: 1120px; margin: 0 auto; padding: 56px 24px 96px; }
+
+  .kicker {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-size: clamp(1.9rem, 3.5vw, 2.6rem);
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+    margin-bottom: 16px;
+  }
+  .lede { font-size: 1.08rem; max-width: 46em; margin-bottom: 8px; }
+  .lede strong { color: var(--accent); font-weight: 600; }
+  .howto {
+    margin-top: 20px; padding: 14px 20px;
+    border: 1px solid var(--rule); border-radius: 6px;
+    background: #fff; font-size: 0.94rem; color: var(--muted);
+  }
+
+  h2 {
+    font-family: var(--serif);
+    font-size: 1.55rem;
+    font-weight: 400;
+    margin: 72px 0 16px;
+    padding-top: 28px;
+    border-top: 1px solid var(--rule);
+  }
+  h3 { font-size: 1.06rem; font-weight: 600; margin: 40px 0 8px; }
+  p { max-width: 46em; margin-bottom: 12px; }
+  p strong { font-weight: 600; }
+  .muted { color: var(--muted); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.85em;
+    background: var(--paper-2);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .note {
+    max-width: 46em;
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: 1.02rem;
+    color: var(--muted);
+    padding-left: 16px;
+    border-left: 2px solid var(--accent);
+    margin: 16px 0 4px;
+  }
+
+  .diagram-frame {
+    margin: 24px 0 8px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .diagram-container { width: 100%; overflow-x: auto; }
+  svg { width: 100%; display: block; }
+  @media print {
+    .diagram-container { overflow-x: visible; }
+    svg { min-width: 0 !important; }
+  }
+  .cap {
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin: 20px 0;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 16px 20px 14px;
+  }
+  .card .cn { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .card .role { font-weight: 600; margin: 2px 0 6px; }
+  .card p { font-size: 0.9rem; color: var(--muted); margin-bottom: 6px; max-width: none; }
+  .card .loc { font-family: var(--mono); font-size: 11px; color: var(--soft); }
+
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; background: #fff; }
+  th, td { border: 1px solid var(--rule); padding: 8px 14px; text-align: left; font-size: 0.92rem; }
+  th { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; color: var(--muted); background: var(--paper-2); }
+  td b { font-weight: 600; }
+
+  footer {
+    margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--rule);
+    font-size: 0.88rem; color: var(--muted); max-width: 52em;
+  }
+  footer a { color: var(--link); }
+
+  /* ---- SVG 文本角色 ---- */
+  .nn { font-family: var(--sans); font-size: 12px; font-weight: 600; fill: var(--ink); text-anchor: middle; }
+  .nn-acc { font-family: var(--sans); font-size: 12px; font-weight: 600; fill: var(--accent); text-anchor: middle; }
+  .ns { font-family: var(--mono); font-size: 9px; fill: var(--muted); text-anchor: middle; }
+  .nz { font-family: var(--sans); font-size: 12px; font-weight: 500; fill: var(--soft); text-anchor: start; }
+  .ac { font-family: var(--sans); font-size: 12px; font-weight: 500; fill: var(--soft); text-anchor: middle; }
+  .ae { font-family: var(--mono); font-size: 8px; fill: var(--soft); text-anchor: middle; letter-spacing: 0.06em; }
+  .lg { font-family: var(--sans); font-size: 12px; fill: var(--muted); text-anchor: start; }
+  .lgk { font-family: var(--mono); font-size: 9px; fill: var(--muted); text-anchor: start; letter-spacing: 0.1em; }
+</style>
+</head>
+<body>
+<main class="page">
+
+<header>
+  <p class="kicker">SpaceMemory · 架构导览</p>
+  <h1>给 AI 的外置档案室</h1>
+  <p class="lede">AI 助手有个老毛病：<strong>换个对话窗口就失忆</strong>。这个项目（SpaceMemory）做的事一句话就能说完——给 AI 配一间随身的档案室：无论你换多少个窗口、用哪家的 AI 工具，它都能到同一个地方查资料、存进度、接着上次干。</p>
+  <div class="howto">本页只讲三件事：<b>整体长什么样</b>（图 1）→ <b>几件日常事务怎么办</b>（图 2–5：写、读、交接、自愈）→ <b>屋里有哪些零件</b>（图 6）。图较宽时可在图内左右滑动。</div>
+</header>
+
+<!-- ============ 1. 整体架构 ============ -->
+<h2>一、整体架构：一间屋子，一个管理员，几根插头</h2>
+<p>把这间"档案室"拆开，核心只有三样东西：</p>
+<p><strong>① 数据目录</strong>——一间真正的屋子：硬盘上一个普通文件夹（<code>~/.agent-memory</code>）。所有记忆都是人能直接打开的文本文件，AI 记了什么、谁改的，全在里面，没有任何数据库锁着你的数据。</p>
+<p><strong>② mem 程序</strong>——唯一的"管理员"。AI 不直接翻文件，而是通过它读写：它负责加锁、验票、记账、查证，保证许多个 AI 同时使用也不会互相踩脚。</p>
+<p><strong>③ 宿主适配</strong>——每个 AI 工具接进来的一根"插头"。接法可简可繁：最简的一档，AI 拿命令行直接用也能完整工作。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d1-title d1-desc" style="min-width:1280px">
+  <title id="d1-title">SpaceMemory 整体架构</title>
+  <desc id="d1-desc">架构总览：上层的 AI 宿主工具通过四种接入方式进入 mem 程序；mem 程序向下读写唯一真相——数据目录，并维护一份可重建的索引缓存。</desc>
+  <defs>
+    <marker id="d1-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- 分区（最先画） -->
+  <rect x="64" y="48" width="1152" height="144" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <rect x="80" y="52" width="184" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="88" y="64" class="nz">宿主 · AI 助手工作的地方</text>
+
+  <rect x="64" y="240" width="1152" height="248" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <rect x="80" y="244" width="216" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="88" y="256" class="nz">mem · 一个程序，三种打开方式</text>
+
+  <!-- 箭头（节点之前） -->
+  <line x1="220" y1="160" x2="220" y2="234" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <line x1="500" y1="160" x2="500" y2="234" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <line x1="780" y1="160" x2="780" y2="234" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <line x1="1060" y1="160" x2="1060" y2="234" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <line x1="370" y1="456" x2="370" y2="538" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <line x1="910" y1="456" x2="910" y2="538" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d1-arrow)"/>
+  <rect x="382" y="488" width="44" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="404" y="500" class="ac">读写</text>
+  <rect x="922" y="488" width="68" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="956" y="500" class="ac">写时刷新</text>
+
+  <!-- 宿主四插头 -->
+  <rect x="100" y="104" width="240" height="56" rx="6" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="220" y="130" class="nn">Hook 自动注入</text>
+  <text x="220" y="148" class="ns">mem session start</text>
+  <rect x="380" y="104" width="240" height="56" rx="6" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="500" y="130" class="nn">Skill 说明书</text>
+  <text x="500" y="148" class="ns">adapters/*.md</text>
+  <rect x="660" y="104" width="240" height="56" rx="6" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="780" y="130" class="nn">MCP 协议接口</text>
+  <text x="780" y="148" class="ns">mem mcp (stdio)</text>
+  <rect x="940" y="104" width="240" height="56" rx="6" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="1060" y="130" class="nn">命令行直用</text>
+  <text x="1060" y="148" class="ns">mem brief / find</text>
+
+  <!-- mem 三前端 + 核心 -->
+  <rect x="300" y="288" width="200" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="309" class="nn">CLI 命令行</text>
+  <text x="400" y="326" class="ns">mem &lt;命令&gt;</text>
+  <rect x="540" y="288" width="200" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="640" y="309" class="nn">常驻小管家</text>
+  <text x="640" y="326" class="ns">mem serve</text>
+  <rect x="780" y="288" width="200" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="880" y="309" class="nn">MCP 服务</text>
+  <text x="880" y="326" class="ns">mem mcp</text>
+
+  <rect x="300" y="376" width="680" height="80" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <rect x="316" y="384" width="40" height="12" rx="2" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+  <text x="336" y="393" class="ae">CORE</text>
+  <text x="640" y="416" class="nn">机制核心库（干全部重活的大脑）</text>
+  <text x="640" y="436" class="ns">mem-core · lock / token / events / freshness</text>
+
+  <!-- 数据层 -->
+  <rect x="140" y="544" width="460" height="88" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+  <text x="370" y="580" class="nn">数据目录：唯一真相</text>
+  <text x="370" y="600" class="ns">~/.agent-memory · records/ · events.jsonl · .git</text>
+  <text x="370" y="616" class="ns">纯文本文件 · 人可直接打开修改</text>
+  <rect x="680" y="544" width="460" height="88" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+  <text x="910" y="580" class="nn">图书目录索引（可重建的缓存）</text>
+  <text x="910" y="600" class="ns">index.sqlite · derived cache</text>
+  <text x="910" y="616" class="ns">卡片丢了随时重抄 · 不承担正确性</text>
+
+  <!-- 图例 -->
+  <line x1="30" y1="658" x2="1250" y2="658" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="674" class="lgk">LEGEND</text>
+  <rect x="140" y="664" width="12" height="12" rx="2" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+  <text x="160" y="674" class="lg">唯一真相（数据目录）</text>
+  <rect x="380" y="664" width="12" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="674" class="lg">mem 程序的部件</text>
+  <rect x="590" y="664" width="12" height="12" rx="2" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+  <text x="610" y="674" class="lg">存储与缓存</text>
+  <rect x="770" y="664" width="12" height="12" rx="2" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="790" y="674" class="lg">AI 工具的接入插头</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 1 · 整体架构</span><span>下钻：设计文档 §1.2 架构示意 / §1.1 分层</span></div>
+
+<p>图中唯一标橙的是数据目录，因为它是<strong>唯一真相</strong>：程序坏了可以重装、索引脏了可以重建，只要这个文件夹在，记忆就在。旁边的索引只是"图书卡片目录"——一份为了查得快而抄的副本，证明不了自己是新的就会被弃用（图 3 讲这条纪律）。</p>
+
+<!-- ============ 2. 业务流程 ============ -->
+<h2>二、日常四件事：写、读、交接、自愈</h2>
+
+<h3>2.1 写一条记忆：先锁，再验票，绝不悄悄覆盖</h3>
+<p>AI 干活时想更新一条记忆（比如"登录接口做了一半"）。管理员的做法像银行柜台：先拿号（全局安全门）、锁柜台（这条记录别人暂时动不了），然后要求出示<strong>版本票</strong>——每次读记忆时程序都附赠一张"当前版本 + 内容指纹"的凭据，写入必须出示；如果文件已被别人改过，票就过期了，写入被<strong>大声拒绝</strong>，而不是悄悄把别人的成果盖掉。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d2-title d2-desc" style="min-width:1280px">
+  <title id="d2-title">写一条记忆的流程</title>
+  <desc id="d2-desc">写入流程图：AI 要修改记忆时，先过全局安全门、锁记录、校验版本票；票有效则校验内容并原子写盘、记流水账加存快照；票过期则大声报冲突，绝不覆盖。</desc>
+  <defs>
+    <marker id="d2-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d2-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- 箭头 -->
+  <line x1="420" y1="92" x2="420" y2="116" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="420" y1="172" x2="420" y2="196" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="420" y1="252" x2="420" y2="268" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="420" y1="396" x2="420" y2="414" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="420" y1="468" x2="420" y2="492" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="420" y1="548" x2="420" y2="572" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d2-arrow)"/>
+  <line x1="560" y1="332" x2="694" y2="332" stroke="#bf4520" stroke-width="1.2" marker-end="url(#d2-acc)"/>
+  <rect x="432" y="392" width="40" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="452" y="404" class="ac">有效</text>
+  <rect x="583" y="308" width="88" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="627" y="320" class="ac">已被抢先修改</text>
+
+  <!-- 节点 -->
+  <rect x="300" y="48" width="240" height="44" rx="22" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="75" class="nn">AI 要改一条记忆</text>
+
+  <rect x="280" y="124" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="144" class="nn">先过全局安全门</text>
+  <text x="420" y="161" class="ns">barrier · shared lock</text>
+
+  <rect x="280" y="204" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="224" class="nn">锁住这一条记录</text>
+  <text x="420" y="241" class="ns">record lock</text>
+
+  <polygon points="420,268 560,332 420,396 280,332" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="337" class="nn">版本票还有效吗？</text>
+
+  <rect x="280" y="420" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="440" class="nn">检查内容并一步写盘</text>
+  <text x="420" y="457" class="ns">validate · temp + atomic rename</text>
+
+  <rect x="280" y="500" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="520" class="nn">记流水账 + 存快照</text>
+  <text x="420" y="537" class="ns">events.jsonl + git commit</text>
+
+  <rect x="300" y="580" width="240" height="44" rx="22" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="420" y="607" class="nn">完成，返回新版本票</text>
+
+  <rect x="700" y="310" width="340" height="44" rx="22" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+  <text x="870" y="337" class="nn-acc">冲突：不覆盖，交回给人处理</text>
+
+  <!-- 图例 -->
+  <line x1="30" y1="658" x2="1250" y2="658" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="674" class="lgk">LEGEND</text>
+  <rect x="140" y="664" width="12" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="160" y="674" class="lg">一个步骤</text>
+  <rect x="280" y="664" width="20" height="12" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="310" y="674" class="lg">开始 / 结束</text>
+  <rect x="430" y="664" width="12" height="12" rx="2" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+  <text x="450" y="674" class="lg">冲突也是一等结果：大声报告，不静默处理</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 2 · 写路径</span><span>下钻：设计文档 D3 写路径协议 / 红线19 全摘要令牌 CAS</span></div>
+
+<p class="note">"先写临时文件、再一步换名"是防断电的：无论在哪一刻断电，你看到的要么是旧文件、要么是完整的新文件，绝不会是半份。</p>
+
+<h3>2.2 读一条记忆：目录可能撒谎，原件不会</h3>
+<p>为了查得快，程序旁边放了一本"图书目录"（索引）。但目录可能过时——比如有人绕过程序直接改了文件。这里的纪律很偏执：<strong>只有能证明目录是新的，才用目录</strong>；只要有一条证据缺失（比如负责盯梢的常驻小管家不在场），就放弃目录、直接翻原件。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d3-title d3-desc" style="min-width:960px">
+  <title id="d3-title">读一条记忆的流程</title>
+  <desc id="d3-desc">读取流程图：AI 要读记忆时先问索引；只有索引的新鲜性能被证明才走索引快路径，否则放弃索引直接读取文件本身并如实标注。</desc>
+  <defs>
+    <marker id="d3-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <line x1="300" y1="92" x2="300" y2="112" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <line x1="300" y1="168" x2="300" y2="188" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <line x1="430" y1="252" x2="512" y2="252" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <line x1="300" y1="308" x2="300" y2="348" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <line x1="300" y1="404" x2="300" y2="432" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <path d="M670,276 V454 Q670,462 662,462 H428" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d3-arrow)"/>
+  <rect x="449" y="226" width="52" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="475" y="238" class="ac">能证明</text>
+  <rect x="312" y="320" width="40" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="332" y="332" class="ac">不能</text>
+  <rect x="513" y="440" width="64" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="545" y="452" class="ac">一样可信</text>
+
+  <rect x="180" y="48" width="240" height="44" rx="22" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="300" y="75" class="nn">AI 要读记忆</text>
+
+  <rect x="160" y="120" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="300" y="140" class="nn">先问图书目录（索引）</text>
+  <text x="300" y="157" class="ns">index.sqlite</text>
+
+  <polygon points="300,196 430,252 300,308 170,252" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="300" y="257" class="nn">能证明目录是新的吗？</text>
+
+  <rect x="520" y="228" width="300" height="48" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+  <text x="670" y="248" class="nn">用目录秒查（快路径）</text>
+  <text x="670" y="265" class="ns">fast path · full-text search</text>
+
+  <rect x="160" y="356" width="280" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="300" y="376" class="nn">关上目录，直接翻书架</text>
+  <text x="300" y="393" class="ns">direct read · labeled</text>
+
+  <rect x="180" y="440" width="240" height="44" rx="22" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="300" y="467" class="nn">返回结果 + 版本票</text>
+
+  <line x1="30" y1="542" x2="930" y2="542" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="558" class="lgk">LEGEND</text>
+  <rect x="140" y="548" width="12" height="12" rx="2" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+  <text x="160" y="558" class="lg">快路径（可全文检索）</text>
+  <rect x="380" y="548" width="12" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="558" class="lg">普通步骤</text>
+  <rect x="520" y="548" width="20" height="12" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="550" y="558" class="lg">开始 / 结束</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 3 · 读路径与证明式新鲜性</span><span>下钻：设计文档 D5 / 红线21</span></div>
+
+<p class="note">宁可慢一点翻原件，也绝不给你一份可能过期的清单——不存在任何"已知可能返回旧值"的捷径。另外，读的过程零写盘：纯读不改任何东西，只读的盘也能用全部功能。</p>
+
+<h3>2.3 会话交接：新 AI 上班第一天，先读值班记录</h3>
+<p>你今天在 A 工具里聊到一半，明天换 B 工具继续。新 AI 开场时，宿主会自动替它"报到"：程序翻出最近一份<strong>交接本</strong>（上个 AI 干到哪、读到哪些记忆、有什么注意事项），生成一页工作简报，塞进新对话的开场。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d4-title d4-desc" style="min-width:960px">
+  <title id="d4-title">会话交接的时序</title>
+  <desc id="d4-desc">时序图：新 AI 开场时宿主 hook 自动调用 mem，mem 查询并接续最近一份交接本、建立新交接本、返回工作简报，由宿主注入新对话；此后干活过程随时记入流水账。</desc>
+  <defs>
+    <marker id="d4-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d4-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+    <marker id="d4-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polyline points="0 0, 8 3, 0 6" fill="none" stroke="#4f5d75" stroke-width="1.2"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- 生命线 -->
+  <line x1="120" y1="100" x2="120" y2="524" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="360" y1="100" x2="360" y2="524" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="600" y1="100" x2="600" y2="524" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="840" y1="100" x2="840" y2="524" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <!-- 消息 -->
+  <line x1="126" y1="140" x2="354" y2="140" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <rect x="208" y="116" width="64" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="240" y="128" class="ac">开始工作</text>
+
+  <line x1="366" y1="176" x2="594" y2="176" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <rect x="386" y="154" width="188" height="14" rx="2" fill="#f5f5f5"/>
+  <text x="480" y="165" class="ae">mem session start --handoff auto</text>
+
+  <line x1="606" y1="212" x2="834" y2="212" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <rect x="664" y="188" width="112" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="720" y="200" class="ac">查上一份交接本</text>
+
+  <line x1="834" y1="246" x2="612" y2="246" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d4-arrow)"/>
+  <rect x="676" y="222" width="88" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="720" y="234" class="ac">上次干到哪了</text>
+
+  <path d="M604,288 H656 Q664,288 664,296 V304 Q664,312 656,312 H612" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <rect x="676" y="284" width="88" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="720" y="296" class="ac">建立新交接本</text>
+
+  <line x1="594" y1="348" x2="366" y2="348" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d4-arrow)"/>
+  <rect x="428" y="326" width="104" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="480" y="338" class="ac">工作简报 brief</text>
+
+  <line x1="354" y1="392" x2="126" y2="392" stroke="#bf4520" stroke-width="1.2" marker-end="url(#d4-acc)"/>
+  <rect x="166" y="370" width="148" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="240" y="382" class="ac">注入上下文：接着上次干</text>
+
+  <line x1="606" y1="440" x2="832" y2="440" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d4-open)"/>
+  <rect x="654" y="418" width="124" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="716" y="430" class="ac">干活时随时记流水账</text>
+
+  <!-- 激活条 -->
+  <rect x="596" y="166" width="8" height="282" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+  <rect x="836" y="206" width="8" height="52" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+
+  <!-- 参与者 -->
+  <rect x="40" y="48" width="160" height="52" rx="6" fill="rgba(45,49,66,0.10)" stroke="#5a6580" stroke-width="1"/>
+  <text x="120" y="79" class="nn">新来的 AI</text>
+  <rect x="280" y="48" width="160" height="52" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+  <text x="360" y="79" class="nn">宿主（hook）</text>
+  <rect x="520" y="48" width="160" height="52" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="600" y="79" class="nn">mem 程序</text>
+  <rect x="760" y="48" width="160" height="52" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+  <text x="840" y="79" class="nn">记忆库（台账）</text>
+
+  <line x1="30" y1="542" x2="930" y2="542" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="558" class="lgk">LEGEND</text>
+  <line x1="140" y1="554" x2="168" y2="554" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d4-arrow)"/>
+  <text x="180" y="558" class="lg">调用</text>
+  <line x1="260" y1="554" x2="288" y2="554" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d4-arrow)"/>
+  <text x="300" y="558" class="lg">回答 / 后台动作</text>
+  <line x1="440" y1="554" x2="468" y2="554" stroke="#bf4520" stroke-width="1.2" marker-end="url(#d4-acc)"/>
+  <text x="480" y="558" class="lg">关键时刻：简报进入新对话</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 4 · 会话交接</span><span>下钻：设计文档 D13 会话台账 / D14 义务投递</span></div>
+
+<p class="note">第一次来，没有交接本？那就建一本空白的——机制只提供事实，绝不编造历史。交接是显式动作：新台账由"报到"建立，纯读操作永远不会偷偷改台账。</p>
+
+<h3>2.4 一条记录的一生：书架、阁楼、查无此人</h3>
+<p>一条记忆只有三种状态：<strong>在书架上</strong>（<code>records/</code>，正常使用）、<strong>在阁楼</strong>（<code>attic/</code>，被程序删除但可恢复）、<strong>不存在了</strong>（被删干净）。有趣的是最后一种：如果有人在程序<strong>外面</strong>直接删了文件（手滑、脚本、同步盘），账本上还记着它、屋里却没了——程序下次扫描时会发现这个矛盾，自动补记一笔"外部删除"。账本永远向现实对齐，这就是<strong>自愈</strong>。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 960 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d5-title d5-desc" style="min-width:960px">
+  <title id="d5-title">一条记录的三种状态</title>
+  <desc id="d5-desc">状态机图：记录在书架（使用中）、阁楼（可恢复的删除）、不存在三种状态间流转；外部直接删文件会产生账实不符，由回填扫描自动补记，即自愈。</desc>
+  <defs>
+    <marker id="d5-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="d5-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- 转移线 -->
+  <circle cx="120" cy="64" r="6" fill="#2d3142"/>
+  <line x1="120" y1="72" x2="120" y2="112" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <rect x="132" y="82" width="76" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="170" y="94" class="ac">第一次创建</text>
+
+  <path d="M200,120 V100 Q200,92 208,92 H240 Q248,92 248,100 V112" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <rect x="184" y="60" width="112" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="240" y="72" class="ac">更新：版本票 +1</text>
+
+  <line x1="264" y1="136" x2="352" y2="136" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <rect x="267" y="110" width="82" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="308" y="122" class="ac">被 mem 删除</text>
+
+  <line x1="356" y1="176" x2="268" y2="176" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d5-arrow)"/>
+  <rect x="280" y="148" width="64" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="312" y="160" class="ac">恢复回来</text>
+
+  <path d="M100,184 V248 H720 V190" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <rect x="346" y="224" width="128" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="410" y="236" class="ac">在外面被直接删掉</text>
+
+  <path d="M800,184 V328 H208 V190" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d5-arrow)"/>
+  <rect x="436" y="304" width="128" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="500" y="316" class="ac">后来又被重新创建</text>
+
+  <path d="M860,136 H896 Q904,136 904,144 V168 Q904,176 896,176 H868" fill="none" stroke="#bf4520" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#d5-acc)"/>
+  <rect x="836" y="196" width="64" height="16" rx="2" fill="#f5f5f5"/>
+  <text x="868" y="208" class="ac">自愈补记</text>
+
+  <!-- 状态 -->
+  <rect x="60" y="120" width="200" height="64" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="160" y="148" class="nn">书架上 · 使用中</text>
+  <text x="160" y="166" class="ns">records/</text>
+
+  <rect x="360" y="120" width="200" height="64" rx="8" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+  <text x="460" y="148" class="nn">阁楼 · 暂存删除</text>
+  <text x="460" y="166" class="ns">attic/</text>
+
+  <rect x="660" y="120" width="200" height="64" rx="8" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+  <text x="760" y="148" class="nn-acc">不存在了</text>
+  <text x="760" y="166" class="ns">absent</text>
+
+  <line x1="30" y1="422" x2="930" y2="422" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="438" class="lgk">LEGEND</text>
+  <line x1="140" y1="434" x2="168" y2="434" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d5-arrow)"/>
+  <text x="180" y="438" class="lg">mem 的操作</text>
+  <line x1="300" y1="434" x2="328" y2="434" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#d5-arrow)"/>
+  <text x="340" y="438" class="lg">外部动作</text>
+  <line x1="440" y1="434" x2="468" y2="434" stroke="#bf4520" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#d5-acc)"/>
+  <text x="480" y="438" class="lg">自愈：发现账实不符，自动补记</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 5 · 记录状态机（书架 / 阁楼 / 查无此人）</span><span>下钻：设计文档 D12 状态三元组与回填 / 红线24</span></div>
+
+<!-- ============ 3. 模块地图 ============ -->
+<h2>三、零件地图：一个门面，六个零件库</h2>
+<p>整个系统是一个 Rust 工作区，编译出<strong>一个</strong>可执行程序 <code>mem</code>，配上六个零件库（crate）。你安装的永远只有 <code>mem</code> 这一个文件。</p>
+
+<div class="diagram-frame"><div class="diagram-container">
+<svg viewBox="0 0 1280 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d6-title d6-desc" style="min-width:1280px">
+  <title id="d6-title">模块地图</title>
+  <desc id="d6-desc">模块树：根节点是可执行程序 mem，下辖六个零件库——机制核心、图书目录索引、类型规则检查、历史快照、协议入口、出厂模板。</desc>
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- 连接线 -->
+  <line x1="640" y1="120" x2="640" y2="172" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="148" y1="172" x2="1128" y2="172" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="148" y1="172" x2="148" y2="234" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="344" y1="172" x2="344" y2="234" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="540" y1="172" x2="540" y2="234" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="736" y1="172" x2="736" y2="234" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="932" y1="172" x2="932" y2="234" stroke="#4f5d75" stroke-width="1"/>
+  <line x1="1128" y1="172" x2="1128" y2="234" stroke="#4f5d75" stroke-width="1"/>
+
+  <rect x="460" y="64" width="360" height="56" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+  <text x="640" y="88" class="nn-acc" style="font-size:13px">mem —— 唯一要安装的程序</text>
+  <text x="640" y="106" class="ns">one binary · CLI / serve / mcp</text>
+
+  <rect x="64" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="148" y="270" class="nn">机制核心库</text>
+  <text x="148" y="288" class="ns">crates/mem-core</text>
+
+  <rect x="260" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="344" y="270" class="nn">图书目录索引</text>
+  <text x="344" y="288" class="ns">crates/mem-index</text>
+
+  <rect x="456" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="540" y="270" class="nn">类型规则检查</text>
+  <text x="540" y="288" class="ns">crates/mem-schema</text>
+
+  <rect x="652" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="736" y="270" class="nn">历史快照</text>
+  <text x="736" y="288" class="ns">crates/mem-git</text>
+
+  <rect x="848" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="932" y="270" class="nn">协议入口</text>
+  <text x="932" y="288" class="ns">crates/mem-mcp</text>
+
+  <rect x="1044" y="240" width="168" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="1128" y="270" class="nn">出厂模板</text>
+  <text x="1128" y="288" class="ns">crates/mem-assets</text>
+
+  <line x1="30" y1="356" x2="1250" y2="356" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+  <text x="30" y="372" class="lgk">LEGEND</text>
+  <rect x="140" y="362" width="12" height="12" rx="2" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+  <text x="160" y="372" class="lg">门面（唯一入口）</text>
+  <rect x="330" y="362" width="12" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="350" y="372" class="lg">零件库（被 mem 调用）</text>
+</svg>
+</div></div>
+<div class="cap"><span>图 6 · 模块地图</span><span>下钻：仓库 README「crate 一览」/ 设计文档 §1.1</span></div>
+
+<div class="cards">
+  <div class="card">
+    <div class="cn">crates/mem</div>
+    <div class="role">门面</div>
+    <p>你实际运行的程序。同一个文件提供三种打开方式：命令行 <code>mem</code>、常驻小管家 <code>mem serve</code>、协议服务 <code>mem mcp</code>。</p>
+    <div class="loc">源码约 1,255 行 · 另有端到端测试</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-core</div>
+    <div class="role">机制核心库（最大的零件）</div>
+    <p>干全部重活：加锁、验版本票、记流水账、证明新鲜性、管交接本与待办箱。Windows 与 macOS 的差异也全部关在这个库里。</p>
+    <div class="loc">源码约 5,635 行 · 测试约 2,913 行</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-index</div>
+    <div class="role">图书目录索引</div>
+    <p>把书架内容抄成一份 SQLite 卡片目录，过滤、排序、全文检索都靠它提速。证明不了新鲜就弃用，且它无权拒绝任何数据。</p>
+    <div class="loc">源码约 368 行</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-schema</div>
+    <div class="role">类型规则检查</div>
+    <p>记忆是分类的（任务、项目、偏好……），每一类配一份声明文件。这里负责"落笔之前查规则"：字段对不对、引用存不存在、有没有成环。</p>
+    <div class="loc">源码约 450 行</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-git</div>
+    <div class="role">历史快照</div>
+    <p>每次修改顺手做一次 git 提交——记忆因此可回溯、可撤销、可多台电脑同步。它是附属物：拆掉后系统照样完整工作。</p>
+    <div class="loc">源码约 193 行</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-mcp</div>
+    <div class="role">协议入口</div>
+    <p>让支持 MCP 协议的 AI 工具用"标准插头"接入，工具说明书里直接携带版本票，AI 不用额外记。</p>
+    <div class="loc">源码约 399 行</div>
+  </div>
+  <div class="card">
+    <div class="cn">crates/mem-assets</div>
+    <div class="role">出厂模板</div>
+    <p>出厂自带的类型声明文件。它只负责原样搬运这些文件，一个字节都不解释——类型再多，程序代码也一行不用改。</p>
+    <div class="loc">源码约 45 行 · 模板数据 310 行</div>
+  </div>
+</div>
+
+<h3>名词小抄</h3>
+<table>
+  <tr><th>黑话</th><th>大白话</th></tr>
+  <tr><td><b>信封</b> envelope</td><td>每条记忆文件开头的一段"登记信息"：编号、类型、第几版、归谁、引用了谁。机制只拥有信封；正文是人跟 AI 的自由领土。</td></tr>
+  <tr><td><b>版本票</b>（修订令牌）</td><td><code>v6@9f01…</code>：读的时候程序发的"当前版本 + 内容指纹"凭据，写入必须出示，过期即拒绝——防覆盖的根。</td></tr>
+  <tr><td><b>流水账</b> events.jsonl</td><td>全库唯一的大事记，一行记一件事，只追加不涂改。谁改的、改成了什么，全在里面。</td></tr>
+  <tr><td><b>图书目录</b> index.sqlite</td><td>提速用的卡片目录。派生物，随时可删掉重抄；它只帮查询，永远没有否决权。</td></tr>
+  <tr><td><b>交接本</b>（会话台账）</td><td>一个 AI 留给下一个 AI 的值班记录：做到哪、读到哪些记忆、注意什么。</td></tr>
+  <tr><td><b>待办箱</b> agenda</td><td>程序发现的"建议整理事项"（重复条目、断掉的引用……）。程序只提案，落笔前必须经人确认。</td></tr>
+  <tr><td><b>门闩</b> barrier</td><td>全局安全门：大扫除（维护）时独占，平时所有人共用通过。</td></tr>
+</table>
+
+<footer>
+  <p>本页是解释层，供人阅读，<b>不承载任何规则</b>；机制细节以真源为准：<a href="../develop/agent-memory-design.md">设计文档</a>（决策与红线）、<a href="../requirement/agent-memory-requirements.md">需求基线</a>、<a href="../specs/">公开规范</a>。图与说明若与真源不一致，以真源为准。</p>
+</footer>
+
+</main>
+</body>
+</html>

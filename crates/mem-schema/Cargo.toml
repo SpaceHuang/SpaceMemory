@@ -1,0 +1,17 @@
+[package]
+name = "mem-schema"
+description = "类型声明两件套：加载与校验（JSON Schema 2020-12 + x-* 自定义关键字词汇表，D19）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# 刻意不依赖 mem-core：依赖方向是 mem-core → mem-schema（写路径校验载荷，D3 第 4 步）。
+# x-ref 存在性 / x-dag 无环检查由调用方提供存在性回调与邻接表，本 crate 只产声明与违例。
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jsonschema = { version = "0.30", default-features = false, features = ["resolve-file"] }
+
+[dev-dependencies]
+tempfile = "3"

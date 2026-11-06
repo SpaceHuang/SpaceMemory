@@ -1,0 +1,6 @@
+{
+  "slug": "main",
+  "label": "main",
+  "host": null,
+  "description": "mem init 自举的首条 principal（防错报不防伪装，红线12）。机制只覆写 slug/label 两个字段（唯一键推导必须知道的名字），其余字段含义完全由 types/principal/schema.json 提供——改 principal 字段定义只需改本文件与两件套（红线1 试金石）。"
+}

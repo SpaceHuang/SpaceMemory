@@ -1,0 +1,17 @@
+[package]
+name = "mem-index"
+description = "派生索引 index.sqlite：过滤/排序/分页/FTS/边表；证明式新鲜性，读路径零写盘（D5）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mem-core.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+unicode-normalization = "0.1"
+mem-schema.workspace = true

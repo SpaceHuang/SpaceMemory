@@ -1,0 +1,21 @@
+[package]
+name = "mem-mcp"
+description = "MCP 前端：工具面 schema 携带 expect 全令牌；initialize 建/接手台账（D7/§3.4 L4 档）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mem-core.workspace = true
+mem-git.workspace = true
+mem-schema.workspace = true
+mem-index.workspace = true
+serde_json.workspace = true
+
+# 说明：MCP stdio 协议（JSON-RPC 2.0）以手写最小实现交付（v1）。
+# rmcp 装配为第二阶段（开放问题29 工具面定稿后）——协议面稳定、依赖面最小。
+
+[dev-dependencies]
+tempfile = "3"
+mem-schema.workspace = true

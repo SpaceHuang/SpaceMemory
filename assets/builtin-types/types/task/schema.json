@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "task",
+  "description": "任务状态机（两件套试金石，§8 第 2 步）",
+  "type": "object",
+  "x-grade": "strict",
+  "x-unique-key": ["project", "slug"],
+  "x-dag": false,
+  "x-topics": ["area"],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "maxLength": 128, "description": "任务短标识；路径推导成分" },
+    "title": { "type": "string", "minLength": 1, "description": "任务标题" },
+    "status": { "enum": ["todo", "in_progress", "blocked", "done", "cancelled"], "description": "任务状态机" },
+    "project": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "x-ref": { "target_type": "project", "existence": true }, "description": "归属 project 记录 ID（信封镜像 rel=project）" },
+    "area": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "x-ref": { "target_type": "topic", "existence": true }, "description": "主题面 topic 记录 ID（x-topics）" },
+    "due": { "type": ["string", "null"], "format": "date", "description": "截止日期" },
+    "priority": { "type": ["integer", "null"], "minimum": 0, "maximum": 9 }
+  },
+  "required": ["slug", "title", "status"]
+}

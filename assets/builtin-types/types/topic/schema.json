@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "topic",
+  "description": "主题面（D9 分类是数据；开放问题33）",
+  "type": "object",
+  "x-grade": "strict",
+  "x-unique-key": ["slug"],
+  "x-dag": false,
+  "x-topics": [],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": ["string", "null"] }
+  },
+  "required": ["slug", "title"]
+}

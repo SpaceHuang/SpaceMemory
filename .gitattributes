@@ -1,0 +1,3 @@
+# shell 脚本钉死 LF：CI/各平台 bash 不容忍 CRLF
+*.sh text eol=lf
+*.yml text eol=lf

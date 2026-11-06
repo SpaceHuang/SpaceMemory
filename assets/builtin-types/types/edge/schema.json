@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "edge",
+  "description": "有属性的边：建模为记录（D16）",
+  "type": "object",
+  "x-grade": "lenient",
+  "x-unique-key": [],
+  "x-dag": false,
+  "x-topics": [],
+  "properties": {
+    "from": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "description": "起点记录 ID" },
+    "to": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "description": "终点记录 ID" },
+    "rel": { "type": "string", "minLength": 1, "description": "关系名（类型命名空间）" },
+    "attrs": { "type": "object", "description": "边属性（自由，lenient）" }
+  },
+  "required": ["from", "to", "rel"]
+}
