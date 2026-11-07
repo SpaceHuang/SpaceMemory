@@ -5,11 +5,10 @@
 //! 降级 CLI（§3.4 降级路径）。
 
 pub fn run() {
-    let root = std::env::var("MEM_STORE").unwrap_or_else(|_| {
-        eprintln!(r#"{{"error":"mem mcp 需要 MEM_STORE 环境变量"}}"#);
-        std::process::exit(1);
-    });
-    let root = std::path::PathBuf::from(root);
+    // r14：与 CLI 同缺省链（$MEM_STORE > ~/.agent-memory，store_root_or_default
+    // 单源）——此前强制 MEM_STORE、缺省即退出，MCP 宿主配置多一个必填项。
+    // 红线25 不变：台账仍由宿主经 mem_session_start 显式建立。
+    let root = std::path::PathBuf::from(crate::commands::store_root_or_default(None));
     mem_mcp::protocol::remember_root(&root);
     use std::io::BufRead;
     let stdin = std::io::stdin();

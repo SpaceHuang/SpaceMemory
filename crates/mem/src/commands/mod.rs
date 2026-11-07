@@ -214,9 +214,12 @@ fn run(cli: &Cli) -> MemResult<i32> {
 
 // ---------- 公共构件 ----------
 
-fn store_root(cli: &Cli) -> std::path::PathBuf {
-    if let Some(p) = &cli.store {
-        return p.clone();
+/// 店根解析单源（CLI 与 `mem mcp` 共用，r14 MCP 安装）：显式路径 > $MEM_STORE
+/// > ~/.agent-memory（用户级数据目录）。MCP 前端不再强依赖 MEM_STORE 环境变量
+/// ——此前缺省即退出（部署脚手架）；红线25 不变：台账仍由宿主显式建立。
+pub(crate) fn store_root_or_default(explicit: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
     }
     if let Ok(p) = std::env::var("MEM_STORE") {
         return p.into();
@@ -225,6 +228,31 @@ fn store_root(cli: &Cli) -> std::path::PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".into());
     std::path::Path::new(&home).join(".agent-memory")
+}
+
+fn store_root(cli: &Cli) -> std::path::PathBuf {
+    store_root_or_default(cli.store.as_deref())
+}
+
+#[cfg(test)]
+mod store_root_tests {
+    use super::*;
+
+    #[test]
+    fn default_chain_env_then_user_home() {
+        // 单测试串行覆盖两级（env 操作跨测试并行会竞态）：
+        // 1) MEM_STORE 显式 → 原样采用；
+        // 2) 无 MEM_STORE、无 CLI 参数 → 用户级 ~/.agent-memory。
+        unsafe { std::env::set_var("MEM_STORE", "X:/mem-env-store") };
+        assert_eq!(
+            store_root_or_default(None),
+            std::path::PathBuf::from("X:/mem-env-store"),
+            "$MEM_STORE 显式优先"
+        );
+        unsafe { std::env::remove_var("MEM_STORE") };
+        let r = store_root_or_default(None);
+        assert!(r.ends_with(".agent-memory"), "缺省 = 用户级数据目录，实际 {r:?}");
+    }
 }
 
 fn open_store(cli: &Cli) -> MemResult<Store> {
