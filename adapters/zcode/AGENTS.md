@@ -23,10 +23,14 @@
 
 ## MCP 配置（L4 完整档）
 
+服务器键用 `spacememory`（仓库名——MCP 生态里 memory/mem0/mem.ai 等近名产品
+众多，短名 "mem" 在同名覆盖规则下易被静默替换；协议层 serverInfo.name 标识
+程序本体，不受此键影响）。
+
 ```json
 {
   "mcpServers": {
-    "mem": {
+    "spacememory": {
       "command": "mem",
       "args": ["mcp"],
       "env": { "MEM_STORE": "<store 路径>" }
