@@ -30,10 +30,19 @@ pub fn tool_definitions() -> serde_json::Value {
         { "name": "mem_session_flush", "description": "提交读留痕，置 flushed（可接续）",
           "inputSchema": { "type": "object", "required": ["session"], "properties": {
               "session": { "type": "string" }, "trail": { "type": "array", "items": { "type": "string" } } } } },
-        { "name": "mem_list", "description": "过滤定位（LIMIT+续读；返回完整令牌）",
+        { "name": "mem_list", "description": "过滤定位（LIMIT+续读；返回完整令牌）。filters 载荷字段过滤可组合（值一律 JSON 字符串——标量文本，类型解释由字段声明承担，R10 决策④）；响应透出坏记录告警 warnings（决策⑦）",
           "inputSchema": { "type": "object", "properties": {
               "type": { "type": "string" }, "view": { "type": "string" },
+              "filters": { "type": "object", "additionalProperties": { "type": "string" },
+                  "description": "过滤条件 {字段: 标量文本}；值一律 JSON 字符串，非字符串标量被拒收（invalid_filter_value）" },
               "limit": { "type": "integer" }, "offset": { "type": "integer" } } } },
+        { "name": "mem_find", "description": "关键词检索（词项与/与位排除 + 载荷字段过滤组合，R10）。query 必填且解析后须含至少一个肯定词项（空查询/纯否定拒收 query_invalid；纯过滤走 mem_list）。命中 = 定位信息 + 完整修订令牌；read_mode 标注快路径/直读；坏记录告警 warnings 透出（决策⑦）",
+          "inputSchema": { "type": "object", "required": ["query"], "properties": {
+              "query": { "type": "string", "description": "查询整串（空白分隔词项；- 前缀 = 否定词项）" },
+              "filters": { "type": "object", "additionalProperties": { "type": "string" },
+                  "description": "过滤条件 {字段: 标量文本}；值一律 JSON 字符串，非字符串标量被拒收（invalid_filter_value）" },
+              "limit": { "type": "integer" },
+              "offset": { "type": "integer", "description": "命中序号续读（取自上页 resume.offset）" } } } },
         { "name": "mem_show", "description": "钻取单条（返回信封/载荷/正文/令牌；零写盘）。正文按 brief_bytes 截断，body_offset 续读（R4.2/红线9）",
           "inputSchema": { "type": "object", "required": ["id"], "properties": {
               "id": { "type": "string" },
