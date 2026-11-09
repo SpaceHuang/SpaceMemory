@@ -34,7 +34,7 @@ pub fn tool_definitions() -> serde_json::Value {
           "inputSchema": { "type": "object", "properties": {
               "type": { "type": "string" }, "view": { "type": "string" },
               "limit": { "type": "integer" }, "offset": { "type": "integer" } } } },
-        { "name": "mem_show", "description": "钻取单条（返回信封/载荷/正文/令牌；零写盘）。正文按 brief_bytes 截断，body_offset 续读（R4.2/红线9）",
+        { "name": "mem_show", "description": "钻取单条（返回信封/载荷/正文/令牌；零写盘）。正文按 brief_bytes 截断，body_offset 续读（R4.2/红线9）。正文区合法 UTF-8 → body 文本分页（切点码点对齐）；不合法 → body=null、body_b64 base64 分页（页=brief_bytes 个原始字节）；body_utf8 恒有供机判（R11/BD2）",
           "inputSchema": { "type": "object", "required": ["id"], "properties": {
               "id": { "type": "string" },
               "body_offset": { "type": "integer", "description": "正文字节偏移续读（取自上页 resume.body_offset）" } } } },
@@ -66,6 +66,11 @@ pub fn tool_definitions() -> serde_json::Value {
               "id": { "type": "string" }, "expect": expect_schema(), "force": { "type": "boolean" } } } },
         { "name": "mem_restore", "description": "恢复 tombstone（attic → records 同路径）",
           "inputSchema": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } } },
+        { "name": "mem_restore_body", "description": "恢复正文（经确认的内容写：正文区替换为来源字节，信封/载荷原样保留，版本+1，事件 op=restore_body；R11/BD4）。与 fix 的分界：结构头坏 → 先 fix；正文坏 → mem_restore_body。来源三形：git:<版本> 指定历史版本 | file:<店外路径> 店外备份 | history 自动锚定（仅在可判定窗口内：漂移仍在 ∧ 最后事件为机制写入登记；窗口外响亮拒绝并附指引，绝不回退次优匹配）",
+          "inputSchema": { "type": "object", "required": ["id", "expect", "source"], "properties": {
+              "id": { "type": "string" }, "expect": expect_schema(),
+              "source": { "type": "string", "description": "git:<版本> | file:<店外路径> | history" },
+              "session": { "type": "string" } } } },
         { "name": "mem_diff", "description": "增量 = changes_since_N（日志过滤）∪ current_drift（独立预算；与 git 无关）。changes_since 组级 offset 续读（取自上页 resume.offset）",
           "inputSchema": { "type": "object", "properties": { "since": { "type": "integer" },
               "offset": { "type": "integer", "description": "组序号续读（取自上页 resume.offset）" } } } },

@@ -174,19 +174,30 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         "mem_show" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
             // r12 B7-3：预算是配置错误——先于一切工作响亮拒收；MCP 与 CLI 同预算
-            // 语义（R4.2/红线9 不因前端豁免）——正文按 brief_bytes 截断 + body_offset 续读。
+            // 语义（R4.2/红线9 不因前端豁免）。
+            // R11.2/BD2 响应自适应：正文区合法 UTF-8 → 文本分页（切点码点对齐，
+            // 数学上字节保真）；不合法 → `body=null`、正文页以 `body_b64` 交付
+            // （页 = brief_bytes 个**原始字节**，resume.body_offset 按字节计）。
+            // `body_utf8` 恒有字段供机判（BD3）；分页单源 = mem_core::body。
             let budget = mem_core::budget::brief_bytes_budget(&store)?;
             let hit = ops::get(&store, id)?;
-            let (body_text, body_truncated, next_off) = mem_core::budget::body_slice(
-                &hit.record.body,
-                args.get("body_offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                budget,
-            );
+            let body_utf8 = mem_core::body::is_valid_utf8(&hit.record.body);
+            let off = args.get("body_offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let (body, body_b64, body_truncated, next_off) = if body_utf8 {
+                let (text, truncated, next) = mem_core::body::body_page_text(&hit.record.body, off, budget)
+                    .expect("合法 UTF-8 正文必有文本通道");
+                (json!(text), Value::Null, truncated, next)
+            } else {
+                let (bytes, truncated, next) = mem_core::body::body_page_bytes(&hit.record.body, off, budget);
+                (Value::Null, json!(b64_encode(bytes)), truncated, next)
+            };
             Ok(json!({
                 "rel": hit.rel,
                 "envelope": hit.record.envelope.to_json_value(),
                 "payload": hit.record.payload,
-                "body": body_text,
+                "body": body,
+                "body_utf8": body_utf8,
+                "body_b64": body_b64,
                 "body_bytes_total": hit.record.body.len(),
                 "body_truncated": body_truncated,
                 "resume": if body_truncated {
@@ -309,6 +320,26 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             let r = ops::restore_record(&ctx, args.get("id").and_then(|v| v.as_str()).unwrap_or_default(), None)?;
             Ok(json!({"rel": r.rel, "token": r.token.to_string()}))
         }
+        "mem_restore_body" => {
+            // R11.5 对等 + R11.6/BD4：恢复正文（经确认的内容写；与 CLI restore-body
+            // 同批义务——前端功能对等）。来源三形：git:<版本> | file:<店外路径> | history。
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
+            let expect = parse_expect(args.get("expect"))?;
+            let source_spec = arg_str!(args, "source")
+                .ok_or_else(|| MemError::BadArgument("source 必填（git:<版本> | file:<店外路径> | history）".into()))?;
+            let source = parse_restore_source(&source_spec)?;
+            let session_id: Option<String> = arg_str!(args, "session");
+            let ctx = make_ctx(&store, &types, session_id.as_deref());
+            let history = GitProcess::new(store.root());
+            let out = ops::restore_body(&ctx, id, &expect, &source, Some(&history))?;
+            Ok(json!({
+                "id": out.record.envelope.id,
+                "rel": out.rel,
+                "version": out.record.envelope.version,
+                "token": out.token.to_string(),
+                "source": out.source_echo,
+            }))
+        }
         "mem_diff" => {
             let cfg = store.config().budgets;
             // r13 B9-2：组级 offset 续读（与 CLI cmd_diff 同语义——全量取组数再
@@ -375,17 +406,29 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             }
             let mirror_report = mem_core::ops::mirror_consistency_audit(&store, &types)?;
             let plan_report = mem_core::agenda::verify_report(&store, &types, deep)?;
+            // BD5 ④：.gitattributes 提交树核验（与 CLI 同一组审计）。
+            let has_git = store.root().join(".git").exists();
+            let head_attr = if has_git {
+                GitProcess::new(store.root())
+                    .head_file(mem_core::gitattrs::GITATTRIBUTES_REL)
+                    .unwrap_or(None)
+            } else {
+                None
+            };
+            let gitattrs_audit = mem_core::gitattrs::audit_findings(has_git, head_attr.as_deref());
             let ok = scan.warnings.is_empty()
                 && holes.is_empty()
                 && dangling.is_empty()
                 && digest_mismatches.is_empty()
                 && mirror_report.is_empty()
-                && plan_report.is_empty();
+                && plan_report.is_empty()
+                && gitattrs_audit.is_empty();
             Ok(json!({
                 "ok": ok, "scanned": scan.records.len(), "warnings": scan.warnings,
                 "history_holes": holes, "dangling_refs": dangling,
                 "payload_mirror_inconsistencies": mirror_report,
                 "digest_mismatches": digest_mismatches,
+                "gitattributes_audit": gitattrs_audit,
                 "plans": plan_report,
             }))
         }
@@ -442,6 +485,24 @@ fn body_bytes(args: &Value) -> MemResult<Option<Vec<u8>>> {
     Ok(args.get("body").and_then(|v| v.as_str()).map(|b| b.as_bytes().to_vec()))
 }
 
+/// base64 编码（标准字母表 + padding；与写通道 `b64_decode` 同构的保真传输
+/// 编码——R11.2/BD2 读通道：非文本正文页经 JSON 交付时的传输编码）。
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).map(|b| *b as u32);
+        let b2 = chunk.get(2).map(|b| *b as u32);
+        let n = (b0 << 16) | (b1.unwrap_or(0) << 8) | b2.unwrap_or(0);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if b1.is_some() { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if b2.is_some() { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn b64_decode(s: &str) -> MemResult<Vec<u8>> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
@@ -472,4 +533,26 @@ fn parse_expect(v: Option<&Value>) -> MemResult<Token> {
         .or_else(|| v.and_then(|v| v.get("version")).and_then(|x| x.as_str()))
         .ok_or_else(|| MemError::BadArgument("expect 令牌缺失（红线19：读改写必须携带全令牌）".into()))?;
     s.parse::<Token>().map_err(MemError::BadArgument)
+}
+
+/// 来源三形解析（与 CLI parse_restore_source 同构；§3.6）。
+fn parse_restore_source(spec: &str) -> MemResult<ops::RestoreSource> {
+    if spec == "history" {
+        return Ok(ops::RestoreSource::History);
+    }
+    if let Some(rev) = spec.strip_prefix("git:") {
+        if rev.is_empty() {
+            return Err(MemError::BadArgument("git: 源缺版本号（git:<版本>）".into()));
+        }
+        return Ok(ops::RestoreSource::Git { rev: rev.to_string() });
+    }
+    if let Some(p) = spec.strip_prefix("file:") {
+        if p.is_empty() {
+            return Err(MemError::BadArgument("file: 源缺路径（file:<店外路径>）".into()));
+        }
+        return Ok(ops::RestoreSource::File { path: std::path::PathBuf::from(p) });
+    }
+    Err(MemError::BadArgument(format!(
+        "source 必须为 git:<版本> | file:<店外路径> | history，实际 {spec:?}"
+    )))
 }
