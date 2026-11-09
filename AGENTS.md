@@ -12,8 +12,11 @@
 
 | 文档 | 权威范围 |
 |---|---|
-| `docs/requirement/agent-memory-requirements.md` | 需求基线 v1.2——一切设计与验收的起源与评审标尺 |
+| `docs/requirement/agent-memory-requirements.md` | 需求基线 v1.4——一切设计与验收的起源与评审标尺 |
+| `docs/requirement/keyword-search-requirements.md` | R10 关键词检索提案（v0.7）——需求本体已并入基线 v1.3，本文保留决策过程、评审往返与盘点明细 |
+| `docs/requirement/binary-content-requirements.md` | R11 二进制承载提案（v0.3）——需求本体已并入基线 v1.3，本文保留决策过程、评审往返与盘点明细 |
 | `docs/develop/agent-memory-design.md` | 设计现状 v1.2——决策（D#）、红线（§5）、实施顺序（§8）、开放问题（§7）、实施裁决注记 |
+| `docs/develop/keyword-search-design.md` | R10 实施设计 v0.3——查询文法、双执行器单源（open_proved 构造即证明）、x-filter 词汇、过滤规范条件（字段＋标量文本）、坏记录告警承接；三轮评审通过，七项决策经用户批准（2026-11-09），实施待启动 |
 | `docs/specs/` | 三个公开规范 v1（envelope-format / type-declaration / conventions-source）；规范与实现冲突时以规范评审结论为准 |
 | `docs/rules/` | 操作型指南（流程性规则，如打包分发 `packaging.md`）——执行对应任务时按需读取全文，本文件只登记存在与触发时机 |
 | `docs/review/` | 评审记录归档（历史评审文件缺失，待补） |
@@ -35,7 +38,7 @@
 
 引用规则时用统一锚点，代码注释、README、讨论通用：
 
-- `R#` = 需求编号（R1–R9），分项如 `R3.2`；
+- `R#` = 需求编号（R1–R11），分项如 `R3.2`；
 - `D#` = 设计决策编号（D1–D19）；
 - `红线#` = 设计文档 §5 的编号（1–27）；
 - `§8-步` = 实施顺序第 N 步（如 §8-4 = 核心库）；

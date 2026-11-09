@@ -53,7 +53,18 @@ pub struct Scanned {
 #[derive(Debug, Default)]
 pub struct ScanResult {
     pub records: Vec<Scanned>,
+    /// 结构化坏记录（rel, 告警行）——同一次扫描的坏条目与不可读文件（R10.3 决策⑦）。
+    /// 告警行 = "跳过坏条目 {rel}：{原因}"（修复入口由检索/清单响应层追加）；
+    /// 与 `warnings` 同源双视图：bad 供排序/截断/索引落库，warnings 供 verify 等人读面。
+    pub bad: Vec<(String, String)>,
     pub warnings: Vec<String>,
+}
+
+impl ScanResult {
+    fn push_bad(&mut self, rel: String, line: String) {
+        self.bad.push((rel, line.clone()));
+        self.warnings.push(line);
+    }
 }
 
 /// 直读扫描 records/（读路径零写盘；R6.2：坏条目跳过 + 告警）。
@@ -63,7 +74,7 @@ pub fn scan_all(store: &Store) -> MemResult<ScanResult> {
         let bytes = match std::fs::read(store.abs(&rel)) {
             Ok(b) => b,
             Err(e) => {
-                out.warnings.push(format!("跳过不可读 {rel}：{e}"));
+                out.push_bad(rel.clone(), format!("跳过不可读 {rel}：{e}"));
                 continue;
             }
         };
@@ -73,7 +84,7 @@ pub fn scan_all(store: &Store) -> MemResult<ScanResult> {
                 token: token::for_bytes(rec.envelope.version, &bytes),
                 record: rec,
             }),
-            Err(e) => out.warnings.push(format!("跳过坏条目 {rel}：{e}")),
+            Err(e) => out.push_bad(rel.clone(), format!("跳过坏条目 {rel}：{e}")),
         }
     }
     Ok(out)

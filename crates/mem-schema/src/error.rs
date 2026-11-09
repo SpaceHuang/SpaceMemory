@@ -24,4 +24,6 @@ pub enum LoadError {
     UnknownKeyedField(String),
     #[error("x-ref 字段 {0} 未在 properties 中定义")]
     UnknownRefField(String),
+    #[error("x-filter 字段 {0} 未在 properties 中定义")]
+    UnknownFilterField(String),
 }

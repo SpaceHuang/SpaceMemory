@@ -23,6 +23,7 @@ pub mod drift;
 pub mod envelope;
 pub mod error;
 pub mod event;
+pub mod find;
 pub mod freshness;
 pub mod lock;
 pub mod ops;

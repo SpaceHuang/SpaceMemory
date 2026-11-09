@@ -77,6 +77,11 @@ pub enum MemError {
 
     #[error("参数非法：{0}")]
     BadArgument(String),
+
+    /// 检索/过滤参数的显式拒收（R10 §2.7：4 枚机判 kind，两前端同码——CLI JSON
+    /// 错误体与 MCP JSON-RPC error 的 data.kind 携带同一 kind 字符串）。
+    #[error("{message}")]
+    ParamRejected { kind: String, message: String },
 }
 
 pub type MemResult<T> = Result<T, MemError>;
@@ -84,5 +89,13 @@ pub type MemResult<T> = Result<T, MemError>;
 impl MemError {
     pub fn io(path: impl Into<String>, e: std::io::Error) -> Self {
         MemError::Io { path: path.into(), source: e }
+    }
+
+    /// 机判错误 kind（R10 §2.7）：仅 ParamRejected 携带；两前端据此同码透出。
+    pub fn param_kind(&self) -> Option<&str> {
+        match self {
+            MemError::ParamRejected { kind, .. } => Some(kind),
+            _ => None,
+        }
     }
 }

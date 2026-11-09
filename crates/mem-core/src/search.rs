@@ -46,5 +46,10 @@ pub fn record_matches(
     if payload_contains(payload, q_fold) {
         return true;
     }
-    fold(&String::from_utf8_lossy(body)).contains(q_fold)
+    // 正文域 UTF-8 参与前提收口（R10 §2.3 / R11.4 检索侧先行）：非合法 UTF-8 的
+    // 正文退出匹配——有损解码匹配是需求已否决的伪命中形态。身份/别名/载荷三域照常。
+    match std::str::from_utf8(body) {
+        Ok(text) => fold(text).contains(q_fold),
+        Err(_) => false,
+    }
 }

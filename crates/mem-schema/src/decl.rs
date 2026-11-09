@@ -28,6 +28,56 @@ pub struct RefSpec {
     pub existence: bool,
 }
 
+/// x-filter 字段的声明形态（R10 决策③：取值形态由属性本体的 schema 定义承载；
+/// 形态从 `type` 关键字读取，**不从 enum 推导**——评审 L2）。
+///
+/// v1 支持形态固定四类（string / number / boolean / array）；元素为标量的数组
+/// 运行时按元素实际 JSON 形态裁定等值。支持形态之外的声明（对象、多类型、
+/// 无 type 等）加载不失败（前向容忍），但会被 verify 告警
+/// `filter_shape_unsupported`，运行时对该字段过滤 → 兼容类型集为空 →
+/// `invalid_filter_value`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterShape {
+    /// `"type": "string"`——折叠等值。
+    Text,
+    /// `"type": "number"`——JSON 数值文法解析后数值等值。
+    Number,
+    /// `"type": "boolean"`——仅认字面 `true`/`false`。
+    Bool,
+    /// `"type": "array"`——任一元素按其实际形态等值即命中。
+    Array,
+    /// v1 支持形态之外的声明（verify 告警；运行时不可解释任何文本）。
+    Unsupported,
+}
+
+impl FilterShape {
+    /// verify 用：是否 v1 支持形态。
+    pub fn is_supported(&self) -> bool {
+        !matches!(self, FilterShape::Unsupported)
+    }
+}
+
+/// 从属性 schema 读取声明形态（单源：形态 = 属性本体定义，不重复声明）。
+fn filter_shape_of(prop: &serde_json::Value) -> FilterShape {
+    let kinds: Vec<&str> = match prop.get("type") {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        // type 数组：剔除 null（可空字段），恰剩一个标量/array 才可判定。
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| *s != "null")
+            .collect(),
+        _ => vec![],
+    };
+    match kinds.as_slice() {
+        ["string"] => FilterShape::Text,
+        ["number"] => FilterShape::Number,
+        ["boolean"] => FilterShape::Bool,
+        ["array"] => FilterShape::Array,
+        _ => FilterShape::Unsupported,
+    }
+}
+
 /// 一种类型声明的运行时形态。
 #[derive(Debug)]
 pub struct TypeDecl {
@@ -38,6 +88,8 @@ pub struct TypeDecl {
     derived_rel: String,
     topics: Vec<String>,
     refs: BTreeMap<String, RefSpec>,
+    /// x-filter 声明（payload 属性级，R10 决策③）：字段 → 声明形态。
+    filters: BTreeMap<String, FilterShape>,
     raw: serde_json::Value,
     validator: jsonschema::Validator,
 }
@@ -125,6 +177,23 @@ impl TypeDecl {
             }
         }
 
+        // x-filter 解析（payload 属性级，R10 决策③）。点名缺失与 x-ref 同族：
+        // 加载即响亮失败（R6.1）；形态不支持的声明不失败（verify 告警 + 运行时
+        // 兼容集为空），保持对支持形态之外声明的前向容忍。
+        let mut filters = BTreeMap::new();
+        if let Some(props) = properties {
+            for (field, spec) in props {
+                if spec.get("x-filter") == Some(&serde_json::Value::Bool(true)) {
+                    filters.insert(field.clone(), filter_shape_of(spec));
+                }
+            }
+        }
+        for f in filters.keys() {
+            if !properties.map(|p| p.contains_key(f)).unwrap_or(false) {
+                return Err(LoadError::UnknownFilterField(f.clone()));
+            }
+        }
+
         let validator = jsonschema::options()
             .build(&raw)
             .map_err(|e| LoadError::SchemaCompile(e.to_string()))?;
@@ -137,6 +206,7 @@ impl TypeDecl {
             derived_rel,
             topics,
             refs,
+            filters,
             raw,
             validator,
         })
@@ -162,6 +232,12 @@ impl TypeDecl {
     }
     pub fn ref_specs(&self) -> &BTreeMap<String, RefSpec> {
         &self.refs
+    }
+
+    /// x-filter 声明（R10 决策③）：字段 → 声明形态（含 Unsupported——供 verify
+    /// 告警 filter_shape_unsupported 与运行时兼容判定）。
+    pub fn filter_fields(&self) -> &BTreeMap<String, FilterShape> {
+        &self.filters
     }
     pub fn raw(&self) -> &serde_json::Value {
         &self.raw
