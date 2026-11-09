@@ -366,3 +366,55 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     assert_eq!(v2["warnings_truncated"], json!(true));
     serve.kill().ok();
 }
+
+/// B2 生产路径复验（实施评审第三轮修复要求 3）：新文件落盘后的第一次读取不得
+/// 因"扫描后新增文件被检查点提前确认"而漏——direct（stat 失配）必命中；收敛回
+/// indexed 后（下一次物化将其入扫描）仍命中且 read_mode=indexed。CLI 与 MCP 各验。
+#[test]
+fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    let s = init(&dir);
+    std::fs::create_dir_all(dir.join("types/doc")).unwrap();
+    std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
+    let _a = add(&s, r#"{"title":"anchor"}"#);
+
+    let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
+        .args(["serve", "--store", &s, "--idle-secs", "30"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().unwrap();
+    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
+    assert!(wait_until(|| mode_of(&cli_find(&s, "anchor", None)) == "indexed", 50, 100));
+
+    // 扫描后新落盘的合法记录 X（外部放置形态）。
+    let env = mem_core::envelope::Envelope {
+        id: "01f9b200-0000-7000-8000-0000000000b2x".into(),
+        r#type: "doc".into(),
+        created: "2026-11-10T00:00:00Z".into(),
+        modified: "2026-11-10T00:00:00Z".into(),
+        version: 1,
+        principal: None, refs: vec![], aliases: vec![],
+        evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+    };
+    let bytes = mem_core::record::serialize_new(&env, &json!({"title":"b2newx marker"}), b"");
+    std::fs::write(dir.join("records/doc/b2-new.md"), bytes).unwrap();
+
+    // 第一次读取（CLI）：X 必须在命中清单（落盘后 stat 失配 → direct 直读真相层）。
+    let v1 = cli_find(&s, "b2newx", None);
+    assert!(hit_ids(&v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "新文件第一次读取不得漏（B2）：{v1}");
+    // 第一次读取（MCP）：同面。
+    let mcp_v1 = mcp_find(&s, "b2newx", None);
+    assert!(hit_ids(&mcp_v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "MCP 新文件第一次读取不得漏（B2）：{mcp_v1}");
+
+    // 维护收敛回 indexed 后仍命中，且此轮响应真走 indexed（显式模式断言）。
+    assert!(wait_until(|| mode_of(&cli_find(&s, "b2newx", None)) == "indexed", 80, 150),
+        "维护收敛回 indexed");
+    let v2 = cli_find(&s, "b2newx", None);
+    assert!(v2["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false),
+        "收敛后应真走 indexed：{v2}");
+    assert!(hit_ids(&v2, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "indexed 命中含新文件：{v2}");
+    serve.kill().ok();
+}

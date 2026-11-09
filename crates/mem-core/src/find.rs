@@ -213,14 +213,25 @@ pub fn filter_declaration_audit(types: &TypeSet) -> Vec<String> {
 }
 
 /// 候选类型集（§2.4）：type 参数/view 限定到的类型集，未限定时 = 全店已加载类型集。
+/// `--type` 与 `--view` 同给时候选集取**交集**（实施评审 L3）——精筛按 view ∧ type
+/// 交集裁定可命中记录，声明检查作用域必须与之一致，否则只被 --type 类型声明的
+/// 过滤字段会被误报 unknown_filter_field；交集为空 → 一切过滤报 unknown_filter_field
+/// （与"交集内记录恒空、过滤条件永不命中"一致）。
 fn candidate_types(types: &TypeSet, type_narrow: Option<&str>, view_types: &[String]) -> Vec<String> {
-    if !view_types.is_empty() {
-        return view_types.to_vec();
+    let mut base: Vec<String> = if !view_types.is_empty() {
+        view_types.to_vec()
+    } else {
+        match type_narrow {
+            Some(t) => vec![t.to_string()],
+            None => types.decls().map(|d| d.type_name().to_string()).collect(),
+        }
+    };
+    if let Some(t) = type_narrow {
+        if !view_types.is_empty() {
+            base.retain(|x| x == t);
+        }
     }
-    match type_narrow {
-        Some(t) => vec![t.to_string()],
-        None => types.decls().map(|d| d.type_name().to_string()).collect(),
-    }
+    base
 }
 
 /// 声明检查与解析（唯一规则，§2.4）：

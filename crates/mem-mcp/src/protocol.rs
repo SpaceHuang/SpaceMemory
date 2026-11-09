@@ -532,7 +532,8 @@ fn make_ctx<'a>(
     store: &'a Store,
     types: &'a TypeSet,
     session_id: Option<&'a str>,
-) -> WriteContext<'a> {    let principal_label = session_id
+) -> WriteContext<'a> {
+    let principal_label = session_id
         .and_then(|sid| session::get(store, sid).ok().flatten())
         .map(|l| l.principal)
         .unwrap_or_default();

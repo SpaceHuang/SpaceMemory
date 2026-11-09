@@ -636,3 +636,53 @@ fn filter_declaration_audit_reports_unsupported_shapes() {
     assert!(!joined.contains("字段 status"), "支持形态不告警：{report:?}");
     assert!(!joined.contains("字段 mixed"), "数组形态支持：{report:?}");
 }
+
+/// --type 与 --view 同给：候选类型集取交集（实施评审 L3）——声明检查作用域与
+/// 精筛（view ∧ type 交集）一致；只被 --type 类型声明的字段不得误报
+/// unknown_filter_field；交集为空 → 一切过滤显式报错（可命中记录恒空）。
+#[test]
+fn filter_candidate_types_view_and_type_intersect() {
+    let f = fresh_store();
+    seed_library(&f.store);
+    let d001 = "01f1d000-0000-7000-8000-0000000000d001";
+    let view_doc = mem_core::view::ViewFilter {
+        types: vec!["doc".to_string()],
+        ..Default::default()
+    };
+
+    // type=doc ∧ view.types=[doc]：score 只被 doc 声明——此前 view 独占候选集时
+    // alt 被排除没问题、但若字段只被 --type 类型声明则误报；此处正向验证不误报。
+    let out = find::execute(FindParams {
+        store: &f.store, types: &f.types, query: None,
+        filters: &conds(&[("score", "1")]),
+        type_narrow: Some("doc"), view: Some(&view_doc),
+        limit: 50, offset: 0,
+        mode: ReadMode::Direct { reason: "测试".into() }, prefilter: None,
+    })
+    .unwrap();
+    let d002 = "01f1d000-0000-7000-8000-0000000000d002";
+    assert_eq!(ids(&out), vec![d001, d002], "doc ∩ doc：score=1 命中 1 与 1.0：{:?}", ids(&out));
+
+    // type=alt ∧ view.types=[doc]：交集为空 → 一切过滤显式报错（记录恒不可命中）。
+    let e = find::execute(FindParams {
+        store: &f.store, types: &f.types, query: None,
+        filters: &conds(&[("score", "1")]),
+        type_narrow: Some("alt"), view: Some(&view_doc),
+        limit: 50, offset: 0,
+        mode: ReadMode::Direct { reason: "测试".into() }, prefilter: None,
+    })
+    .unwrap_err();
+    assert_eq!(kind_of(&e), "unknown_filter_field", "交集为空 → 显式错误");
+
+    // 无过滤时同给组合照常运行（类型与视图双限定，词项面不受影响）。
+    let out = find::execute(FindParams {
+        store: &f.store, types: &f.types, query: None,
+        filters: &conds(&[]),
+        type_narrow: Some("doc"), view: Some(&view_doc),
+        limit: 50, offset: 0,
+        mode: ReadMode::Direct { reason: "测试".into() }, prefilter: None,
+    })
+    .unwrap();
+    assert!(ids(&out).iter().all(|id| id.ends_with("d001") || id.ends_with("d002") || id.ends_with("d003")),
+        "view ∧ type 双限定生效（仅 doc 记录）：{:?}", ids(&out));
+}

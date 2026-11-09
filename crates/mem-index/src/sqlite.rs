@@ -240,7 +240,25 @@ impl Index {
         usize,
         std::collections::BTreeMap<String, (u128, u64)>,
     )> {
+        self.rebuild_with_entries_with_hook(store, None)
+    }
+
+    /// [`rebuild_with_entries`] 的可注入变体（实施评审 B2 护栏测试专用）：钩子在
+    /// 扫描完成后、事务与 stat 集采集前执行——生产路径恒 None（经上者进入）。
+    /// 注入窗口 = 评审 B2 的 T0–T2 时序窗口（扫描后新落盘文件）。
+    pub fn rebuild_with_entries_with_hook(
+        &mut self,
+        store: &Store,
+        after_scan: Option<&dyn Fn()>,
+    ) -> MemResult<(
+        usize,
+        usize,
+        std::collections::BTreeMap<String, (u128, u64)>,
+    )> {
         let scan = ops::scan_all(store)?;
+        if let Some(hook) = after_scan {
+            hook();
+        }
         let mut entries = std::collections::BTreeMap::new();
         let mut n_records = 0usize;
         let mut n_refs = 0usize;
@@ -308,28 +326,25 @@ impl Index {
                     rusqlite::params![rel, line],
                 )
                 .map_err(sq_err)?;
-        }
-        self.conn
-            .execute("COMMIT", [])
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
-        // r10（B1）：stat 集覆盖该次扫描看到的**全部** records/ 文件（含不可解析/
-        // 不可读文件）——否则坏文件的后续外部变化逃过 stat 证明、indexed 告警陈旧。
-        // 与 scan_all 同源枚举（enumerate_md）；metadata 不可读的文件与
-        // stat_snapshot 语义一致（缺席）。
-        for rel in mem_core::event::enumerate_md(store, "records")? {
-            if entries.contains_key(&rel) {
-                continue;
-            }
-            if let Ok(md) = std::fs::metadata(store.abs(&rel)) {
+            // 检查点 stat 集覆盖坏/不可读文件（决策⑦/B1）——来源仍是**同一次扫描**
+            //（scan.records ∪ scan.bad == 扫描时刻枚举全集）。metadata 失败（如已被
+            // 删除）→ 缺席，与 stat_snapshot 语义一致。
+            // 实施评审 B2：**绝不在此处重新枚举磁盘**——重枚举会把扫描后新落盘的
+            // 文件混进 entries 而索引无其行，实时 stat 与检查点一致的假象消掉了
+            // r5 B3 的失配信号（读路径误判 Indexed、命中/告警漏该文件）。
+            if let Ok(md) = std::fs::metadata(store.abs(rel)) {
                 let mtime = md
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                entries.insert(rel, (mtime, md.len()));
+                entries.insert(rel.clone(), (mtime, md.len()));
             }
         }
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
         // 物化代际递增（r4 B2：检查点据此核对与索引同代）。
         let prev = self
             .conn

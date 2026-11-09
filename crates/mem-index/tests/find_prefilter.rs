@@ -302,3 +302,79 @@ fn proved_index_only_constructible_via_open_proved() {
         takes(&p);
     }
 }
+
+/// 护栏（实施评审 B2 / 红线21）：扫描之后、stat 集采集之前落盘的新文件**不得**
+/// 进入本次物化的检查点 entries，也不得出现在 records/bad_records 两表——
+/// 否则实时枚举与 entries 一致 → 读路径误判 Indexed → 命中/告警漏该文件
+/// （r5 B3 立法：entries 只允许来自同一次扫描，绝不重新枚举磁盘）。
+#[test]
+fn post_scan_new_file_never_enters_checkpoint_entries() {
+    let (_tmp, store) = fresh_store();
+    seed(&store, "doc", "w001", "2026-11-02T00:00:00Z", json!({"title":"before"}), "");
+
+    let injected = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let root = store.root().to_path_buf();
+    let flag = injected.clone();
+    let hook = move || {
+        // 注入：扫描完成后、stat 集采集前——新文件 X 落盘（坏文件形态）。
+        std::fs::write(root.join("records/doc/post-scan.md"), b"corrupt").unwrap();
+        *flag.lock().unwrap() = true;
+    };
+
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
+    let (_, _, entries) =
+        idx.rebuild_with_entries_with_hook(&store, Some(&hook)).unwrap();
+    assert!(*injected.lock().unwrap(), "钩子必须已注入（护栏有效性自证）");
+
+    // 1) X 不在本次扫描的 stat 集——实时枚举含 X → stat 失配 → 读路径直读。
+    assert!(
+        !entries.contains_key("records/doc/post-scan.md"),
+        "扫描后新增文件不得进入检查点 entries（红线21）：{entries:?}"
+    );
+    // 2) X 不在 records / bad_records 两表（否则 indexed 内容缺 X 还自认新鲜）。
+    let ro = rusqlite::Connection::open_with_flags(
+        store.abs("index/index.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let n_rec: i64 = ro
+        .query_row(
+            "SELECT count(*) FROM records WHERE rel = 'records/doc/post-scan.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let n_bad: i64 = ro
+        .query_row(
+            "SELECT count(*) FROM bad_records WHERE rel = 'records/doc/post-scan.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n_rec, 0, "records 表不得含扫描后新增文件");
+    assert_eq!(n_bad, 0, "bad_records 表不得含扫描后新增文件");
+    // 3) 失配信号在：实时 stat（含 X）≠ entries（不含 X）→ 读路径必直读。
+    let realtime = mem_core::freshness::stat_snapshot(&store);
+    assert!(realtime.contains_key("records/doc/post-scan.md"));
+    assert_ne!(realtime, entries, "实时 stat 与检查点必须失配（直读信号，红线21）");
+}
+
+/// 中段/后段子串语义回归（自 index.rs 的 Index::search 测试迁移——L2：search 已删，
+/// 粗筛契约由 candidates 承担）：折叠列 LIKE 仍是子串语义，不回退 token MATCH。
+#[test]
+fn candidates_mid_substring_semantics() {
+    let (_tmp, store) = fresh_store();
+    seed(&store, "memory", "ss01", "2026-11-05T00:00:00Z",
+        json!({"title": "shared-alpha"}), "hello world");
+
+    let (epoch, entries) = materialize(&store).unwrap();
+    publish(&store, epoch, entries);
+    let pf = proven(&store).index.expect("证明成立");
+
+    // payload 中段子串命中（"shared-alpha" 的中段）。
+    let rows = pf.candidates(&["hared-al".to_string()], None).unwrap();
+    assert_eq!(rows.len(), 1, "payload 中段子串命中：{:?}", rows.iter().map(|r| r.rel.clone()).collect::<Vec<_>>());
+    // 正文后段子串命中（"hello world" 的后段）。
+    let rows = pf.candidates(&["ello".to_string()], None).unwrap();
+    assert_eq!(rows.len(), 1, "正文后段子串命中");
+}
