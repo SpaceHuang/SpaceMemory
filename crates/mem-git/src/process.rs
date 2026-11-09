@@ -143,6 +143,83 @@ impl mem_core::ops::HistoryStore for GitProcess {
     }
 }
 
+// ---------- R11（新增面9）：只读历史方法（restore_body 来源通道，BD4） ----------
+
+fn require_git_dir(workdir: &std::path::Path) -> MemResult<()> {
+    if workdir.join(".git").exists() {
+        Ok(())
+    } else {
+        Err(MemError::Git(format!(
+            "无 .git（{}）——history/git: 历史通道不可用（BD4：git 缺席即无历史通道，file: 源仍可用）",
+            workdir.display()
+        )))
+    }
+}
+
+impl GitProcess {
+    /// HEAD 树中该相对路径的字节（verify 的 .gitattributes 提交树核验用，BD5 ④；
+    /// 只读 best-effort：无 .git / git 缺席 / 读取失败 → Ok(None)——历史缺席是
+    /// 合法形态，红线10）。
+    pub fn head_file(&self, rel: &str) -> MemResult<Option<Vec<u8>>> {
+        if !self.workdir.join(".git").exists() {
+            return Ok(None);
+        }
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(["show", &format!("HEAD:{rel}")])
+            .output()
+            .map_err(|e| MemError::Git(format!("git show 失败：{e}")))?;
+        Ok(if out.status.success() { Some(out.stdout) } else { None })
+    }
+}
+
+impl mem_core::ops::BodyHistory for GitProcess {
+    fn file_bytes_at(&self, rel: &str, rev: &str) -> MemResult<Option<Vec<u8>>> {
+        require_git_dir(&self.workdir)?;
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(["show", &format!("{rev}:{rel}")])
+            .output()
+            .map_err(|e| MemError::Git(format!("git show 失败：{e}")))?;
+        if out.status.success() {
+            return Ok(Some(out.stdout));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // "路径在该版本不存在"是扫描的合法分支 → Ok(None)；坏版本引用等 → Err。
+        if stderr.contains("does not exist") {
+            Ok(None)
+        } else {
+            Err(MemError::Git(format!(
+                "取历史版本失败（{rev}:{rel}）：{}",
+                stderr.trim()
+            )))
+        }
+    }
+
+    fn list_versions(&self, rel: &str) -> MemResult<Vec<String>> {
+        require_git_dir(&self.workdir)?;
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(["log", "--format=%H", "--", rel])
+            .output()
+            .map_err(|e| MemError::Git(format!("git log 失败：{e}")))?;
+        if !out.status.success() {
+            return Err(MemError::Git(format!(
+                "列历史版本失败（{rel}）：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
