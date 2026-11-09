@@ -53,20 +53,26 @@ pub enum Cmd {
         #[arg(long)]
         deep: bool,
     },
-    /// 过滤定位（LIMIT+续读；返回完整令牌）
+    /// 过滤定位（LIMIT+续读；返回完整令牌；--filter 载荷字段过滤可重复合取，R10）
     List {
         #[arg(long)]
         view: Option<String>,
         #[arg(long = "type")]
         type_filter: Option<String>,
+        /// 载荷字段过滤（字段=值，以第一个 = 分界；可重复、合取）
+        #[arg(long = "filter")]
+        filters: Vec<String>,
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long)]
         offset: Option<usize>,
     },
-    /// 查找（id 前缀 / 别名 / 正文字面子串；直读或 FTS 快路径）
+    /// 查找（词项与/与位排除、载荷字段过滤；id 前缀/别名/逐值/正文四域子串命中）
     Find {
         query: String,
+        /// 载荷字段过滤（字段=值，以第一个 = 分界；可重复、合取）
+        #[arg(long = "filter")]
+        filters: Vec<String>,
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long, help = "续读偏移（配合上次输出的 resume.offset）")]

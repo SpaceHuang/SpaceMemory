@@ -12,7 +12,8 @@
 //! 索引上不建唯一性/完整性强制点——强制点必须在真相层原子原语（红线8）。
 
 pub mod checkpoint;
-pub mod fts;
+pub mod proved;
 pub mod sqlite;
 
+pub use proved::{open_proved, Proved, ProvedIndex};
 pub use sqlite::{Index, IndexRow, RefRow};

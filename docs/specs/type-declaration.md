@@ -1,7 +1,7 @@
-# 类型声明两件套格式规范 v1（Type Declaration）
+# 类型声明两件套格式规范 v1.1（Type Declaration）
 
-- 状态：v1（设计文档 D19 的规范定稿；§8 第 2 步）
-- 上游：R7/R8（声明式引入、零知识、校验强制与分档、两件套）、D9/D10/D16/D19
+- 状态：v1.1（x-filter 词汇随 R10 实施落表，keyword-search-design.md §9 第 3 条；v1 = 设计文档 D19 的规范定稿）
+- 上游：R7/R8（声明式引入、零知识、校验强制与分档、两件套）、R10（载荷字段过滤）、D9/D10/D16/D19
 - 每种内容类型 = **两件套**：`types/<t>/schema.json`（(a) 机器可判定）+ `types/<t>/conventions.md`（(b) 判断型教学）。同源交付，分别承载 R7 的两类规则（R8.8）。
 - **新增类型 = 新增两件套，基础设施零改动**（R8.1）；机制对 payload 结构零知识（红线1/R8.2）。
 
@@ -20,13 +20,17 @@
 | `x-ref`: `{"target_type": "<t>", "existence": true}` | payload 属性 | 引用字段：目标类型 + 存在性校验（R8.5/红线12 同族）；字段值必须是该类型现存记录 ID | mem-schema × mem-core 记录表 | (a) |
 | `x-dag`: `true` | 根 | 派生类引用强制无环（D16/红线17）：该类型实例经其派生 rel 边构成的图必须为 DAG；写路径检出环 → 结构化拒收 | mem-core 引用图 | (a) |
 | `x-topics`: `[主题面…]` | 根 | 必挂主题面清单（开放问题33 边界；v1 仅声明 + 校验 payload 相应字段存在） | mem-schema | (a)/(b) 边界 |
+| `x-filter`: `true` | payload 属性 | 声明该字段值可作清单与检索的过滤条件（R10 决策③）；取值形态 = 该属性本体的 schema 定义（`type` 关键字，不从 `enum` 推导） | mem-core 过滤执行器 | (a) |
 
 规则：
 
-- 词汇表属**基础设施**（机制认识这五个关键字）；**类型本身仍是纯数据**——新增类型零代码（红线13 不破：机制新增的是"认识关键字"这一信封级能力，载荷字段含义仍完全由声明提供）；
+- 词汇表属**基础设施**（机制认识这些关键字并机械执行）；**类型本身仍是纯数据**——新增类型零代码（红线13 不破：机制新增的是"认识关键字"这一信封级能力，载荷字段含义仍完全由声明提供）；
 - `x-ref` 字段的 JSON Schema 类型约束必须与之一致（`"type": "string"`，uuid 形式）；不一致由 verify 报告；
 - `x-dag: true` 的类型，其 `x-ref` 引用中语义为"派生自"的 rel（默认 `derived_from`，可被 schema 根级 `x-derived-rel` 覆盖）参与 DAG 检查；
-- `x-grade` 缺省 = `lenient`（保守默认；strict 必须显式声明）。
+- `x-grade` 缺省 = `lenient`（保守默认；strict 必须显式声明）；
+- `x-filter` 点名的属性必须存在于 `properties`（点名缺失 = 声明自身坏写，加载即响亮失败，与 x-unique-key/x-ref 同族）；
+- `x-filter` 的 **v1 支持形态** = `string` / `number` / `boolean` / 元素为以上标量的 `array`（任一元素等值即命中），形态从属性的 `type` 关键字读取（`type` 数组剔除 `null` 后恰剩一个可判定；`type: "integer"` 不在支持集）；支持形态之外的属性声明了 `x-filter` → verify 告警 `filter_shape_unsupported`，运行时对该字段过滤 → `invalid_filter_value`（声明不失败，前向容忍）；
+- `x-filter` 的等值语义由声明形态承担：string → 折叠等值（NFC+小写，与检索共用折叠单源）；number → 过滤文本按 JSON 数值文法严格解析后数值等值（"1" 与 "1.0" 同值）；boolean → 仅认字面 `true`/`false`；array → 任一元素按其实际 JSON 形态等值即命中。规范过滤条件 = 字段＋标量文本（CLI `--filter 字段=值` 值原样、MCP `filters` 值一律 JSON 字符串），两端合法条件空间逐字相同（R10 决策④）。
 
 ### 1.2 根级约定形状（v1）
 
@@ -44,7 +48,7 @@
 }
 ```
 
-- `properties` 中被 `x-unique-key`/`x-ref`/`x-topics` 点名的字段必须在 `properties` 内有定义；
+- `properties` 中被 `x-unique-key`/`x-ref`/`x-topics`/`x-filter` 点名的字段必须在 `properties` 内有定义；
 - 引用字段（x-ref）的值 = 目标记录 uuid v7 字符串——**引用只填 ID 不填名**（D11）。
 
 ## 2. 唯一键与路径推导（D19/D11）
@@ -91,3 +95,4 @@
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.0 | 2026-11-05 | 初版：x-* 词汇表、唯一键/路径推导、演化容忍、task 试金石契约 |
+| v1.1 | 2026-11-09 | x-filter 词汇（R10 决策③④，keyword-search-design.md §2.4）：属性级过滤声明、v1 支持形态与等值语义、点名缺失加载响亮失败、形态不支持 verify 告警 `filter_shape_unsupported`；词汇表版本 1→2（机制关键字 6→7） |

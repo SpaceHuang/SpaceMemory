@@ -6,7 +6,7 @@
 //!   存在性——由本校验器机械执行，不依赖写入者自律（R8.5）；
 //! - conventions.md 承载判断型行为（R7-b），与机制解耦、独立演化。
 //!
-//! 词汇表属基础设施（机制认识这五个关键字）；**类型本身仍是纯数据**——新增类型 =
+//! 词汇表属基础设施（机制认识这些关键字并机械执行）；**类型本身仍是纯数据**——新增类型 =
 //! 新增两件套，基础设施零改动（R8.1/红线1）：
 //!
 //! | 关键字 | 语义 |
@@ -16,6 +16,7 @@
 //! | `x-ref` | 引用字段：目标类型与存在性校验 |
 //! | `x-dag` | 派生类引用强制无环（D16/红线17） |
 //! | `x-topics` | 必挂主题面（R7 (a)/(b) 边界） |
+//! | `x-filter` | 载荷字段可过滤声明（R10 决策③；词汇表 v2） |
 //!
 //! 演化容忍（R8.7）：类型声明变更后，既有记录仍可读——降级、标注、不拒绝服务；
 //! 迁移是显式例程，不做隐式自动改写。
@@ -26,7 +27,7 @@ pub mod evolve;
 pub mod keywords;
 pub mod validate;
 
-pub use decl::{Grade, RefSpec, TypeDecl, TypeSet};
+pub use decl::{FilterShape, Grade, RefSpec, TypeDecl, TypeSet};
 pub use error::LoadError;
 pub use validate::Policy;
 

@@ -16,45 +16,52 @@ use serde_json::{json, Value};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// 单请求处理：Some(应答 JSON-RPC object)；None = 通知（无应答）。
+/// 检索/过滤参数的显式拒收（R10 §2.7）以 JSON-RPC error 应答，data.kind 携带
+/// 机判 kind——与 CLI JSON 错误体同码。
 pub fn handle_request(store_root: &Path, req: &Value) -> Option<Value> {
     let method = req.get("method")?.as_str()?;
     let id = req.get("id").cloned();
-    let result = match method {
-        "initialize" => Some(initialize(store_root, req.get("params"))),
-        "notifications/initialized" | "initialized" => None,
-        "ping" => Some(Ok(json!({}))),
-        "tools/list" => Some(Ok(json!({ "tools": crate::tools::tool_definitions() }))),
-        "tools/call" => Some(tool_call(store_root, req.get("params"))),
-        other => Some(Err(format!("未知方法 {other}"))),
+    let result: MemResult<Value> = match method {
+        "initialize" => Ok(initialize(store_root, req.get("params"))),
+        "notifications/initialized" | "initialized" => return None,
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": crate::tools::tool_definitions() })),
+        "tools/call" => tool_call(store_root, req.get("params")),
+        other => Err(MemError::BadArgument(format!("未知方法 {other}"))),
     };
     let id = id?;
     Some(match result {
-        Some(Ok(v)) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
-        Some(Err(e)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": e } }),
-        None => return None,
+        Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
+        Err(e) => {
+            let mut error = json!({ "code": -32603, "message": e.to_string() });
+            if let Some(kind) = e.param_kind() {
+                error["data"] = json!({ "kind": kind });
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "error": error })
+        }
     })
 }
 
-fn initialize(store_root: &Path, _params: Option<&Value>) -> Result<Value, String> {
+fn initialize(store_root: &Path, _params: Option<&Value>) -> Value {
     // MCP initialize = 显式建立操作（D13.1）：此处只做协议握手；台账建立必须经
     // mem_session_start 显式提供 principal（红线25：不能从协议噪声推断身份）。
     let _ = store_root;
-    Ok(json!({
+    json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "mem", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "SpaceMemory 机制层。先 mem_session_start 显式建立台账（principal 必填，防错报不防伪装）；写工具携带 expect 全令牌（红线19）。",
-    }))
+    })
 }
 
-fn tool_call(store_root: &Path, params: Option<&Value>) -> Result<Value, String> {
-    let p = params.ok_or("tools/call 缺 params")?;
+fn tool_call(store_root: &Path, params: Option<&Value>) -> MemResult<Value> {
+    let p = params.ok_or_else(|| MemError::BadArgument("tools/call 缺 params".into()))?;
     let name = p
         .get("name")
         .and_then(|v| v.as_str())
-        .ok_or("tools/call 缺 name")?;
+        .ok_or_else(|| MemError::BadArgument("tools/call 缺 name".into()))?;
     let args = p.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let out = dispatch_tool(store_root, name, &args).map_err(|e| e.to_string())?;
+    let out = dispatch_tool(store_root, name, &args)?;
     Ok(json!({
         "content": [ { "type": "text", "text": serde_json::to_string_pretty(&out).unwrap_or_default() } ],
         "isError": false,
@@ -156,19 +163,89 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             Ok(json!({"session": l.id, "status": l.status, "watermark": l.watermark}))
         }
         "mem_list" => {
+            // R10：filters 增参（决策⑤，值一律 JSON 字符串）+ 统一响应形状；
+            // 快路径经 open_proved 构造即证明（决策②——MCP list 不再恒直读），
+            // CLI 与 MCP 同源调用 mem-core find::execute。
+            let filters = parse_mcp_filters(args.get("filters"))?;
             let limit = mem_core::budget::effective_limit(&store, args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize));
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let r = match arg_str!(args, "view") {
-                Some(v) => mem_core::view::execute_from(&store, &v, limit, offset)?,
-                None => {
-                    let types_f = arg_str!(args, "type").map(|t| vec![t]).unwrap_or_default();
-                    mem_core::view::execute_filter(&store, &mem_core::view::ViewFilter { types: types_f, ..Default::default() }, limit, offset)?
+            let proved = proved_access(&store);
+            let vf = match arg_str!(args, "view") {
+                Some(v) => {
+                    let vr = ops::get(&store, &v)?;
+                    if vr.record.envelope.r#type != "view" {
+                        return Err(MemError::BadArgument(format!("{v} 不是 view 记录")));
+                    }
+                    Some(mem_core::view::ViewFilter::from_payload(&vr.record.payload)?)
                 }
+                None => None,
             };
+            let prefilter = if vf.is_some() {
+                None
+            } else {
+                proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter)
+            };
+            let outcome = mem_core::find::execute(mem_core::find::FindParams {
+                store: &store,
+                types: &types,
+                query: None,
+                filters: &filters,
+                type_narrow: arg_str!(args, "type").as_deref(),
+                view: vf.as_ref(),
+                limit,
+                offset,
+                mode: proved.mode,
+                prefilter,
+            })?;
             Ok(json!({
-                "items": r.items.iter().map(|i| json!({"id": i.envelope.id, "type": i.envelope.r#type, "rel": i.rel, "token": i.token.to_string()})).collect::<Vec<_>>(),
-                "truncated": r.truncated,
-                "resume": r.resume_hint.as_ref().map(|h| json!({"offset": h.offset})),
+                "read_mode": outcome.mode,
+                "items": outcome.hits.iter().map(|h| json!({"id": h.id, "type": h.type_name, "rel": h.rel, "modified": h.modified, "version": h.version, "token": h.token})).collect::<Vec<_>>(),
+                "truncated": outcome.truncated,
+                "resume": outcome.resume_offset.map(|o| json!({"offset": o})).unwrap_or(Value::Null),
+                "filters_applied": filters_applied_json(&outcome.filters_applied),
+                "warnings": outcome.warnings,
+                "warnings_truncated": outcome.warnings_truncated,
+                "note": outcome_note(outcome.truncated, outcome.resume_offset, outcome.warnings_truncated),
+            }))
+        }
+        "mem_find" => {
+            // R10 决策⑥：mem_find 新工具——query 必填且须含肯定词项（空查询/纯否定
+            // → query_invalid；纯过滤由 mem_list 承载）；filters 值一律 JSON 字符串
+            //（决策④：标量文本，类型解释由字段声明承担——非字符串标量显式拒收）。
+            let query = arg_str!(args, "query").ok_or_else(|| {
+                MemError::ParamRejected {
+                    kind: mem_core::find::QUERY_INVALID.into(),
+                    message: "query 必填且须含至少一个肯定词项（纯过滤清单请走 mem_list）".into(),
+                }
+            })?;
+            let filters = parse_mcp_filters(args.get("filters"))?;
+            let limit = mem_core::budget::effective_limit(&store, args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize));
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let proved = proved_access(&store);
+            let outcome = mem_core::find::execute(mem_core::find::FindParams {
+                store: &store,
+                types: &types,
+                query: Some(&query),
+                filters: &filters,
+                // find 不设 type/view 参数（检索的类型/域限定是基线未来项）。
+                type_narrow: None,
+                view: None,
+                limit,
+                offset,
+                mode: proved.mode,
+                prefilter: proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter),
+            })?;
+            Ok(json!({
+                "read_mode": outcome.mode,
+                "hits": outcome.hits.iter().map(|h| json!({"id": h.id, "type": h.type_name, "rel": h.rel, "token": h.token})).collect::<Vec<_>>(),
+                "limit": limit,
+                "truncated": outcome.truncated,
+                "resume": outcome.resume_offset.map(|o| json!({"offset": o})).unwrap_or(Value::Null),
+                "query": { "positive": outcome.positive_terms, "negative": outcome.negative_terms },
+                "filters_applied": filters_applied_json(&outcome.filters_applied),
+                "warnings": outcome.warnings,
+                "warnings_truncated": outcome.warnings_truncated,
+                "note": outcome_note(outcome.truncated, outcome.resume_offset, outcome.warnings_truncated),
             }))
         }
         "mem_show" => {
@@ -434,6 +511,64 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         }
         other => Err(MemError::BadArgument(format!("未知工具 {other}"))),
     }
+}
+
+/// 读路径的证明式接入（决策②——调用点不承载新鲜性判断）：与 CLI 同一构造函数
+/// `open_proved`（stat 咨询 ∧ 只读打开 ∧ schema 门禁含 bad_records ∧ epoch 同代）。
+fn proved_access(store: &Store) -> mem_index::Proved {
+    let hello = mem_core::sidecar::probe(store);
+    mem_index::open_proved(store, hello.as_ref())
+}
+
+/// MCP filters 参数解析（决策④/⑤）：JSON 对象 {"字段": "值"}，值**一律 JSON
+/// 字符串**（标量文本，类型解释由字段声明承担）——非字符串 JSON 标量显式拒收
+/// invalid_filter_value，两前端合法条件空间逐字相同。
+fn parse_mcp_filters(v: Option<&Value>) -> MemResult<Vec<mem_core::find::FilterCond>> {
+    let Some(Value::Object(map)) = v else {
+        if v.is_some() {
+            return Err(MemError::ParamRejected {
+                kind: mem_core::find::INVALID_FILTER_VALUE.into(),
+                message: "filters 必须是对象 {\"字段\": \"文本\"}".into(),
+            });
+        }
+        return Ok(vec![]);
+    };
+    map.iter()
+        .map(|(k, val)| {
+            let Some(text) = val.as_str() else {
+                return Err(MemError::ParamRejected {
+                    kind: mem_core::find::INVALID_FILTER_VALUE.into(),
+                    message: format!(
+                        "filters 值须为字符串文本，类型解释由字段声明承担（决策④）：{k} = {val}"
+                    ),
+                });
+            };
+            Ok(mem_core::find::FilterCond { field: k.clone(), text: text.to_string() })
+        })
+        .collect()
+}
+
+/// filters_applied 回显（字段→文本对象）。
+fn filters_applied_json(filters: &[(String, String)]) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in filters {
+        m.insert(k.clone(), Value::String(v.clone()));
+    }
+    m
+}
+
+/// 统一响应 note（§2.6）：截断给续读指引；告警截断注明 verify 续读通道。
+fn outcome_note(truncated: bool, resume: Option<usize>, warnings_truncated: bool) -> String {
+    let mut parts = Vec::new();
+    if truncated {
+        if let Some(off) = resume {
+            parts.push(format!("用 offset {off} 续读"));
+        }
+    }
+    if warnings_truncated {
+        parts.push("完整坏记录清单经 mem_verify".into());
+    }
+    parts.join("；")
 }
 
 fn make_ctx<'a>(

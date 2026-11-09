@@ -142,46 +142,10 @@ fn diagnose_reports_drift_never_rejects() {
     assert!(diff.iter().any(|d| d.contains("索引缺记录")));
 }
 
-#[test]
-fn search_is_substring_like_on_records_table() {
-    // r11 优化：records_fts 虚表移除——find 子串检索由两执行器共用的 LIKE 语义
-    // 承担（r7/r10 对齐后命中契约一致）；本测试钉住子串语义不回退到 token MATCH。
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("index/index.sqlite");
-    let store = fake_store(tmp.path());
-    // 磁盘 seed 记录（rebuild 从磁盘扫描；折叠列由物化写入）。
-    let env = mem_core::envelope::Envelope {
-        id: "01a1c111-0000-7000-8000-000000000001".into(),
-        r#type: "memory".into(),
-        created: "2026-11-05T00:00:00Z".into(),
-        modified: "2026-11-05T00:00:00Z".into(),
-        version: 1,
-        principal: None,
-        refs: vec![],
-        aliases: vec!["al".into()],
-        evidence_cutoff_seq: None,
-        commit: None,
-        extra: Default::default(),
-    };
-    let bytes = mem_core::record::serialize_new(
-        &env,
-        &serde_json::json!({"title": "shared-alpha"}),
-        "hello world".as_bytes(),
-    );
-    let abs = store.abs("records/memory/x.md");
-    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-    std::fs::write(abs, bytes).unwrap();
-
-    let mut idx = mem_index::Index::open(&path).unwrap();
-    idx.rebuild(&store).unwrap();
-    // 子串语义：中段/后段命中。
-    let hits = idx.search("hared-al", 10, 0).unwrap();
-    assert_eq!(hits.len(), 1, "payload 中段子串命中");
-    let hits2 = idx.search("ello", 10, 0).unwrap();
-    assert_eq!(hits2.len(), 1, "正文后段子串命中");
-    // 直读模式语义：子串检索不再依赖 FTS5（判断 3：结构化摘要即索引达标）。
-    // "FTS 仅快路径可用"的说法随 records_fts 移除而失效——两执行器同语义。
-}
+// （R10 实施评审 L2）Index::search（单串 LIKE）已删除——粗筛被 FindPrefilter::candidates
+// 取代（keyword-search-design.md §2.1：既有 Index::search 被 candidates 取代）。
+// 其中段/后段子串语义回归迁移至 tests/find_prefilter.rs 的
+// candidates_mid_substring_semantics（payload 中段 + 正文后段仍经折叠列 LIKE 命中）。
 
 #[test]
 fn readonly_open_never_creates_and_epoch_advances() {

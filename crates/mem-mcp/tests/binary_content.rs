@@ -216,7 +216,7 @@ fn tools_list_includes_restore_body() {
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
     let resp = mem_mcp::handle_request(&dir, &req).unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15, "工具面 14→15（BD4）：{}", tools.len());
+    assert_eq!(tools.len(), 16, "工具面：基线 14 + mem_find（R10）+ mem_restore_body（R11 BD4）= 16：{}", tools.len());
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"mem_restore_body"), "{names:?}");
     // mem_show 描述声明 body_utf8/body_b64（BD2 形状随工具面可见）。

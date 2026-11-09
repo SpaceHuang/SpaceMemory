@@ -1,7 +1,14 @@
-//! r12 回归：B7-1 字面 LF/反斜杠查询 direct vs indexed 逐 ID 相等（LF 分隔符
+//! r12 回归：B7-1 字面反斜杠查询 direct vs indexed 逐 ID 相等（折叠列 LF 分隔符
 //! 不得成为假命中源）；B7-2 MCP mem_trace 节点 resume 重放可执行（不重复、
 //! 到达后续节点）；B7-3 MCP mem_show/mem_brief 字节预算与续读（R4.2/红线9
 //! 不因前端豁免）。
+//!
+//! R10 实施迁移注记（keyword-search-design.md §7）：查询文法已按提案决策⑥ 变更为
+//! "空白 = 词项分隔"——LF/U+3000 等空白不再属于词项字符。原 B7-1 的字面 LF 查询
+//! 用例（单 LF、"a" 与 "b" 以 LF 连接、"o" 与 "tw" 以 LF 连接）按新文法迁移为
+//! 多词项与查询 + 空查询/纯否定拒收断言（R10.9）；"LF 分隔符不假命中"的索引侧
+//! 保障由新文法结构性成立（词项永不含空白 → 折叠列 LF 分隔符不可能被词项跨越），
+//! 等价断言面保留。
 
 use assert_cmd::Command;
 use serde_json::{json, Value};
@@ -60,31 +67,46 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
     // 四条内容可控的记录：
     // R1 多值 payload（"alpha"/"one"/"two"）+ 别名 "beta"——拼接列内部有 LF 分隔符；
     // R2 仅正文 "gamma"；
-    // R3 payload 值内含**真实换行** "line1\nline2"；
+    // R3 payload 值内含**真实换行** "line1␊line2"（LF 字面字节）；
     // R4 payload 值含**字面反斜杠+n**（"a\nb" 的字面形式，非换行）。
     let r1 = seed_memory(&dir, "00r1", vec!["beta"], json!({"title": "alpha", "tags": ["one", "two"]}), "");
     let r2 = seed_memory(&dir, "00r2", vec![], json!({"title": "r-two"}), "gamma");
     let r3 = seed_memory(&dir, "00r3", vec![], json!({"title": "line1\nline2"}), "");
     let r4 = seed_memory(&dir, "00r4", vec![], json!({"title": "a\\nb"}), "");
+    // 移除自举 principal（host 取机器名——环境相关命中会污染精确集合断言）。
+    for e in std::fs::read_dir(dir.join("records/principal")).unwrap() {
+        let e = e.unwrap();
+        if e.path().extension().map(|x| x == "md").unwrap_or(false) {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
 
-    // 无索引无检查点 → 必为直读：先记录 direct 命中面。
+    // R10 文法（决策①）下的查询→期望集（词项与）：
+    // - 字面反斜杠单词项：R4；
+    // - 值内真实换行的两个词项（原字面 LF 查询迁移）：R3（同值含 line1 与 line2）；
+    // - "o tw"（原跨分隔符两端子串迁移）：R1（"one" 含 o、"two" 含 tw——AND 跨值
+    //   成立）与 R2（"r-two" 同值含 o 与 tw）；
+    // - "a b"（原字面 "a+LF+b" 查询迁移）：R1 与 R4（各自含 a 与 b）；
+    // - 常规守卫：alpha → R1；gamma → R2。
     let queries: Vec<(&str, Vec<String>)> = vec![
-        // 字面换行（单 LF）：只有值内真实含换行的 R3 命中；LF 分隔符不得假命中（B7-1）。
-        ("\n", vec![r3.clone()]),
-        // 含换行的多字符查询：R4 的字面反斜杠+n 不是换行 → 两模式都不得命中。
-        ("a\nb", vec![]),
-        // 跨分隔符两端子串（"one" 尾 + LF + "two" 头）：不得命中（r11 关闭条件）。
-        ("o\ntw", vec![]),
-        // 字面反斜杠：命中含反斜杠值的 R4。
         ("\\", vec![r4.clone()]),
-        // 值内真实换行的完整匹配：R3（正向守卫——修复不得把合法命中一起掐掉）。
-        ("line1\nline2", vec![r3.clone()]),
-        // 常规查询守卫。
+        ("line1 line2", vec![r3.clone()]),
+        ("o tw", vec![r1.clone(), r2.clone()]),
+        ("a b", vec![r1.clone(), r4.clone()]),
         ("alpha", vec![r1.clone()]),
         ("gamma", vec![r2.clone()]),
     ];
+    // 空查询 / 纯否定（R10.9）：非零退出 + kind=query_invalid——绝不表现为空命中
+    // 清单或全库清单。
+    for bad_q in ["", "  \n ", "--x"] {
+        let o = mem().args(["--store", &s, "find", "--", bad_q]).output().unwrap();
+        assert!(!o.status.success(), "查询 {bad_q:?} 必须非零退出");
+        let err: Value = serde_json::from_slice(&o.stderr).unwrap();
+        assert_eq!(err["kind"], json!("query_invalid"), "{err}");
+    }
+
     let mut direct_hits: Vec<(String, Vec<String>)> = Vec::new();
-    for (q, _) in &queries {
+    for (q, expected) in &queries {
         let o = mem().args(["--store", &s, "find", q]).output().unwrap();
         let v = j(&o);
         assert!(
@@ -93,6 +115,11 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         );
         let ids: Vec<String> = v["hits"].as_array().unwrap()
             .iter().map(|h| h["id"].as_str().unwrap().to_string()).collect();
+        let mut got = ids.clone();
+        got.sort();
+        let mut exp = expected.clone();
+        exp.sort();
+        assert_eq!(got, exp, "direct 查询 {q:?} 命中面不符期望\n{v}");
         direct_hits.push((q.to_string(), ids));
     }
 
@@ -116,8 +143,9 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         "sidecar 收敛后 find 应走 indexed 模式"
     );
 
-    // 逐查询：indexed 命中面 == direct 命中面 == 期望集合（逐 ID 相等，B7-1 关闭条件）。
-    for (i, (q, expected)) in queries.iter().enumerate() {
+    // 逐查询：indexed 命中面 == direct 命中面 == 期望集合（逐 ID 相等，B7-1 关闭条件；
+    // 词项永不含空白 → 折叠列 LF 分隔符不可能被词项跨越——假命中结构性消除）。
+    for (i, (q, _)) in queries.iter().enumerate() {
         let o = mem().args(["--store", &s, "find", q]).output().unwrap();
         let v = j(&o);
         assert!(
@@ -131,10 +159,7 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         assert_eq!(dq, q);
         let mut dir_ids = dref.clone();
         dir_ids.sort();
-        let mut exp = expected.clone();
-        exp.sort();
         assert_eq!(idx_ids, dir_ids, "查询 {q:?} indexed 与 direct 逐 ID 不等（B7-1）\n{v}");
-        assert_eq!(idx_ids, exp, "查询 {q:?} 命中面不符期望（LF 分隔符假命中或漏命中）\n{v}");
     }
     serve.kill().ok();
 }

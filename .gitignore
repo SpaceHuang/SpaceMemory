@@ -11,3 +11,9 @@ Thumbs.db
 
 # 本地杂项（数据目录 ~/.agent-memory 不在本仓库内，天然隔离）
 *.log
+
+# 本地 worktree（分支工作区，不入库）
+/worktrees
+
+# ZCode 会话状态（本地，不入库）
+.zcode/
