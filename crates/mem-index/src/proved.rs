@@ -38,6 +38,19 @@ impl ProvedIndex {
     fn new(index: Index) -> Self {
         Self { conn: Mutex::new(index) }
     }
+
+    /// cmd_view 既有快路径的兼容面（R10 检索执行器之外的既有索引消费者——
+    /// 类型单维查询，SQL 层 LIMIT/OFFSET，排序 modified DESC, id DESC）。
+    pub fn query_by_type(&self, type_name: &str, limit: usize, offset: usize) -> MemResult<Vec<crate::sqlite::IndexRow>> {
+        let conn = self.conn.lock().expect("索引连接锁");
+        conn.query_by_type(type_name, limit, offset)
+    }
+
+    /// cmd_brief 既有快路径的兼容面（全类型最近 N 条）。
+    pub fn query_all(&self, limit: usize, offset: usize) -> MemResult<Vec<crate::sqlite::IndexRow>> {
+        let conn = self.conn.lock().expect("索引连接锁");
+        conn.query_all(limit, offset)
+    }
 }
 
 /// 唯一证明点（两前端调同一函数）。`hello` = sidecar 握手（None = 嵌入模式，

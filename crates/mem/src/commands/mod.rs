@@ -24,6 +24,12 @@ pub fn dispatch(cli: &Cli) -> Result<i32, String> {
             eprintln!("{}", serde_json::json!({ "error": e.to_string(), "conflict": true }));
             Ok(2) // 冲突是独立退出码（一等结果，D3）
         }
+        // 检索/过滤参数的显式拒收（R10 §2.7：4 枚机判 kind）——非零退出 + JSON
+        // 错误体携带 kind（与 MCP JSON-RPC error 的 data.kind 同码）。
+        Err(e) if e.param_kind().is_some() => {
+            eprintln!("{}", serde_json::json!({ "error": e.to_string(), "kind": e.param_kind() }));
+            Ok(1)
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -64,12 +70,12 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     cmd_reconcile(&store, *deep)?;
                     Ok(0)
                 }
-                Cmd::List { view, type_filter, limit, offset } => {
-                    cmd_list(&store, view.as_deref(), type_filter.as_deref(), *limit, *offset)?;
+                Cmd::List { view, type_filter, filters, limit, offset } => {
+                    cmd_list(&store, &types, view.as_deref(), type_filter.as_deref(), filters, *limit, *offset)?;
                     Ok(0)
                 }
-                Cmd::Find { query, limit, offset } => {
-                    cmd_find(&store, query, *limit, *offset)?;
+                Cmd::Find { query, filters, limit, offset } => {
+                    cmd_find(&store, &types, query, filters, *limit, *offset)?;
                     Ok(0)
                 }
                 Cmd::Show { id, body, body_offset } => {
@@ -125,7 +131,9 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     Ok(0)
                 }
                 Cmd::View { id, limit, offset } => {
-                    let (mode, index) = fastpath(&store);
+                    let proved = proved_access(&store);
+                    let mode = proved.mode.clone();
+                    let index = proved.index;
                     // r4 B1：仅"**恰好一个类型** 且 无 refs/principals/since"才可走
                     // 索引（query_by_type 只懂类型单维——此前条件写反，复合视图绕过
                     // 过滤返回视图外记录、空类型视图 index 越界 panic）。
@@ -273,45 +281,14 @@ fn sink_for(store: &Store) -> GitProcess {
     GitProcess::new(store.root())
 }
 
-/// B3 接线：读路径的新鲜性判定 + 快路径索引（Indexed 时 Some）。
-///
-/// 证明判定（红线21）：sidecar 握手（Hello.undigested == 0）∧ stat 检查点一致
-/// → 快路径查 index.sqlite；任一不成立 → 直读真相层（标注 reason）。索引打开
-/// 失败 = 可丢弃缓存损坏 → 直读兜底（索引永不 gate 正确性，红线8）。
-fn fastpath(store: &Store) -> (mem_core::freshness::ReadMode, Option<mem_index::Index>) {
-    let checkpoint = mem_core::freshness::load_checkpoint(store);
+/// 读路径的证明式接入（R10 决策②下沉后的前端组装点——**调用点不承载新鲜性判断**）：
+/// 两前端循环调用同一 `open_proved`（stat 咨询 ∧ 只读打开 ∧ schema 门禁含
+/// bad_records ∧ epoch 同代核对——全部门禁在构造函数内，红线21）。全过 →
+/// `index` 为已证明句柄（indexed 执行器消费）；任一失败 → None，`mode` 携带
+/// 真实 reason（直读标注）。
+fn proved_access(store: &Store) -> mem_index::Proved {
     let hello = mem_core::sidecar::probe(store);
-    let mode = mem_core::freshness::consult_with_hello(store, checkpoint.as_ref(), hello.as_ref());
-    if mode.is_direct() {
-        return (mode, None);
-    }
-    // r4 B2：读路径**只读**打开已存在索引——不建库/不建表（此前 Connection::open
-    // 会自建空库并把空结果当真相应答）；缺失/schema 不符 → 直读（红线8/18）。
-    let index = match mem_index::Index::open_store_readonly(store) {
-        Ok(i) => i,
-        Err(_) => {
-            return (
-                mem_core::freshness::ReadMode::Direct {
-                    reason: "索引缺失或不完整（读路径不建库——直读兜底，红线8/18）".into(),
-                },
-                None,
-            )
-        }
-    };
-    // r4 B2 代际核对：检查点必须与索引同物化代——索引被删重建（epoch 重置）
-    // 而检查点记旧代 → 直读，空/旧索引不被误信。
-    let epoch_ok = checkpoint
-        .map(|cp| index.epoch().map(|e| e == cp.index_epoch).unwrap_or(false))
-        .unwrap_or(false);
-    if !epoch_ok {
-        return (
-            mem_core::freshness::ReadMode::Direct {
-                reason: "检查点与索引代际不匹配（物化进行中或索引被重建）——直读".into(),
-            },
-            None,
-        );
-    }
-    (mode, Some(index))
+    mem_index::open_proved(store, hello.as_ref())
 }
 
 fn index_row_to_json(r: &mem_index::IndexRow) -> serde_json::Value {
@@ -449,7 +426,9 @@ fn cmd_brief(
     offset: Option<usize>,
 ) -> MemResult<()> {
     // 证明式新鲜性判定（读路径零写盘；B3：订阅状态经 sidecar 握手远端取得）。
-    let (mode, index) = fastpath(store);
+    let proved = proved_access(store);
+    let mode = proved.mode.clone();
+    let index = proved.index;
     // 台账：只读查找（红线25：brief 永不创建/修改台账）。
     let (ledgers, _) = session::scan_ledgers(store)?;
     let identity = ledgers
@@ -675,176 +654,152 @@ fn cmd_reconcile(store: &Store, deep: bool) -> MemResult<()> {
 
 // ---------- list / find / show / trace ----------
 
-fn list_items(
-    store: &Store,
-    view: Option<&str>,
-    type_filter: Option<&str>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> MemResult<mem_core::view::ViewResult> {
-    let limit = mem_core::budget::effective_limit(store, limit);
-    let offset = offset.unwrap_or(0);
-    if let Some(v) = view {
-        return mem_core::view::execute_from(store, v, limit, offset);
-    }
-    let filter = mem_core::view::ViewFilter {
-        types: type_filter.map(|t| vec![t.to_string()]).unwrap_or_default(),
-        ..Default::default()
-    };
-    mem_core::view::execute_filter(store, &filter, limit, offset)
+/// CLI --filter 参数解析（决策⑤）：`字段=值` 以**第一个** = 分界（值可含 =）；
+/// 无 = 分界 → invalid_filter_value（R10 §2.7 机判 kind，两前端同码）。
+fn parse_filter_args(args: &[String]) -> MemResult<Vec<mem_core::find::FilterCond>> {
+    args.iter()
+        .map(|s| match s.split_once('=') {
+            Some((field, text)) => Ok(mem_core::find::FilterCond {
+                field: field.to_string(),
+                text: text.to_string(),
+            }),
+            None => Err(MemError::ParamRejected {
+                kind: mem_core::find::INVALID_FILTER_VALUE.into(),
+                message: format!("过滤条件须为 字段=值 形式（以第一个 = 分界，值可含 =）：{s:?}"),
+            }),
+        })
+        .collect()
 }
 
+/// 统一响应 note（§2.6）：截断给续读指引（红线9）；告警截断注明 verify 续读通道
+///（§2.5——告警不做 offset 分页，verify 是续读通道）。
+fn find_note(truncated: bool, resume: Option<usize>, warnings_truncated: bool) -> String {
+    let mut parts = Vec::new();
+    if truncated {
+        if let Some(off) = resume {
+            parts.push(format!("命中截断（红线9）——用 --offset {off} 续读"));
+        }
+    }
+    if warnings_truncated {
+        parts.push("完整坏记录清单经 mem verify".into());
+    }
+    parts.join("；")
+}
+
+/// filters_applied 回显（字段→文本对象）。
+fn find_filters_json(filters: &[(String, String)]) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in filters {
+        m.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    m
+}
+
+/// 过滤定位（R10 §2.6）：--type/--view 先限定后过滤；--filter 可重复合取；
+/// 快路径经 proved_access（open_proved 构造即证明）注入执行器——CLI 与 MCP 同源。
+/// 纯过滤清单（无词项）在新鲜性已证明时索引行即答案；其余逐候选回读真相层精筛。
 fn cmd_list(
     store: &Store,
+    types: &TypeSet,
     view: Option<&str>,
     type_filter: Option<&str>,
+    filter_args: &[String],
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> MemResult<()> {
+    let filters = parse_filter_args(filter_args)?;
     let limit = mem_core::budget::effective_limit(store, limit);
     let offset = offset.unwrap_or(0);
-    let (mode, index) = fastpath(store);
-    // 快路径：类型过滤（或全库）走索引；视图引用过滤仍直读（v1 索引仅信封标量域）。
-    let fast = match (&index, view.is_none()) {
-        (Some(idx), true) => match type_filter {
-            Some(t) => idx.query_by_type(t, limit, offset).ok(),
-            None => idx.query_all(limit, offset).ok(),
-        },
-        _ => None,
+    let proved = proved_access(store);
+    let vf = match view {
+        Some(vid) => {
+            let v = ops::get(store, vid)?;
+            if v.record.envelope.r#type != "view" {
+                return Err(MemError::BadArgument(format!("{vid} 不是 view 记录")));
+            }
+            Some(mem_core::view::ViewFilter::from_payload(&v.record.payload)?)
+        }
+        None => None,
     };
-    match fast {
-        Some(rows) => {
-            out_json(&serde_json::json!({
-                "read_mode": mode,
-                "items": rows.iter().map(index_row_to_json).collect::<Vec<_>>(),
-                "truncated": rows.len() == limit,
-                "resume": if rows.len() == limit { serde_json::json!({"offset": offset + rows.len()}) } else { serde_json::Value::Null },
-            }));
-            Ok(())
-        }
-        None => {
-            let r = list_items(store, view, type_filter, Some(limit), Some(offset))?;
-            out_json(&serde_json::json!({
-                "read_mode": mode,
-                "items": r.items.iter().map(|i| serde_json::json!({
-                    "id": i.envelope.id, "type": i.envelope.r#type, "rel": i.rel,
-                    "modified": i.envelope.modified, "version": i.envelope.version,
-                    "token": i.token.to_string(),
-                })).collect::<Vec<_>>(),
-                "truncated": r.truncated,
-                "resume": r.resume_hint.map(|h| serde_json::json!({"offset": h.offset})),
-            }));
-            Ok(())
-        }
-    }
+    // 视图路径 v1 恒直读（信封引用过滤不进索引）；否则注入已证明句柄。
+    let prefilter = if vf.is_some() {
+        None
+    } else {
+        proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter)
+    };
+    let outcome = mem_core::find::execute(mem_core::find::FindParams {
+        store,
+        types,
+        query: None,
+        filters: &filters,
+        type_narrow: type_filter,
+        view: vf.as_ref(),
+        limit,
+        offset,
+        mode: proved.mode,
+        prefilter,
+    })?;
+    out_json(&serde_json::json!({
+        "read_mode": outcome.mode,
+        "items": outcome.hits.iter().map(|h| serde_json::json!({
+            "id": h.id, "type": h.type_name, "rel": h.rel,
+            "modified": h.modified, "version": h.version, "token": h.token,
+        })).collect::<Vec<_>>(),
+        "truncated": outcome.truncated,
+        "resume": outcome.resume_offset
+            .map(|o| serde_json::json!({"offset": o}))
+            .unwrap_or(serde_json::Value::Null),
+        "filters_applied": find_filters_json(&outcome.filters_applied),
+        "warnings": outcome.warnings,
+        "warnings_truncated": outcome.warnings_truncated,
+        "note": find_note(outcome.truncated, outcome.resume_offset, outcome.warnings_truncated),
+    }));
+    Ok(())
 }
 
-fn cmd_find(store: &Store, query: &str, limit: Option<usize>, offset: Option<usize>) -> MemResult<()> {
+/// 查找（R10 §2.6）：词项与/与位排除 + --filter 组合；执行器单源（mem-core find），
+/// 快路径经 open_proved 构造即证明注入；空查询/纯否定由 parse_query 显式拒收
+///（R10.9——绝不表现为空命中清单或全库清单）。
+fn cmd_find(
+    store: &Store,
+    types: &TypeSet,
+    query: &str,
+    filter_args: &[String],
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> MemResult<()> {
+    let filters = parse_filter_args(filter_args)?;
     let limit = mem_core::budget::effective_limit(store, limit);
     let offset = offset.unwrap_or(0);
-    let (mode, index) = fastpath(store);
-    // 快路径：折叠列 LIKE 粗筛（仅快路径可用，D5）。
-    if let Some(idx) = &index {
-        // r12 B7-1：LIKE 折叠列只是**粗筛**（保守超集——跨值假命中可能、永不漏），
-        // 命中语义由与 direct 同源的 search::record_matches 精筛裁定；分页必须在
-        // 精筛后按命中序号进行（SQL 层预分页会把页边界画在未精筛的行上）。
-        // r5 B7：查询失败不得伪装为空命中——Err → 直读兜底（reason 携带真实错误）。
-        let candidates = match idx.search(query, usize::MAX, 0) {
-            Ok(rows) => rows,
-            Err(e) => {
-                return cmd_find_direct(store, query, limit, Some(offset),
-                    &mem_core::freshness::ReadMode::Direct {
-                        reason: format!("索引查询失败——直读兜底（红线8）：{e}"),
-                    });
-            }
-        };
-        let q = mem_core::paths::fold(query);
-        // 索引行可能领先/落后磁盘（红线8：索引不 gate 正确性）——精筛按磁盘真相
-        // 逐条裁定；文件已消失的行（删除竞态残影）跳过。
-        let mut hits = Vec::new();
-        for row in &candidates {
-            let Ok(rec) = ops::get(store, &row.id) else { continue };
-            let env = &rec.record.envelope;
-            if mem_core::search::record_matches(
-                &env.id, &env.aliases, &rec.record.payload, &rec.record.body, &q,
-            ) {
-                hits.push(rec);
-            }
-        }
-        // hits 保持索引序（SQL：modified DESC, id DESC）——与 direct 排序规则一致。
-        let truncated = hits.len() > offset + limit;
-        let page = &hits[offset.min(hits.len())..hits.len().min(offset + limit)];
-        out_json(&serde_json::json!({
-            "read_mode": mode,
-            "hits": page.iter().map(|r| serde_json::json!({
-                "id": r.record.envelope.id, "type": r.record.envelope.r#type, "rel": r.rel,
-                "token": r.token.to_string(),
-            })).collect::<Vec<_>>(),
-            "limit": limit,
-            "truncated": truncated,
-            "resume": if truncated { serde_json::json!({"offset": offset + limit}) } else { serde_json::Value::Null },
-            "note": if truncated { "命中截断（红线9）——用 --offset <resume.offset> 续读" } else { "" },
-        }));
-        return Ok(());
-    }
-    cmd_find_direct(store, query, limit, Some(offset), &mode)
-}
-
-fn cmd_find_direct(
-    store: &Store,
-    query: &str,
-    limit: usize,
-    offset: Option<usize>,
-    mode: &mem_core::freshness::ReadMode,
-) -> MemResult<()> {
-    let offset = offset.unwrap_or(0);
-    let mut scan = ops::scan_all(store)?;
-    // r7：分页顺序与 indexed 模式对齐（modified DESC, id DESC）——否则两页顺序
-    // 相反，逐 ID 对比与续读语义双双失效。
-    scan.records.sort_by(|a, b| {
-        b.record
-            .envelope
-            .modified
-            .cmp(&a.record.envelope.modified)
-            .then(b.record.envelope.id.cmp(&a.record.envelope.id))
-    });
-    let q = mem_core::paths::fold(query);
-    // r11：续读语义统一为**命中序号**（与 indexed 的 SQL OFFSET 同语义——跳过前
-    // N 个命中行）。此前 offset 是扫描记录偏移：direct 第 0 页 resume=扫描位置，
-    // 拿到 indexed 当命中偏移 → 漏命中；反向 direct 重复第一页。
-    // r12 B7-1：命中判定收敛到 search::record_matches 单源（与 indexed 精筛同一
-    // 函数——两执行器命中面结构性等价，不再各自维护匹配逻辑）。
-    let mut hits = Vec::new();
-    let mut hit_seen = 0usize;
-    let mut remaining_after_stop = false;
-    for r in &scan.records {
-        let env = &r.record.envelope;
-        if mem_core::search::record_matches(
-            &env.id, &env.aliases, &r.record.payload, &r.record.body, &q,
-        ) {
-            if hit_seen >= offset {
-                if hits.len() < limit {
-                    hits.push(r);
-                } else {
-                    // 命中达到 limit 后还有命中 → 截断标注 + 续读路径（红线9/H5）。
-                    remaining_after_stop = true;
-                    break;
-                }
-            }
-            hit_seen += 1;
-        }
-    }
-    let truncated = remaining_after_stop;
+    let proved = proved_access(store);
+    let outcome = mem_core::find::execute(mem_core::find::FindParams {
+        store,
+        types,
+        query: Some(query),
+        filters: &filters,
+        // find 不设 type/view 参数（检索的类型/域限定是基线未来项，§2.6）。
+        type_narrow: None,
+        view: None,
+        limit,
+        offset,
+        mode: proved.mode,
+        prefilter: proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter),
+    })?;
     out_json(&serde_json::json!({
-        "read_mode": mode,
-        "hits": hits.iter().map(|r| serde_json::json!({
-            "id": r.record.envelope.id, "type": r.record.envelope.r#type, "rel": r.rel,
-            "token": r.token.to_string(),
+        "read_mode": outcome.mode,
+        "hits": outcome.hits.iter().map(|h| serde_json::json!({
+            "id": h.id, "type": h.type_name, "rel": h.rel, "token": h.token,
         })).collect::<Vec<_>>(),
         "limit": limit,
-        "truncated": truncated,
-        "resume": if truncated { serde_json::json!({"offset": offset + hits.len()}) } else { serde_json::Value::Null },
-        "note": if truncated { "命中截断（红线9）——用 --offset <resume.offset> 续读" } else { "" },
+        "truncated": outcome.truncated,
+        "resume": outcome.resume_offset
+            .map(|o| serde_json::json!({"offset": o}))
+            .unwrap_or(serde_json::Value::Null),
+        "query": { "positive": outcome.positive_terms, "negative": outcome.negative_terms },
+        "filters_applied": find_filters_json(&outcome.filters_applied),
+        "warnings": outcome.warnings,
+        "warnings_truncated": outcome.warnings_truncated,
+        "note": find_note(outcome.truncated, outcome.resume_offset, outcome.warnings_truncated),
     }));
     Ok(())
 }
