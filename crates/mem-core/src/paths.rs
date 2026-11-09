@@ -145,3 +145,28 @@ pub fn records_rel(attic_rel_path: &str) -> MemResult<String> {
         .ok_or_else(|| MemError::BadArgument(format!("非 attic/ 路径：{attic_rel_path}")))?;
     Ok(format!("records/{rest}"))
 }
+
+/// 判定 path 是否位于 root 目录内（R11：`--body-out` 目标与 restore-body 的
+/// `file:` 源共用；CLI/MCP 不得各自复写）。词法前缀 + 规范化前缀双判——目标可能
+/// 尚不存在（父目录链不一定可规范化）；Windows 大小写不敏感。
+pub fn path_is_inside(root: &std::path::Path, path: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        p.to_string_lossy()
+            .to_lowercase()
+            .replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+    if norm(path).starts_with(&norm(root)) {
+        return true;
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(c) => {
+            let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            c.starts_with(&root_canon)
+        }
+        Err(_) => false,
+    }
+}

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{new_uuid_v7, Envelope, Ref};
 use crate::error::{MemError, MemResult};
-use crate::event::{EventLog, Op};
+use crate::event::{EventLog, Kind, Op};
 use crate::lock;
 use crate::paths;
 use crate::record::{self, Record};
@@ -30,6 +30,17 @@ pub trait CommitSink: Send + Sync {
 pub trait HistoryStore: Send + Sync {
     /// HEAD 中该相对路径的上一版内容；无历史 → Ok(None)。
     fn previous_file(&self, rel: &str) -> MemResult<Option<Vec<u8>>>;
+}
+
+/// restore_body 的只读历史通道（R11/BD4 来源三形之 `git:<版本>` 与 `history`；
+/// mem-git 实现，测试用 fake）。机制保证与来源可信性分离：本 trait 只负责
+/// "按版本取字节/列版本"——可信性由调用方显式选择承担（§3.6 责任分界）。
+pub trait BodyHistory: Send + Sync {
+    /// 指定版本（完整 SHA 或引用）该相对路径的完整文件字节；路径在该版本不存在
+    /// → Ok(None)；坏版本引用/无 .git → Err（响亮，错误信息区分成因）。
+    fn file_bytes_at(&self, rel: &str, rev: &str) -> MemResult<Option<Vec<u8>>>;
+    /// 按路径列历史版本（自新至旧的完整 SHA 列表）；无 .git → Err。
+    fn list_versions(&self, rel: &str) -> MemResult<Vec<String>>;
 }
 
 /// 写路径上下文。
@@ -272,6 +283,7 @@ fn validate_payload_and_refs(
 /// 唯一键路径独占创建（R3.3/D11）：输者返回既有记录及令牌。
 pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     ctx.store.check_writable()?;
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
     let decl = ctx
         .types
         .get(&args.type_name)
@@ -378,6 +390,7 @@ pub fn update_locked(
     payload: serde_json::Value,
     body: Option<Vec<u8>>,
 ) -> MemResult<Updated> {
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let cur = get(ctx.store, id_or_path)?;
     let decl = ctx
         .types
@@ -449,6 +462,7 @@ pub fn link(
     expect_b: &Token,
 ) -> MemResult<(Token, Token)> {
     ctx.store.check_writable()?;
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let a = get(ctx.store, a_id)?;
     let b = get(ctx.store, b_id)?;
     if a.record.envelope.id == b.record.envelope.id {
@@ -592,6 +606,7 @@ pub fn delete_locked(
     expect: &Token,
     force: bool,
 ) -> MemResult<Deleted> {
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let cur = get(ctx.store, id_or_path)?;
     if cur.rel.starts_with("attic/") {
         return Err(MemError::BadArgument("已是 tombstone".into()));
@@ -664,6 +679,7 @@ pub fn restore_locked(
     id_or_path: &str,
     expect: Option<&Token>,
 ) -> MemResult<Restored> {
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let tomb = get(ctx.store, id_or_path)?;
     if !tomb.rel.starts_with("attic/") {
         return Err(MemError::BadArgument("记录不在 attic（非受管删除）".into()));
@@ -724,6 +740,13 @@ fn commit_same_batch(ctx: &WriteContext, record_paths: &[String], _seq: u64) -> 
     let Some(sink) = ctx.committer else { return Ok(()) };
     let mut batch: Vec<String> = record_paths.to_vec();
     batch.push("events.jsonl".into());
+    // BD5 ②：行尾规则文件随受管写批次入树（幂等——已入树且内容相符时对
+    // path-scoped 提交无 diff；init 暂存的规则由此随首次提交入树；commit-pending
+    // 批次同样携带，直至核验入树）。冲突状态在写入口已结构化拒绝（③），
+    // 走到这里的批次必然是默认内容或待补种状态。
+    if ctx.store.root().join(".git").exists() {
+        batch.push(crate::gitattrs::GITATTRIBUTES_REL.into());
+    }
     match sink.commit(&batch) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -806,6 +829,7 @@ pub fn merge_locked(
     expect_dup: &Token,
     expect_canonical: &Token,
 ) -> MemResult<Merged> {
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let dup = get(ctx.store, dup_id)?;
     let canonical = get(ctx.store, canonical_id)?;
     if dup.record.envelope.id == canonical.record.envelope.id {
@@ -1019,6 +1043,7 @@ pub fn fix_record(
     expect: Option<&Token>,
 ) -> MemResult<Fixed> {
     store.check_writable()?;
+    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：受管写前核验
     // H1：定位（只读解析路径；真正的内容读取全部在锁内）。
     let rel = match get(store, id_or_path) {
         Ok(hit) => hit.rel,
@@ -1115,6 +1140,268 @@ fn split_body_bytes(bytes: &[u8]) -> Vec<u8> {
 fn token_of_bytes(bytes: &[u8]) -> Token {
     let version = Record::from_bytes(bytes).map(|r| r.envelope.version).unwrap_or(1);
     token::for_bytes(version.max(1), bytes)
+}
+
+
+// ---------- restore-body（R11 恢复通道，BD4） ----------
+
+/// 恢复来源三形（§3.6）。
+#[derive(Debug, Clone)]
+pub enum RestoreSource {
+    /// `git:<版本>`——指定历史版本的正文区（来源可信性由调用方显式承担）。
+    Git { rev: String },
+    /// `file:<店外路径>`——店外备份的记录格式文件，取其正文区。
+    File { path: std::path::PathBuf },
+    /// `history`——自动锚定，仅在可机械判定的窗口内可用（见下）。
+    History,
+}
+
+#[derive(Debug)]
+pub struct RestoredBody {
+    pub rel: String,
+    pub record: Record,
+    pub token: Token,
+    /// 来源出处回显（§3.6 机制保证）：来源形态、锚定摘要或版本、复制前/后正文区
+    /// 摘要——供调用方复核。机制保证 = 字节完整复制；来源可信性由调用方确认，
+    /// 两者显式分离。
+    pub source_echo: serde_json::Value,
+}
+
+/// 恢复正文（经确认的内容写操作；R11.6/验收 6）。
+///
+/// 正文区替换为**来源字节**，信封（版本、时间戳除外）与载荷原样保留，走既有更新
+/// 写路径（共享门闩/记录锁/全摘要令牌 CAS/事件追加/git 同批提交）；事件操作名
+/// `restore_body`，携带恢复前/后全文摘要。
+///
+/// 与 fix 的分界（§3.6 操作组合）：结构头坏 → 先 `fix`（保正文字节的结构修复）；
+/// 正文坏 → `restore-body`（换正文字节的内容写）。frontmatter 必须可解析——
+/// 两者皆坏时本命令响亮拒绝（先 fix）。
+///
+/// `history` 自动锚定的**可用窗口**（两条件同时成立）：
+/// 1. 漂移仍在：磁盘全文摘要 ≠ 最后事件登记摘要（成因唯一：磁盘被外部改动而
+///    日志未登记——最后事件登记的恰是外部改动前机制写入的字节）；
+/// 2. 最后事件是机制写入登记（kind=op，非回填——回填登记摘要描述外部字节，
+///    可能是损坏本身，机械不可分辨，不得作可信锚）。
+/// 窗口内：锚 = 最后事件登记摘要，自新至旧扫 git 历史取全文摘要相符的版本。
+/// 窗口外/锚无匹配：**响亮拒绝**，绝不回退次优匹配、绝不把盘上字节冒充治愈；
+/// 响应附可行动指引（最后机制写入登记摘要及匹配的历史版本，若找到）。
+pub fn restore_body(
+    ctx: &WriteContext,
+    id_or_path: &str,
+    expect: &Token,
+    source: &RestoreSource,
+    history: Option<&dyn BodyHistory>,
+) -> MemResult<RestoredBody> {
+    ctx.store.check_writable()?;
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
+    let hit = get(ctx.store, id_or_path)?;
+    if !hit.rel.starts_with("records/") {
+        return Err(MemError::BadArgument(format!(
+            "restore-body 仅支持 records/ 内的记录（attic 用 mem restore）：{}",
+            hit.rel
+        )));
+    }
+    let rel = hit.rel.clone();
+    let _barrier = lock::barrier_shared(ctx.store)?;
+    let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
+    // 锁内重读 + CAS（红线19：经确认的内容写仍是读改写）。
+    let fresh_bytes = std::fs::read(ctx.store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;
+    // frontmatter 必须可解析（§3.6：两者皆坏 → 先 fix；响亮拒绝不静默）。
+    let fresh = Record::from_bytes(&fresh_bytes)?;
+    let current = token::for_bytes(fresh.envelope.version, &fresh_bytes);
+    token::cas_check(expect, &current)?;
+
+    let (source_body, mut echo) =
+        resolve_restore_source(ctx, &rel, &fresh.envelope.id, &fresh_bytes, source, history)?;
+
+    // 构造新字节：信封/载荷原样保留（版本+1、modified 刷新），正文替换。
+    let mut env = fresh.envelope.clone();
+    env.version += 1;
+    env.modified = crate::clock::now_rfc3339();
+    let out_bytes = record::serialize_new(&env, &fresh.payload, &source_body);
+    // 机制保证：落盘正文区摘要 == 来源正文区摘要（不符即响亮失败、不留半成品）。
+    let written_body = record::find_body_after_first_delimiter(&out_bytes)?;
+    let source_digest = token::sha256_hex(&source_body);
+    let written_digest = token::sha256_hex(&written_body);
+    if written_digest != source_digest {
+        return Err(MemError::Corrupt {
+            path: rel.clone(),
+            reason: format!(
+                "restore-body 复制保真校验失败：落盘正文区摘要 {written_digest} ≠ 来源 {source_digest}（不留半成品）"
+            ),
+        });
+    }
+    echo["body_sha256_source"] = serde_json::json!(source_digest);
+    echo["body_sha256_written"] = serde_json::json!(written_digest);
+    crate::platform::atomic_write(&ctx.store.abs(&rel), &out_bytes)
+        .map_err(|e| MemError::io(rel.clone(), e))?;
+    let new_token = token::for_bytes(env.version, &out_bytes);
+    let log = EventLog::new(ctx.store);
+    log.append_simple(
+        &env.id,
+        &rel,
+        Op::RestoreBody,
+        Some(fresh.envelope.version),
+        Some(env.version),
+        Some(&current.digest),
+        Some(&new_token.digest),
+        &ctx.by,
+    )?;
+    commit_same_batch(ctx, &[rel.clone()], 0)?;
+    register_trail(ctx, &env.id);
+    Ok(RestoredBody {
+        rel,
+        record: Record::from_bytes(&out_bytes).expect("自产字节必可解析"),
+        token: new_token,
+        source_echo: echo,
+    })
+}
+
+/// 解析来源三形 → (来源正文字节, 出处回显)。
+fn resolve_restore_source(
+    ctx: &WriteContext,
+    rel: &str,
+    id: &str,
+    fresh_bytes: &[u8],
+    source: &RestoreSource,
+    history: Option<&dyn BodyHistory>,
+) -> MemResult<(Vec<u8>, serde_json::Value)> {
+    match source {
+        RestoreSource::Git { rev } => {
+            // 无 .git → 整体结构化报错（git 缺席即无历史通道；file: 源仍可用）。
+            if !ctx.store.root().join(".git").exists() {
+                return Err(MemError::Git(
+                    "无 .git——git: 源不可用（git 缺席即无历史通道；file: 源仍可用）".into(),
+                ));
+            }
+            let h = history.ok_or_else(|| {
+                MemError::BadArgument("git: 源需要历史通道（BodyHistory）".into())
+            })?;
+            let bytes = h.file_bytes_at(rel, rev)?.ok_or_else(|| {
+                MemError::BadArgument(format!("历史版本 {rev} 无该文件：{rel}"))
+            })?;
+            let body = record::find_body_after_first_delimiter(&bytes)?;
+            Ok((
+                body,
+                serde_json::json!({ "form": "git", "rev": rev }),
+            ))
+        }
+        RestoreSource::File { path } => {
+            if crate::paths::path_is_inside(ctx.store.root(), path) {
+                return Err(MemError::BadArgument(format!(
+                    "file: 源必须位于店外（{} 在店目录内）——防旁挂写入",
+                    path.display()
+                )));
+            }
+            let bytes = std::fs::read(path)
+                .map_err(|e| MemError::BadArgument(format!("file: 源不可读（{}）：{e}", path.display())))?;
+            let body = record::find_body_after_first_delimiter(&bytes)?;
+            Ok((
+                body,
+                serde_json::json!({ "form": "file", "path": path.display().to_string() }),
+            ))
+        }
+        RestoreSource::History => {
+            // 无 .git → 整体结构化报错（窗口判定之前——git 缺席即无历史通道）。
+            if !ctx.store.root().join(".git").exists() {
+                return Err(MemError::Git(
+                    "无 .git——history 源不可用（git 缺席即无历史通道；file: 源仍可用）".into(),
+                ));
+            }
+            let h = history.ok_or_else(|| {
+                MemError::BadArgument("history 源需要历史通道（BodyHistory）".into())
+            })?;
+            let log = EventLog::new(ctx.store).read_log()?;
+            let last = log.events.iter().rev().find(|e| e.id == id);
+            let Some(last) = last else {
+                return Err(MemError::BadArgument(format!(
+                    "history 锚定失败（{rel}）：无事件历史——改用显式来源 git:<版本> 或 file:<店外路径>"
+                )));
+            };
+            let disk_digest = token::sha256_hex(fresh_bytes);
+            let drifted = last.new_digest.as_deref() != Some(disk_digest.as_str());
+            let mech_last = last.kind == Kind::Op;
+            if !drifted || !mech_last {
+                return Err(history_window_rejection(ctx, h, id, rel));
+            }
+            let anchor = last.new_digest.clone().ok_or_else(|| {
+                MemError::BadArgument(format!(
+                    "history 锚定失败（{rel}）：最后事件无登记摘要"
+                ))
+            })?;
+            // 自新至旧扫历史取全文摘要相符的版本（典型库首数个版本即命中）。
+            for sha in h.list_versions(rel)? {
+                if let Some(bytes) = h.file_bytes_at(rel, &sha)? {
+                    if token::sha256_hex(&bytes) == anchor {
+                        let body = record::find_body_after_first_delimiter(&bytes)?;
+                        return Ok((
+                            body,
+                            serde_json::json!({ "form": "history", "anchor": anchor, "commit": sha }),
+                        ));
+                    }
+                }
+            }
+            // 无匹配：响亮失败、区分成因，绝不回退次优匹配。
+            let pending = list_pending_commits(ctx.store)?;
+            Err(MemError::BadArgument(format!(
+                "history 锚定失败（{rel}）：锚摘要 {anchor} 未在 git 历史中找到——{}；改用显式来源 git:<版本> 或 file:<店外路径>",
+                if pending.is_empty() {
+                    "锚版本不在跟踪范围或历史被改写"
+                } else {
+                    "commit-pending 未收敛（等待 mem reconcile 重试提交后重试）"
+                }
+            )))
+        }
+    }
+}
+
+/// 窗口外拒绝：附可行动指引——该记录最后**机制写入**登记的摘要，及 git 历史中
+/// 匹配该摘要的版本（若找到），引导显式 `git:<版本>` 或 `file:`（绝不把盘上
+/// （可能损坏的）字节写成新版本冒充治愈）。
+fn history_window_rejection(
+    ctx: &WriteContext,
+    h: &dyn BodyHistory,
+    id: &str,
+    rel: &str,
+) -> MemError {
+    let log = EventLog::new(ctx.store);
+    let last_mech = log
+        .read_log()
+        .ok()
+        .and_then(|l| {
+            l.events
+                .iter()
+                .rev()
+                .find(|e| e.id == id && e.kind == Kind::Op && e.new_digest.is_some())
+                .cloned()
+        });
+    let Some(mech) = last_mech else {
+        return MemError::BadArgument(format!(
+            "history 自动锚定拒绝（{rel}）：窗口外（漂移已收敛或最后事件为回填）——机械上无法推出损坏前版本，不得把盘上字节冒充治愈；无机制写入事件可指引——改用显式来源 git:<版本> 或 file:<店外路径>"
+        ));
+    };
+    let digest = mech.new_digest.clone().unwrap_or_default();
+    // git 历史中匹配该摘要的版本（若找到）。
+    let matched = h.list_versions(rel).ok().and_then(|versions| {
+        versions.into_iter().find(|sha| {
+            h.file_bytes_at(rel, sha)
+                .ok()
+                .flatten()
+                .map(|b| token::sha256_hex(&b) == digest)
+                .unwrap_or(false)
+        })
+    });
+    let guidance = match matched {
+        Some(sha) => format!(
+            "该记录最后机制写入登记摘要 {digest}，对应历史版本 {sha}——显式指定 --source git:{sha} 或 file:<店外路径>"
+        ),
+        None => format!(
+            "该记录最后机制写入登记摘要 {digest}（git 历史中无匹配版本）——显式指定 git:<版本> 或 file:<店外路径>"
+        ),
+    };
+    MemError::BadArgument(format!(
+        "history 自动锚定拒绝（{rel}）：窗口外（漂移已收敛或最后事件为回填）——机械上无法推出损坏前版本，不得把盘上字节冒充治愈。{guidance}"
+    ))
 }
 
 

@@ -247,7 +247,13 @@ impl Index {
             // r11：折叠列统一在物化时计算（逐值/逐别名独立 fold 后 LF 连接——
             // LF 分隔符保证 LIKE 子串匹配不跨值/跨别名）。sync_fts 不再覆盖。
             let payload_folded = payload_values_folded(&s.record.payload);
-            let body_folded = mem_core::paths::fold(&String::from_utf8_lossy(&s.record.body));
+            // R11.4 索引素材契约（G1 单源谓词）：非文本正文 → 空字符串（非空
+            // schema 与行类型零改动；空串对任何非空查询的 LIKE 恒不命中 =
+            // "无正文检索素材"；粗筛超集性质保证新旧索引行为等价，真值由
+            // record_matches 精筛裁定）。废除有损解码入素材列。
+            let body_folded = mem_core::body::text_or_none(&s.record.body)
+                .map(mem_core::paths::fold)
+                .unwrap_or_default();
             let aliases_folded = s
                 .record
                 .envelope
@@ -342,7 +348,11 @@ impl Index {
         // 查询用 fold 模式精确 LIKE，非 ASCII 大小写折叠不依赖 SQLite LIKE。
         let scan = ops::scan_all(store)?;
         for s in &scan.records {
-            let body = String::from_utf8_lossy(&s.record.body).to_string();
+            // R11.4 素材契约（与 rebuild_with_entries 同一 G1 谓词）：非文本正文
+            // → 正文文本列与折叠列写空串；合法正文照常。
+            let body = mem_core::body::text_or_none(&s.record.body)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             let aliases = s.record.envelope.aliases.join(" ");
             // r8：payload_folded = **值的 fold**（不含键名、不含 id）——直读的
             // payload 匹配只搜值（payload_contains），键名查询两模式都必须不命中；
@@ -505,4 +515,98 @@ fn row_to_index(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {
 
 fn sq_err(e: rusqlite::Error) -> MemError {
     MemError::Corrupt { path: "index/index.sqlite".into(), reason: e.to_string() }
+}
+
+#[cfg(test)]
+mod r11_body_material_tests {
+    //! R11.4 索引素材契约（binary-content-design §3.4/§8 设计自有验证点 3）：
+    //! 非文本正文 → 正文素材列（正文文本列与折叠列）写**空字符串**（物化走 G1
+    //! 单源谓词）；非空 schema（`TEXT NOT NULL DEFAULT ''`）与行类型零改动。
+
+    use super::*;
+    use mem_core::envelope::Envelope;
+    use mem_core::record;
+    use mem_core::store::{OpenMode, Store};
+
+    fn write_record(store: &Store, type_name: &str, slug: &str, body: &[u8]) -> String {
+        // id 以 slug 字节长度 + 首字节派生（fixture 内唯一即可）。
+        let id = format!(
+            "01980000-0000-7000-8000-{:012x}",
+            slug.len() as u64 * 0x100 + slug.bytes().next().unwrap_or(0) as u64
+        );
+        let env = Envelope {
+            id: id.clone(),
+            r#type: type_name.into(),
+            created: "2026-11-10T00:00:00Z".into(),
+            modified: "2026-11-10T00:00:00Z".into(),
+            version: 1,
+            principal: None,
+            refs: vec![],
+            aliases: vec![slug.to_string()],
+            evidence_cutoff_seq: None,
+            commit: None,
+            extra: Default::default(),
+        };
+        let bytes = record::serialize_new(&env, &serde_json::json!({"slug": slug}), body);
+        let rel = format!("records/{type_name}/{slug}.md");
+        std::fs::create_dir_all(store.abs(format!("records/{type_name}"))).unwrap();
+        std::fs::write(store.abs(&rel), &bytes).unwrap();
+        env.id
+    }
+
+    #[test]
+    fn non_utf8_body_materializes_empty_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&{
+            let p = tmp.path().join("store");
+            mem_core::store::Store::create(&p).unwrap();
+            p
+        }, OpenMode::Auto).unwrap();
+        // 记录1：非文本正文（PNG 头 + "abs" 编巧合——素材列不得携带它）。
+        let bin_id = write_record(&store, "image", "bin1",
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF]);
+        // 记录2：合法 UTF-8 正文（SVG 文本）——照常写折叠文本。
+        let svg_id = write_record(&store, "image", "svg1",
+            br#"<svg>abstract</svg>"#);
+
+        let mut idx = Index::open_store(&store).unwrap();
+        let (n, _) = idx.rebuild(&store).unwrap();
+        assert_eq!(n, 2, "库中含非文本记录时物化成功（无 NOT NULL 违规）——验收5 断言");
+
+        let rows = idx.query_all(10, 0).unwrap();
+        let bin_row = rows.iter().find(|r| r.id == bin_id).expect("非文本记录在索引中");
+        assert_eq!(bin_row.body_folded, "", "非文本正文素材 = 空串（不含编码巧合）");
+        let svg_row = rows.iter().find(|r| r.id == svg_id).expect("文本记录在索引中");
+        assert!(svg_row.body_folded.contains("abstract"), "合法正文照常折叠入素材列");
+
+        // set_body_texts（写例程第二处物化点）同契约。
+        idx.set_body_texts(&store).unwrap();
+        let bt: String = idx.conn
+            .query_row("SELECT body_text FROM records WHERE id = ?1", [&bin_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bt, "", "正文文本列对非文本正文写空串");
+        let bt2: String = idx.conn
+            .query_row("SELECT body_text FROM records WHERE id = ?1", [&svg_id], |r| r.get(0))
+            .unwrap();
+        assert!(bt2.contains("<svg>"));
+    }
+
+    #[test]
+    fn empty_utf8_body_and_non_text_share_empty_material() {
+        // 设计 §3.4："非文本正文"与"合法 UTF-8 空正文"同为空串、不需要区分——
+        // 素材列唯一职责是粗筛超集，正文域真值由 G1 谓词在精筛层裁定。
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&{
+            let p = tmp.path().join("store");
+            mem_core::store::Store::create(&p).unwrap();
+            p
+        }, OpenMode::Auto).unwrap();
+        let bin_id = write_record(&store, "image", "bin2", &[0xFF, 0xFE, 0x00]);
+        let empty_id = write_record(&store, "note", "empty2", b"");
+        let mut idx = Index::open_store(&store).unwrap();
+        idx.rebuild(&store).unwrap();
+        let rows = idx.query_all(10, 0).unwrap();
+        assert_eq!(rows.iter().find(|r| r.id == bin_id).unwrap().body_folded, "");
+        assert_eq!(rows.iter().find(|r| r.id == empty_id).unwrap().body_folded, "");
+    }
 }

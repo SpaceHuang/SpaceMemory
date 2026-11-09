@@ -17,6 +17,7 @@
 //! 校验见 `mem-schema`。
 
 pub mod agenda;
+pub mod body;
 pub mod budget;
 pub mod clock;
 pub mod drift;
@@ -24,6 +25,7 @@ pub mod envelope;
 pub mod error;
 pub mod event;
 pub mod freshness;
+pub mod gitattrs;
 pub mod lock;
 pub mod ops;
 pub mod paths;

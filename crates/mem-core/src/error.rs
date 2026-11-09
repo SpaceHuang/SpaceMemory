@@ -72,6 +72,9 @@ pub enum MemError {
     #[error("git 提交失败（可重试资源，事件已生效）：{0}")]
     Git(String),
 
+    #[error("受管写入被拒（{path}）：.gitattributes 内容与默认不符——建立并核验后才允许受管写入（BD5 ③）；恢复默认内容 `* -text` 即解锁，读路径不受影响")]
+    GitAttributesConflict { path: String },
+
     #[error("计划/文件损坏（{path}）：{reason}")]
     PlanCorrupt { path: String, reason: String },
 

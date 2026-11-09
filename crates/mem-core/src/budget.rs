@@ -51,17 +51,10 @@ pub fn apply_byte_budget(
     (kept, skipped, truncated)
 }
 
-/// r12 B7-3：show 正文分页切片单源（CLI/MCP 共用）——offset 为字节偏移（resume
-/// 的 body_offset 原样回传），返回 (本页文本, 是否截断, 下一偏移)。
-/// 字节切点可能落在 UTF-8 序列中间 → lossy（与 CLI 既有行为一致）。
-pub fn body_slice(body: &[u8], offset: usize, byte_budget: usize) -> (String, bool, Option<usize>) {
-    let off = offset.min(body.len());
-    let rest = &body[off..];
-    let take = rest.len().min(byte_budget);
-    let truncated = rest.len() > take;
-    let next = if truncated { Some(off + take) } else { None };
-    (String::from_utf8_lossy(&rest[..take]).to_string(), truncated, next)
-}
+// R11.2：`body_slice`（字节切 + 有损解码的单一文本通道）已废除——正文分页收敛
+// 为 mem_core::body 双通道单源：`body_page_text`（合法 UTF-8，切点码点对齐）与
+// `body_page_bytes`（任意字节，CLI 落文件 / MCP base64）。四个有损点位中的
+// 正文分页点位由此收口（binary-content-design §1 表第 1 行）。
 
 /// 裁定有效 limit：clamp 到 [1, list_limit_max]；None → 默认 list_limit。
 pub fn effective_limit(store: &Store, requested: Option<usize>) -> usize {

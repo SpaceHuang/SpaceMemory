@@ -26,6 +26,11 @@ use crate::token;
 pub type Seq = u64;
 
 /// 事件操作（规范 envelope-format.md §4.1）。
+///
+/// R11（BD4）：`restore_body` = 损坏内容恢复（经确认的内容写操作，正文区替换为
+/// 来源字节，信封/载荷原样保留）。`Unknown` = 未知操作值兜底（R11 迁移节：读取
+/// 侧前向兼容——未来再增操作值时旧二进制不再解析失败；兜底事件仅保序保读，
+/// 绝不参与写路径语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -38,6 +43,10 @@ pub enum Op {
     Backfill,
     Fix,
     Merge,
+    RestoreBody,
+    /// 未知操作值兜底（`#[serde(other)]`：反序列化不失败）。永不写出。
+    #[serde(other)]
+    Unknown,
 }
 
 impl fmt::Display for Op {
@@ -441,6 +450,7 @@ pub fn reconcile_backfill(
     pause_hook: Option<PauseHook>,
 ) -> MemResult<BackfillReport> {
     store.check_writable()?;
+    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：写例程核验
     let mut report = BackfillReport::default();
     let log = EventLog::new(store).read_log()?;
     let candidates = enumerate_candidates(store, &log)?;
@@ -638,4 +648,55 @@ pub fn chain_audit(events: &[Event]) -> Vec<ChainHole> {
         }
     }
     holes
+}
+
+#[cfg(test)]
+mod r11_op_tests {
+    //! R11（新增面7，BD4/迁移节）：`restore_body` 操作枚举 + 未知操作值兜底
+    //!（前向兼容：未来再增操作值时，旧二进制读取不失败——本次给操作枚举加兜底，
+    //! 是"一次已知断点"的缓释）。
+
+    use super::*;
+
+    fn ev_line(op: &str) -> String {
+        format!(
+            r#"{{"by":"m","id":"i","kind":"op","new_digest":"d2","new_v":2,"old_digest":"d1","old_v":1,"op":"{op}","path":"records/x.md","seq":1,"ts":"t"}}"#
+        )
+    }
+
+    #[test]
+    fn restore_body_op_roundtrip() {
+        let ev: Event = serde_json::from_str(&ev_line("restore_body")).unwrap();
+        assert_eq!(ev.op, Op::RestoreBody);
+        let line = String::from_utf8(ev.to_line()).unwrap();
+        assert!(line.contains("\"restore_body\""), "序列化往返保操作名：{line}");
+        assert_eq!(Op::RestoreBody.to_string(), "restore_body");
+    }
+
+    #[test]
+    fn unknown_op_value_tolerated() {
+        // 未来版本的未知操作值：读取侧兜底（不解析失败、不参与写路径语义）。
+        let ev: Event = serde_json::from_str(&ev_line("some_future_op")).unwrap();
+        assert_eq!(ev.op, Op::Unknown);
+        assert_ne!(ev.op, Op::ExternalDelete, "兜底事件不触发 absent 语义");
+        assert_ne!(ev.op, Op::Create);
+    }
+
+    #[test]
+    fn chain_audit_treats_unknown_as_normal_write() {
+        // 兜底事件保留 old_v/new_v → 版本链经其推进，不断裂（不伪造空洞）。
+        let events = vec![
+            Event {
+                seq: 1, ts: "t".into(), id: "i".into(), path: "records/x.md".into(),
+                op: Op::Create, old_v: None, new_v: Some(1),
+                old_digest: None, new_digest: Some("d1".into()), by: "m".into(), kind: Kind::Op,
+            },
+            Event {
+                seq: 2, ts: "t".into(), id: "i".into(), path: "records/x.md".into(),
+                op: Op::Unknown, old_v: Some(1), new_v: Some(2),
+                old_digest: Some("d1".into()), new_digest: Some("d2".into()), by: "m".into(), kind: Kind::Op,
+            },
+        ];
+        assert!(chain_audit(&events).is_empty(), "未知操作值不断言为空洞");
+    }
 }

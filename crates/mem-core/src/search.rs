@@ -30,6 +30,11 @@ pub fn payload_contains(payload: &Value, q_fold: &str) -> bool {
 /// 记录命中谓词（direct 执行器与 indexed 精筛共用，结构性等价）：
 /// id 前缀 ∪ 逐别名 ∪ 逐 payload 值 ∪ 正文——全部 fold（NFC+小写）子串语义。
 /// `q_fold` 必须是 `fold(query)`（调用方折一次，逐记录循环内不重复折叠）。
+///
+/// R11.4 正文域参与门槛（G1 单源，需求决策④(b)）：正文区非合法 UTF-8 → 正文域
+/// 不参与（恒不命中），**绝不经过有损解码**——binary-content-design §3.4 废除
+/// "有损解码后匹配"（编码巧合入命中 = 伪命中，基线 R10.2 注记由 R11 落地收口）。
+/// 其余三域（身份前缀/别名/载荷值）照常。
 pub fn record_matches(
     id: &str,
     aliases: &[String],
@@ -46,5 +51,52 @@ pub fn record_matches(
     if payload_contains(payload, q_fold) {
         return true;
     }
-    fold(&String::from_utf8_lossy(body)).contains(q_fold)
+    match crate::body::text_or_none(body) {
+        Some(s) => fold(s).contains(q_fold),
+        // 非文本正文：正文域不参与（G1 门槛）。
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const BIN: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF];
+
+    #[test]
+    fn r11_body_gate_non_utf8_never_matches() {
+        // (i) 正文区含 "abs" 编巧合、其余域不含 → 不命中（伪命中收口）。
+        assert!(
+            !record_matches("0198-id", &[], &json!({"slug":"img1"}), BIN, &fold("abs")),
+            "非文本正文绝不经有损解码参与匹配"
+        );
+    }
+
+    #[test]
+    fn r11_body_gate_valid_utf8_body_still_matches() {
+        // (iii) 合法 UTF-8 正文（SVG 文本）照常命中。
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg">abstract-geometry</svg>"#;
+        assert!(record_matches("0198-id", &[], &json!({}), svg, &fold("abstract")));
+    }
+
+    #[test]
+    fn r11_other_domains_still_hit_on_binary_record() {
+        // (ii) 非文本记录的 id 前缀 / 别名 / 载荷值照常参与。
+        let bin = BIN;
+        assert!(record_matches("img-abs-01", &[], &json!({}), bin, &fold("img")));
+        assert!(record_matches("0198-id", &["abs-alias".into()], &json!({}), bin, &fold("abs-ali")));
+        assert!(
+            record_matches("0198-id", &[], &json!({"filename":"abs.png"}), bin, &fold("abs.png")),
+            "锁定『仅正文区排除』边界"
+        );
+    }
+
+    #[test]
+    fn legacy_body_matching_unchanged_for_utf8() {
+        // 既有语义回归：合法 UTF-8 正文子串匹配不受门槛影响。
+        assert!(record_matches("id", &[], &json!({}), b"hello world", &fold("world")));
+        assert!(!record_matches("id", &[], &json!({}), b"hello world", &fold("xyz")));
+    }
 }
