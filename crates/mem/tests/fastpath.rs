@@ -64,7 +64,7 @@ fn fastpath_end_to_end_via_production_binary() {
 
     // 启动 sidecar（短空闲自退）。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
-        .args(["serve", "--store", &s, "--idle-secs", "8"])
+        .args(["serve", "--store", &s, "--idle-secs", "20"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -75,10 +75,24 @@ fn fastpath_end_to_end_via_production_binary() {
 
     // 2) 读路径：backend 分支断言（USN/RDC 都算订阅在场——H7 非提权形态）。
     let store = mem_core::store::Store::open(&dir, mem_core::store::OpenMode::Auto).unwrap();
-    let backend_probe = mem_core::sidecar::probe(&store);
+    // 探测轮询：sidecar 命名管道就绪需要时间——索引文件已物化 ≠ 握手可答
+    //（基线曾出现"首次 probe=None 而紧随的 CLI list 已 indexed"的时序抖动）。
+    // 只对"握手尚未应答"（None）轮询；应答即采纳（backend=none 的机器不被拖慢）。
+    let mut backend_probe = None;
+    for _ in 0..20 {
+        match mem_core::sidecar::probe(&store) {
+            Some(h) => {
+                backend_probe = Some(h);
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    let backend_probe = backend_probe
+        .expect("sidecar 在场（索引已物化）——握手 2s 内必应答（idle 20s 内不会自退）");
     let subscribed = matches!(
-        backend_probe.as_ref().map(|h| h.backend.as_str()),
-        Some("usn") | Some("rdc")
+        backend_probe.backend.as_str(),
+        "usn" | "rdc"
     );
     let out = mem().args(["--store", &s, "list", "--type", "task"]).output().unwrap();
     let v = j(&out);
@@ -90,7 +104,7 @@ fn fastpath_end_to_end_via_production_binary() {
     {
         assert_eq!(
             v["read_mode"]["indexed"]["via_subscription"],
-            json!(backend_probe.as_ref().unwrap().backend),
+            json!(backend_probe.backend),
             "订阅在场且无未消化 → 快路径：{v}"
         );
         let items = v["items"].as_array().unwrap();
@@ -161,9 +175,10 @@ fn fastpath_end_to_end_via_production_binary() {
         );
     }
 
-    // 5) 空闲自退 → 快路径回落 direct。
+    // 5) 空闲自退 → 快路径回落 direct。（等待窗口须覆盖 idle-secs=20 的空闲期——
+    //    最后一次维护 tick 之后 20s 自退；窗口 30s 富余。）
     assert!(
-        wait_until(|| serve.try_wait().map(|st| st.is_some()).unwrap_or(false), 80, 150),
+        wait_until(|| serve.try_wait().map(|st| st.is_some()).unwrap_or(false), 200, 150),
         "sidecar 空闲自退（D2）"
     );
     let out3 = mem().args(["--store", &s, "list", "--type", "task"]).output().unwrap();
