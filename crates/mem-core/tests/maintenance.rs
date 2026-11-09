@@ -310,7 +310,7 @@ fn fix_rebuilds_frontmatter_from_git_keeping_body_bytes() {
     // fix：git 历史上一版 frontmatter + 当前正文字节（HistoryStore 由 mem-git 提供）。
     let git = mem_git_shim::GitProcessShim::new(store.root().to_path_buf());
     let out =
-        mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, Some(&git), None, None).unwrap();
+        mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, Some(&git), None, None, None).unwrap();
     assert!(
         window_has(&out.record.body, b"hand-edited body\r\nsecond line\r\n"),
         "正文字节领土保持（红线27）"
@@ -358,6 +358,7 @@ fn fix_keeps_body_bytes_when_body_contains_horizontal_rules() {
         None,
         Some((env, serde_json::json!({"title": "broken-rec"}))),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -381,7 +382,7 @@ fn fix_without_git_requires_provided_envelope() {
     let rel = m.rel.clone();
     std::fs::write(store.abs(&rel), b"---\n{broken\n---\nbody").unwrap();
     // 无 git 历史可用 → 需要调用方提供 envelope（响亮而非静默）。
-    let err = mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, None, None, None).unwrap_err();
+    let err = mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, None, None, None, None).unwrap_err();
     assert!(matches!(err, MemError::BadArgument(_)) || matches!(err, MemError::Corrupt { .. }), "{err}");
     // 提供信封 → 修复成功。
     let env = mem_core::envelope::Envelope {
@@ -397,7 +398,7 @@ fn fix_without_git_requires_provided_envelope() {
         commit: None,
         extra: Default::default(),
     };
-    let out = mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, None, Some((env, serde_json::json!({"title": "no-git"}))), None).unwrap();
+    let out = mem_core::ops::fix_record(&store, &types, &m.record.envelope.id, None, Some((env, serde_json::json!({"title": "no-git"}))), None, None).unwrap();
     assert_eq!(out.record.body, b"body");
 }
 
@@ -449,14 +450,14 @@ fn fix_on_parseable_record_requires_expect_token() {
     .unwrap();
     let id = &m.record.envelope.id;
     // 无 expect → 响亮拒绝。
-    let err = mem_core::ops::fix_record(&store, &types, id, None, None, None).unwrap_err();
+    let err = mem_core::ops::fix_record(&store, &types, id, None, None, None, None).unwrap_err();
     assert!(err.to_string().contains("expect"), "{err}");
     // 带正确 expect → 成功（确定性再生成）。
-    let out = mem_core::ops::fix_record(&store, &types, id, None, None, Some(&m.token)).unwrap();
+    let out = mem_core::ops::fix_record(&store, &types, id, None, None, Some(&m.token), None).unwrap();
     assert_eq!(out.record.envelope.version, m.record.envelope.version);
     // 陈旧 expect → 结构化冲突。
     let stale = mem_core::token::Token { version: m.token.version, digest: "0".repeat(64) };
-    let err2 = mem_core::ops::fix_record(&store, &types, id, None, None, Some(&stale)).unwrap_err();
+    let err2 = mem_core::ops::fix_record(&store, &types, id, None, None, Some(&stale), None).unwrap_err();
     assert!(matches!(err2, MemError::Conflict { .. }), "{err2}");
 }
 

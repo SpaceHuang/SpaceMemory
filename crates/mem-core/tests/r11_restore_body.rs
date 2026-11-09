@@ -2,10 +2,11 @@
 //! 既测试面覆盖）。窗口语义、来源三形、响亮失败与回显契约逐条锁定。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use mem_core::error::MemError;
 use mem_core::event::{EventLog, Op};
-use mem_core::ops::{self, AddArgs, RestoreSource, WriteContext};
+use mem_core::ops::{self, AddArgs, CommitSink, RestoreSource, WriteContext};
 use mem_core::store::{OpenMode, Store};
 use mem_core::token::{self, Token};
 use mem_schema::TypeSet;
@@ -378,4 +379,71 @@ fn attic_record_rejected() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("records/"), "attic 记录不支持 restore-body：{err}");
+}
+
+// ---------- 实施评审 B1：fix 修复版本必须入 git 同批提交（否则 history 锚不在史） ----------
+
+/// 记录提交批次的 fake 提交汇。
+#[derive(Default, Clone)]
+struct RecordingSink {
+    batches: Arc<Mutex<Vec<Vec<String>>>>,
+    fail: bool,
+}
+
+impl CommitSink for RecordingSink {
+    fn commit(&self, paths: &[String]) -> mem_core::error::MemResult<Option<String>> {
+        if self.fail {
+            return Err(MemError::Git("注入的提交失败".into()));
+        }
+        self.batches.lock().unwrap().push(paths.to_vec());
+        Ok(Some("0".repeat(40)))
+    }
+}
+
+/// 合法手改载荷 title（保版本手改：磁盘字节 ≠ 既有提交，事件日志不知情）。
+fn hand_edit_title(store: &Store, rel: &str, title: &str) -> Vec<u8> {
+    let mut bytes = std::fs::read(store.abs(rel)).unwrap();
+    let old = format!("\"title\": \"{title}\"").into_bytes();
+    assert!(bytes.windows(old.len()).any(|w| w == old), "夹具：payload title 存在");
+    let new = format!("\"title\": \"{title}-edited\"").into_bytes();
+    let pos = bytes.windows(old.len()).position(|w| w == old).unwrap();
+    bytes.splice(pos..pos + old.len(), new);
+    std::fs::write(store.abs(rel), &bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn b1_fix_output_enters_same_batch_commit() {
+    let (_tmp, store, types) = fresh_store();
+    let (id, _tok) = add_memory(&store, &types, "b1-fix", b"body v1");
+    let rel = ops::get(&store, &id).unwrap().rel.clone();
+    let hand_edited = hand_edit_title(&store, &rel, "b1-fix");
+    let expect = token::for_bytes(1, &hand_edited);
+    let sink = RecordingSink::default();
+    ops::fix_record(&store, &types, &id, None, None, Some(&expect), Some(&sink)).unwrap();
+    let batches = sink.batches.lock().unwrap();
+    assert_eq!(batches.len(), 1, "fix 产生新字节 → 恰一批提交");
+    let batch = &batches[0];
+    assert!(batch.contains(&rel), "记录路径在批：{batch:?}");
+    assert!(batch.contains(&"events.jsonl".to_string()), "事件日志同批：{batch:?}");
+    assert!(
+        batch.contains(&".gitattributes".to_string()),
+        "BD5 ②：规则文件随受管写批次（fix 亦然）：{batch:?}"
+    );
+}
+
+#[test]
+fn b1_fix_commit_failure_lands_in_retryable_pending() {
+    let (_tmp, store, types) = fresh_store();
+    let (id, _tok) = add_memory(&store, &types, "b1-pending", b"body v1");
+    let rel = ops::get(&store, &id).unwrap().rel.clone();
+    let hand_edited = hand_edit_title(&store, &rel, "b1-pending");
+    let expect = token::for_bytes(1, &hand_edited);
+    let sink = RecordingSink { batches: Default::default(), fail: true };
+    // 提交失败 → 真相层不回滚、转 commit-pending（D17；不静默无历史）。
+    ops::fix_record(&store, &types, &id, None, None, Some(&expect), Some(&sink)).unwrap();
+    let pending = ops::list_pending_commits(&store).unwrap();
+    assert_eq!(pending.len(), 1, "失败转可重试 pending：{pending:?}");
+    let paths = &pending[0].1.paths;
+    assert!(paths.contains(&rel) && paths.contains(&"events.jsonl".to_string()));
 }

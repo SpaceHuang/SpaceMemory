@@ -921,49 +921,33 @@ fn cmd_show(
 /// BD1：`--body-out` 落文件（读路径唯一的"写盘"——写的是调用方指定的工作区路径，
 /// 不是店内任何真相/缓存/锁/事件；G3：无机制副作用，只读存储上同样可用）。
 /// 约束两条：目标已存在 → 响亮拒绝；目标位于店目录内 → 响亮拒绝。
+///
+/// B2（实施评审）："不覆盖"由**原子独占创建**承担（`platform::create_new`——完整
+/// 字节写同目录临时文件并同步，再以不覆盖的原子发布交付；目标已存在 → 发布失败
+/// 且目标分毫不动）。此前的 `path.exists()` 检查与 `fs::write` 分离存在 TOCTOU
+/// 竞态：目标在检查后被并发创建会被截断覆盖——检查与发布合一后窗口不复存在，
+/// 并发正确性不依赖事后检测。
 fn write_body_out(store: &Store, spec: &str, body: &[u8]) -> MemResult<serde_json::Value> {
     let path = std::path::Path::new(spec);
-    if path.exists() {
-        return Err(MemError::BadArgument(format!(
-            "--body-out 目标已存在（读命令不做覆盖写）：{spec}"
-        )));
-    }
-    if path_is_inside_store(store, path) {
+    if mem_core::paths::path_is_inside(store.root(), path) {
         return Err(MemError::BadArgument(format!(
             "--body-out 目标位于店目录内（防止经读通道在店内产生信封管辖外的旁挂文件）：{spec}"
         )));
     }
-    std::fs::write(path, body).map_err(|e| MemError::io(spec, e))?;
+    match mem_core::platform::create_new(path, body) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(MemError::BadArgument(format!(
+                "--body-out 目标已存在（读命令不做覆盖写；既有文件原字节保持）：{spec}"
+            )));
+        }
+        Err(e) => return Err(MemError::io(spec, e)),
+    }
     Ok(serde_json::json!({
         "path": path.display().to_string(),
         "bytes": body.len(),
         "sha256": mem_core::token::sha256_hex(body),
     }))
-}
-
-/// 判定 path 是否位于店目录内（词法前缀 + 规范化前缀双判——目标可能尚不存在，
-/// 父目录链不一定可规范化；Windows 大小写不敏感）。
-fn path_is_inside_store(store: &Store, path: &std::path::Path) -> bool {
-    fn norm(p: &std::path::Path) -> String {
-        p.to_string_lossy().to_lowercase().replace('/', std::path::MAIN_SEPARATOR_STR)
-    }
-    let root = norm(store.root());
-    let target = norm(path);
-    if target.starts_with(&root) {
-        return true;
-    }
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => return false,
-    };
-    match std::fs::canonicalize(parent) {
-        Ok(c) => {
-            let store_canon = std::fs::canonicalize(store.root())
-                .unwrap_or_else(|_| store.root().to_path_buf());
-            c.starts_with(&store_canon)
-        }
-        Err(_) => false,
-    }
 }
 
 fn cmd_trace(
@@ -1310,7 +1294,11 @@ fn cmd_fix(
         }
     };
     let expect_t = expect.map(parse_token).transpose()?;
-    let out = mem_core::ops::fix_record(store, types, id, Some(&git), provided, expect_t.as_ref())?;
+    // B1：fix 修复版本与事件同批入史（有 .git 才挂提交汇——无 git 形态合法，红线10）。
+    let committer: Option<&dyn mem_core::ops::CommitSink> =
+        if store.root().join(".git").exists() { Some(&git) } else { None };
+    let out =
+        mem_core::ops::fix_record(store, types, id, Some(&git), provided, expect_t.as_ref(), committer)?;
     out_json(&serde_json::json!({
         "rel": out.rel,
         "id": out.record.envelope.id,

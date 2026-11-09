@@ -736,22 +736,30 @@ pub fn reverse_refs(store: &Store, id: &str) -> MemResult<Vec<(String, String)>>
 
 // ---------- commit-pending ----------
 
-fn commit_same_batch(ctx: &WriteContext, record_paths: &[String], _seq: u64) -> MemResult<()> {
-    let Some(sink) = ctx.committer else { return Ok(()) };
+/// git 同批提交的统一入口（D17）：记录路径 + events.jsonl 同批；失败转
+/// commit-pending（不分配序号、不回滚真相层）。通用写路径（[`commit_same_batch`]
+/// 的调用方）与 fix（实施评审 B1：修复版本必须入史，否则随后 restore-body
+/// history 的锚摘要不在 git 历史中——复合修复链断裂）共用本纪律。
+pub fn commit_batch(
+    store: &Store,
+    committer: Option<&dyn CommitSink>,
+    record_paths: &[String],
+) -> MemResult<()> {
+    let Some(sink) = committer else { return Ok(()) };
     let mut batch: Vec<String> = record_paths.to_vec();
     batch.push("events.jsonl".into());
     // BD5 ②：行尾规则文件随受管写批次入树（幂等——已入树且内容相符时对
     // path-scoped 提交无 diff；init 暂存的规则由此随首次提交入树；commit-pending
     // 批次同样携带，直至核验入树）。冲突状态在写入口已结构化拒绝（③），
     // 走到这里的批次必然是默认内容或待补种状态。
-    if ctx.store.root().join(".git").exists() {
+    if store.root().join(".git").exists() {
         batch.push(crate::gitattrs::GITATTRIBUTES_REL.into());
     }
     match sink.commit(&batch) {
         Ok(_) => Ok(()),
         Err(e) => {
             // commit-pending：不分配序号、不回滚真相层（D17）。
-            let dir = ctx.store.abs(".pending-commits");
+            let dir = store.abs(".pending-commits");
             std::fs::create_dir_all(&dir).map_err(|er| MemError::io(dir.display().to_string(), er))?;
             let name = format!(
                 "{}.json",
@@ -770,6 +778,11 @@ fn commit_same_batch(ctx: &WriteContext, record_paths: &[String], _seq: u64) -> 
             Ok(())
         }
     }
+}
+
+/// [`commit_batch`] 的写路径变体（取 WriteContext 的 store/committer）。
+fn commit_same_batch(ctx: &WriteContext, record_paths: &[String], _seq: u64) -> MemResult<()> {
+    commit_batch(ctx.store, ctx.committer, record_paths)
 }
 
 fn register_trail(ctx: &WriteContext, record_id: &str) {
@@ -1034,6 +1047,11 @@ pub struct Fixed {
 /// - frontmatter 损坏：优先用调用方提供的 envelope/payload；否则从历史
 ///   （[`HistoryStore`]）取上一版 frontmatter + **保留当前正文字节**（红线27）；
 ///   两者皆无 → 响亮错误（绝不静默捏造）。
+///
+/// `committer`：git 同批提交汇（B1，实施评审）——fix 是机制写入，修复版本必须
+/// 与 events.jsonl 同批入史（无 .git → 传 None，历史缺席合法红线10）；提交失败转
+/// commit-pending，不得静默无历史：修复产物与事件登记摘要不一致的缺口会让随后
+/// `restore-body history` 的锚不在 git 历史中（复合修复链 §3.6 断裂）。
 pub fn fix_record(
     store: &Store,
     types: &TypeSet,
@@ -1041,6 +1059,7 @@ pub fn fix_record(
     history: Option<&dyn HistoryStore>,
     provided: Option<(Envelope, serde_json::Value)>,
     expect: Option<&Token>,
+    committer: Option<&dyn CommitSink>,
 ) -> MemResult<Fixed> {
     store.check_writable()?;
     crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：受管写前核验
@@ -1127,6 +1146,9 @@ pub fn fix_record(
         Some(&new_token.digest),
         "mem fix",
     )?;
+    // B1：修复版本与事件同批入史（统一写路径提交纪律，D17）——失败转
+    // commit-pending，不回滚真相层。
+    commit_batch(store, committer, &[rel.clone()])?;
     Ok(Fixed { rel, record: Record::from_bytes(&out).expect("自产字节必可解析"), token: new_token })
 }
 
