@@ -15,7 +15,7 @@
 | `docs/requirement/agent-memory-requirements.md` | 需求基线 v1.4——一切设计与验收的起源与评审标尺 |
 | `docs/requirement/keyword-search-requirements.md` | R10 关键词检索提案（v0.7）——需求本体已并入基线 v1.3，本文保留决策过程、评审往返与盘点明细 |
 | `docs/requirement/binary-content-requirements.md` | R11 二进制承载提案（v0.3）——需求本体已并入基线 v1.3，本文保留决策过程、评审往返与盘点明细 |
-| `docs/develop/agent-memory-design.md` | 设计现状 v1.2——决策（D#）、红线（§5）、实施顺序（§8）、开放问题（§7）、实施裁决注记 |
+| `docs/develop/agent-memory-design.md` | 设计现状 v1.3——决策（D#）、红线（§5）、实施顺序（§8）、开放问题（§7）、实施裁决注记 |
 | `docs/develop/keyword-search-design.md` | R10 实施设计 v0.3——查询文法、双执行器单源（open_proved 构造即证明）、x-filter 词汇、过滤规范条件（字段＋标量文本）、坏记录告警承接；三轮评审通过，七项决策经用户批准（2026-11-09），已实施（r10-keyword-search 分支，实施评审 B1/B2 修复关闭，详见 `docs/review/keyword-search-implementation-review.md`） |
 | `docs/specs/` | 三个公开规范 v1（envelope-format / type-declaration / conventions-source）；规范与实现冲突时以规范评审结论为准 |
 | `docs/rules/` | 操作型指南（流程性规则，如打包分发 `packaging.md`）——执行对应任务时按需读取全文，本文件只登记存在与触发时机 |
