@@ -79,6 +79,11 @@ pub enum Cmd {
         body: bool,
         #[arg(long, help = "正文字节续读偏移（配合 resume.body_offset）")]
         body_offset: Option<usize>,
+        /// R11.2/BD1：正文原始字节全量落至调用方指定文件（字节取回通道）；
+        /// stdout 只回元信息（路径/字节数/正文 SHA-256）。目标已存在或位于
+        /// 店目录内 → 响亮拒绝（读命令不做覆盖写、不留旁挂文件）。
+        #[arg(long = "body-out")]
+        body_out: Option<String>,
     },
     /// 多跳遍历（预算+截断标注）
     Trace {
@@ -188,6 +193,18 @@ pub enum Cmd {
         payload: Option<String>,
         #[arg(long, help = "修订令牌（记录可解析时必带，红线19；损坏记录豁免）")]
         expect: Option<String>,
+    },
+    /// 恢复正文（经确认的内容写：正文区替换为来源字节，信封/载荷原样保留；BD4）。
+    /// 与 fix 的分界：结构头坏 → 先 fix（保正文字节）；正文坏 → restore-body（换正文字节）
+    RestoreBody {
+        id: String,
+        #[arg(long, help = "修订令牌（全摘要 CAS，红线19）")]
+        expect: String,
+        /// R11/BD4 来源三形：`git:<版本>` 指定历史版本 | `file:<店外路径>` 店外备份
+        /// | `history` 自动锚定（仅在可判定窗口内：漂移仍在 ∧ 最后事件为机制写入；
+        /// 窗口外响亮拒绝并附指引，绝不回退次优匹配）
+        #[arg(long)]
+        source: String,
     },
 }
 

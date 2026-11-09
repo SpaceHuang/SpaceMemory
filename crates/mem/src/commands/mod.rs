@@ -72,8 +72,8 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     cmd_find(&store, query, *limit, *offset)?;
                     Ok(0)
                 }
-                Cmd::Show { id, body, body_offset } => {
-                    cmd_show(&store, id, *body, *body_offset)?;
+                Cmd::Show { id, body, body_offset, body_out } => {
+                    cmd_show(&store, id, *body, *body_offset, body_out.as_deref())?;
                     Ok(0)
                 }
                 Cmd::Trace { id, dir, depth, limit, skip } => {
@@ -205,6 +205,10 @@ fn run(cli: &Cli) -> MemResult<i32> {
                 }
                 Cmd::Fix { id, envelope, payload, expect } => {
                     cmd_fix(&store, &types, id, envelope.as_deref(), payload.as_deref(), expect.as_deref())?;
+                    Ok(0)
+                }
+                Cmd::RestoreBody { id, expect, source } => {
+                    cmd_restore_body(&store, &types, id, expect, source)?;
                     Ok(0)
                 }
             }
@@ -357,6 +361,8 @@ fn cmd_init(
     principal_label: &str,
 ) -> MemResult<()> {
     Store::create(path)?;
+    // BD5 ①：行尾规则随 init 播种（幂等；git add -A 暂存后随首次受管提交入树）。
+    mem_core::gitattrs::seed_at_root(path)?;
     // 播种类型两件套（混合分发：外部优先、内嵌兜底，开放问题40）。
     // r14 发布准备：查找逻辑单源下沉 mem_assets::resolve_seed_files——
     // 模板覆盖 > exe 旁 builtin-types/ > Homebrew share 布局 > 内嵌字节
@@ -849,31 +855,115 @@ fn cmd_find_direct(
     Ok(())
 }
 
-fn cmd_show(store: &Store, id: &str, with_body: bool, body_offset: Option<usize>) -> MemResult<()> {
+fn cmd_show(
+    store: &Store,
+    id: &str,
+    with_body: bool,
+    body_offset: Option<usize>,
+    body_out: Option<&str>,
+) -> MemResult<()> {
     // r12 B7-3：预算是配置错误——先于一切工作响亮拒收（不因 id 无效而先报别的错）。
     let budget = mem_core::budget::brief_bytes_budget(store)?;
     let hit = ops::get(store, id)?;
     let bytes = std::fs::read(store.abs(&hit.rel)).unwrap_or_default();
-    // r4 B7：show 的返回规模受 brief_bytes 硬预算（R4.2/红线9）——正文超限截断
-    // 并附续读偏移，不静默吞。r10：预算 < 2 响亮拒收（配置错误，R6.1）。
-    // r12 B7-3：预算下限校验与正文切片下沉 mem_core::budget 单源（CLI/MCP 共用
-    // ——此前 MCP 前端无截断无续读，完整正文超预算直出）。
-    let (body_text, body_truncated, next_off) =
-        mem_core::budget::body_slice(&hit.record.body, body_offset.unwrap_or(0), budget);
+    // R11.2（G1/G2）：分页双通道——合法 UTF-8 正文走文本通道（切点码点对齐，
+    // 数学上字节保真）；非合法正文绝不经有损解码，预览降级为占位描述符（BD3），
+    // 字节经 --body-out 取回（BD1）。body_utf8 恒有机判（BD3）。
+    let body_utf8 = mem_core::body::is_valid_utf8(&hit.record.body);
+    // BD1：--body-out 全量落文件，stdout 只回元信息（路径/字节数/正文 SHA-256）。
+    let body_out_meta = match body_out {
+        Some(spec) => Some(write_body_out(store, spec, &hit.record.body)?),
+        None => None,
+    };
+    let (body_value, body_truncated, resume) = if body_out.is_some() || !with_body {
+        // 字节经文件交付 / --no-body：stdout 不重复正文。
+        (serde_json::Value::Null, false, serde_json::Value::Null)
+    } else if body_utf8 {
+        let (text, truncated, next_off) = mem_core::body::body_page_text(
+            &hit.record.body,
+            body_offset.unwrap_or(0),
+            budget,
+        )
+        .expect("合法 UTF-8 正文必有文本通道");
+        let resume = if truncated {
+            serde_json::json!({ "body_offset": next_off })
+        } else {
+            serde_json::Value::Null
+        };
+        (serde_json::json!(text), truncated, resume)
+    } else {
+        // BD3 占位描述符：不分页（描述符后 resume=null）。
+        (
+            serde_json::json!(mem_core::body::non_text_descriptor(
+                &hit.record.envelope.id,
+                &hit.record.body
+            )),
+            false,
+            serde_json::Value::Null,
+        )
+    };
     out_json(&serde_json::json!({
         "rel": hit.rel,
         "envelope": hit.record.envelope.to_json_value(),
         "payload": hit.record.payload,
-        "body": if with_body { Some(body_text) } else { None },
+        "body": body_value,
+        "body_utf8": body_utf8,
+        "body_out": body_out_meta,
         "body_bytes_total": hit.record.body.len(),
         "body_truncated": body_truncated,
-        "resume": if body_truncated {
-            serde_json::json!({"body_offset": next_off})
-        } else { serde_json::Value::Null },
+        "resume": resume,
         "token": hit.token.to_string(),
         "bytes": bytes.len(),
     }));
     Ok(())
+}
+
+/// BD1：`--body-out` 落文件（读路径唯一的"写盘"——写的是调用方指定的工作区路径，
+/// 不是店内任何真相/缓存/锁/事件；G3：无机制副作用，只读存储上同样可用）。
+/// 约束两条：目标已存在 → 响亮拒绝；目标位于店目录内 → 响亮拒绝。
+fn write_body_out(store: &Store, spec: &str, body: &[u8]) -> MemResult<serde_json::Value> {
+    let path = std::path::Path::new(spec);
+    if path.exists() {
+        return Err(MemError::BadArgument(format!(
+            "--body-out 目标已存在（读命令不做覆盖写）：{spec}"
+        )));
+    }
+    if path_is_inside_store(store, path) {
+        return Err(MemError::BadArgument(format!(
+            "--body-out 目标位于店目录内（防止经读通道在店内产生信封管辖外的旁挂文件）：{spec}"
+        )));
+    }
+    std::fs::write(path, body).map_err(|e| MemError::io(spec, e))?;
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "bytes": body.len(),
+        "sha256": mem_core::token::sha256_hex(body),
+    }))
+}
+
+/// 判定 path 是否位于店目录内（词法前缀 + 规范化前缀双判——目标可能尚不存在，
+/// 父目录链不一定可规范化；Windows 大小写不敏感）。
+fn path_is_inside_store(store: &Store, path: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        p.to_string_lossy().to_lowercase().replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+    let root = norm(store.root());
+    let target = norm(path);
+    if target.starts_with(&root) {
+        return true;
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(c) => {
+            let store_canon = std::fs::canonicalize(store.root())
+                .unwrap_or_else(|_| store.root().to_path_buf());
+            c.starts_with(&store_canon)
+        }
+        Err(_) => false,
+    }
 }
 
 fn cmd_trace(
@@ -1229,6 +1319,52 @@ fn cmd_fix(
     Ok(())
 }
 
+/// BD4：恢复正文（经确认的内容写；来源三形解析 + 出处回显）。
+fn cmd_restore_body(
+    store: &Store,
+    types: &TypeSet,
+    id: &str,
+    expect: &str,
+    source: &str,
+) -> MemResult<()> {
+    store.check_writable()?;
+    let expect_t = parse_token(expect)?;
+    let source_spec = parse_restore_source(source)?;
+    let history = mem_git::GitProcess::new(store.root());
+    let ctx = write_ctx(store, types, None);
+    let out = ops::restore_body(&ctx, id, &expect_t, &source_spec, Some(&history))?;
+    out_json(&serde_json::json!({
+        "id": out.record.envelope.id,
+        "rel": out.rel,
+        "version": out.record.envelope.version,
+        "token": out.token.to_string(),
+        "source": out.source_echo,
+    }));
+    Ok(())
+}
+
+/// 来源三形解析：`git:<版本>` | `file:<店外路径>` | `history`（§3.6）。
+fn parse_restore_source(spec: &str) -> MemResult<ops::RestoreSource> {
+    if spec == "history" {
+        return Ok(ops::RestoreSource::History);
+    }
+    if let Some(rev) = spec.strip_prefix("git:") {
+        if rev.is_empty() {
+            return Err(MemError::BadArgument("git: 源缺版本号（git:<版本>）".into()));
+        }
+        return Ok(ops::RestoreSource::Git { rev: rev.to_string() });
+    }
+    if let Some(p) = spec.strip_prefix("file:") {
+        if p.is_empty() {
+            return Err(MemError::BadArgument("file: 源缺路径（file:<店外路径>）".into()));
+        }
+        return Ok(ops::RestoreSource::File { path: std::path::PathBuf::from(p) });
+    }
+    Err(MemError::BadArgument(format!(
+        "--source 必须为 git:<版本> | file:<店外路径> | history，实际 {spec:?}"
+    )))
+}
+
 fn cmd_verify(store: &Store, types: &TypeSet, deep: bool) -> MemResult<()> {
     let scan = ops::scan_all(store)?;
     let log = EventLog::new(store).read_log()?;
@@ -1255,12 +1391,24 @@ fn cmd_verify(store: &Store, types: &TypeSet, deep: bool) -> MemResult<()> {
     // envelope.refs + payload 悬空）。
     let mirror_report = mem_core::ops::mirror_consistency_audit(store, types)?;
     let plan_report = mem_core::agenda::verify_report(store, types, deep)?;
+    // BD5 ④：.gitattributes 提交树核验（有 .git 的店；完成标记 = 提交树核验，
+    // 非工作区文件存在）。
+    let has_git = store.root().join(".git").exists();
+    let head_attr = if has_git {
+        sink_for(store)
+            .head_file(mem_core::gitattrs::GITATTRIBUTES_REL)
+            .unwrap_or(None)
+    } else {
+        None
+    };
+    let gitattrs_audit = mem_core::gitattrs::audit_findings(has_git, head_attr.as_deref());
     let ok = scan.warnings.is_empty()
         && holes.is_empty()
         && dangling.is_empty()
         && digest_mismatches.is_empty()
         && mirror_report.is_empty()
-        && plan_report.is_empty();
+        && plan_report.is_empty()
+        && gitattrs_audit.is_empty();
     out_json(&serde_json::json!({
         "ok": ok,
         "scanned": scan.records.len(),
@@ -1269,6 +1417,7 @@ fn cmd_verify(store: &Store, types: &TypeSet, deep: bool) -> MemResult<()> {
         "dangling_refs": dangling,
         "payload_mirror_inconsistencies": mirror_report,
         "digest_mismatches": digest_mismatches,
+        "gitattributes_audit": gitattrs_audit,
         "plans": plan_report,
     }));
     Ok(())

@@ -182,8 +182,21 @@ fn verify_ok_and_history_hole_detection() {
     let dir = tmp.path().join("store");
     init_store(&dir);
     let s = dir.to_str().unwrap();
+    // R11/BD5 ①④：行尾规则随 init 播种、随**首次受管提交**入树（提交树核验 =
+    // 完成标记）。init 后、首次受管写入前，verify 如实报告该窗口（gitattributes_audit
+    // 非空 → ok=false）；一次受管写入后四件套闭合、全绿。
+    let pre = mem().args(["--store", s, "verify", "--deep"]).output().unwrap();
+    let pre_v = j(&pre);
+    assert_eq!(pre_v["gitattributes_audit"].as_array().unwrap().len(), 1, "init 后窗口如实报告：{pre_v}");
+    assert_eq!(pre_v["ok"], false, "窗口内不宣称完成：{pre_v}");
+    let seal = mem()
+        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"seal"}"#])
+        .output()
+        .unwrap();
+    assert!(seal.status.success(), "{}", String::from_utf8_lossy(&seal.stderr));
     let out = mem().args(["--store", s, "verify", "--deep"]).output().unwrap();
     let v = j(&out);
+    assert_eq!(v["gitattributes_audit"], serde_json::json!([]), "受管写入后提交树核验通过：{v}");
     assert_eq!(v["ok"], true, "{}", serde_json::to_string(&v).unwrap());
     // 注入历史空洞：伪造 update（old_v=5 跳过 v2..4）。
     let log = dir.join("events.jsonl");

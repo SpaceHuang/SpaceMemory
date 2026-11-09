@@ -635,6 +635,7 @@ dependencies = [
  "mem-mcp",
  "mem-schema",
  "serde_json",
+ "sha2",
  "tempfile",
  "windows-sys 0.59.0",
 ]
@@ -691,6 +692,7 @@ dependencies = [
  "mem-index",
  "mem-schema",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
