@@ -175,27 +175,40 @@ impl GitProcess {
 }
 
 impl mem_core::ops::BodyHistory for GitProcess {
+    /// 判据全部为**退出码**（L2，实施评审 r3）：git 消息经 gettext 本地化——
+    /// 此前以 stderr 英文文本 `"does not exist"` 判"路径不在该版本"，非英文
+    /// locale 下 history 锚定扫描会把合法跳过分支误入 Err。改为：
+    /// ① `rev-parse --verify --quiet <rev>^{commit}` 判版本引用有效性；
+    /// ② `cat-file -e <rev>:<rel>` 判路径存在性（退出码）；
+    /// ③ `cat-file blob <rev>:<rel>` 取字节（纯字节输出，无消息文本干扰）。
     fn file_bytes_at(&self, rel: &str, rev: &str) -> MemResult<Option<Vec<u8>>> {
         require_git_dir(&self.workdir)?;
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.workdir)
-            .args(["show", &format!("{rev}:{rel}")])
-            .output()
-            .map_err(|e| MemError::Git(format!("git show 失败：{e}")))?;
-        if out.status.success() {
-            return Ok(Some(out.stdout));
+        let git = |args: &[&str]| -> std::io::Result<std::process::Output> {
+            Command::new("git").arg("-C").arg(&self.workdir).args(args).output()
+        };
+        let spec = format!("{rev}:{rel}");
+        let rev_ok = git(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+            .map_err(|e| MemError::Git(format!("git rev-parse 失败：{e}")))?;
+        if !rev_ok.status.success() {
+            return Err(MemError::Git(format!(
+                "取历史版本失败（{spec}）：版本引用无效"
+            )));
         }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // "路径在该版本不存在"是扫描的合法分支 → Ok(None)；坏版本引用等 → Err。
-        if stderr.contains("does not exist") {
-            Ok(None)
-        } else {
-            Err(MemError::Git(format!(
-                "取历史版本失败（{rev}:{rel}）：{}",
-                stderr.trim()
-            )))
+        let exists = git(&["cat-file", "-e", &spec])
+            .map_err(|e| MemError::Git(format!("git cat-file 失败：{e}")))?;
+        if !exists.status.success() {
+            // 路径在该版本不存在 = 扫描的合法分支（Ok(None)）。
+            return Ok(None);
         }
+        let out = git(&["cat-file", "blob", &spec])
+            .map_err(|e| MemError::Git(format!("git cat-file 失败：{e}")))?;
+        if !out.status.success() {
+            return Err(MemError::Git(format!(
+                "取历史版本失败（{spec}）：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Some(out.stdout))
     }
 
     fn list_versions(&self, rel: &str) -> MemResult<Vec<String>> {

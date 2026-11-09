@@ -147,26 +147,222 @@ pub fn records_rel(attic_rel_path: &str) -> MemResult<String> {
 }
 
 /// 判定 path 是否位于 root 目录内（R11：`--body-out` 目标与 restore-body 的
-/// `file:` 源共用；CLI/MCP 不得各自复写）。词法前缀 + 规范化前缀双判——目标可能
-/// 尚不存在（父目录链不一定可规范化）；Windows 大小写不敏感。
+/// `file:` 源共用；CLI/MCP 不得各自复写）。
+///
+/// H2（实施评审 r3）：目标路径按调用方进程 cwd 解析（std::fs 落盘语义）——相对
+/// 路径先与 cwd 拼接绝对化；裸相对路径（无目录部分）不再因 `parent()` 为空而
+/// 放行。cwd 不可得 → 保守判内（响亮拒绝优于旁挂写入）。
+/// L1（同轮）：词法比较用**分隔符边界感知**的前缀（兄弟目录 `store-backup` 不再
+/// 命中店根 `store` 前缀）＋ `.`/`..` 词法折叠（相对店根 `--store .` 下 `../x`
+/// 不再误判店内）；规范化（canonicalize）兜底承担大小写/符号链接。
 pub fn path_is_inside(root: &std::path::Path, path: &std::path::Path) -> bool {
-    fn norm(p: &std::path::Path) -> String {
-        p.to_string_lossy()
-            .to_lowercase()
-            .replace('/', std::path::MAIN_SEPARATOR_STR)
+    match std::env::current_dir() {
+        Ok(cwd) => path_is_inside_with_cwd(root, path, &cwd),
+        // 拿不到 cwd：相对目标无法定位——保守判内（拒绝写方向安全）。
+        Err(_) => true,
     }
-    if norm(path).starts_with(&norm(root)) {
+}
+
+/// [`path_is_inside`] 的 cwd 注入变体（测试用；生产入口自动取进程 cwd）。
+pub fn path_is_inside_with_cwd(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> bool {
+    let path_abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let root_abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+    // 第一判：词法折叠 + 分隔符边界前缀（目标/店根均可不存在）。
+    let path_norm = normalize_lexical(&path_abs);
+    let root_norm = normalize_lexical(&root_abs);
+    if lexically_within(&root_norm, &path_norm) {
         return true;
     }
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => return false,
-    };
-    match std::fs::canonicalize(parent) {
-        Ok(c) => {
-            let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            c.starts_with(&root_canon)
+    // 第二判：规范化兜底（大小写/符号链接/junction；仅父链存在时可行）。
+    let canon_root = std::fs::canonicalize(&root_abs).ok();
+    let Some(canon_root) = canon_root else { return false };
+    if let Ok(canon_path) = std::fs::canonicalize(&path_abs) {
+        return canonically_within(&canon_root, &canon_path);
+    }
+    // 目标尚不存在：沿祖先链找**最近已存在祖先**规范化——目标落盘必在其下，
+    // 该祖先的内外即目标的内外。
+    for anc in path_abs.ancestors().skip(1) {
+        if let Ok(canon_anc) = std::fs::canonicalize(anc) {
+            return canonically_within(&canon_root, &canon_anc);
         }
-        Err(_) => false,
+    }
+    false
+}
+
+/// 词法规范化：折叠 `.`/`..`、统一分隔符、小写（Windows 不敏感近似）。
+fn normalize_lexical(p: &std::path::Path) -> String {
+    let mut leading = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Prefix(pr) => {
+                leading.push_str(&pr.as_os_str().to_string_lossy().to_lowercase())
+            }
+            std::path::Component::RootDir => leading.push(std::path::MAIN_SEPARATOR),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 绝对路径下弹尽即钳在根（非法输入防御）；相对路径弹尽保留 ".."。
+                if parts.pop().is_none() && leading.is_empty() {
+                    parts.push("..".into());
+                }
+            }
+            std::path::Component::Normal(c) => {
+                parts.push(c.to_string_lossy().to_lowercase())
+            }
+        }
+    }
+    let sep = std::path::MAIN_SEPARATOR;
+    if leading.is_empty() {
+        parts.join(&sep.to_string())
+    } else {
+        format!("{leading}{}", parts.join(&sep.to_string()))
+    }
+}
+
+/// 分隔符边界感知的"p 在 root 内或等于 root"（词法形态）。
+fn lexically_within(root_norm: &str, path_norm: &str) -> bool {
+    if root_norm.is_empty() {
+        return false;
+    }
+    let sep = std::path::MAIN_SEPARATOR;
+    let root_trim = root_norm.trim_end_matches(sep);
+    path_norm == root_trim || path_norm.starts_with(&format!("{root_trim}{sep}"))
+}
+
+/// 规范化形态的"p 在 root 内或等于 root"（canonicalize 产物，已无相对成分）。
+fn canonically_within(root: &std::path::Path, p: &std::path::Path) -> bool {
+    lexically_within(
+        &root.to_string_lossy().to_lowercase(),
+        &p.to_string_lossy().to_lowercase(),
+    )
+}
+
+#[cfg(test)]
+mod r3_path_tests {
+    //! H2/L1（实施评审 r3）判定矩阵：cwd 注入式（不改进程 cwd——测试并行安全）。
+    //! 语义：目标路径按调用方进程 cwd 解析（std::fs 落盘语义）——相对路径先绝对化。
+
+    use super::*;
+    use std::path::Path;
+
+    fn store(root_name: &str) -> std::path::PathBuf {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(root_name);
+        std::fs::create_dir_all(&root).unwrap();
+        // tempdir 生命周期由调用方维持——此 helper 仅用于单元矩阵的路径构造，
+        // 判定全部基于词法/父链规范化，无需 root 内文件真实存在。
+        root
+    }
+
+    #[test]
+    fn h2_bare_relative_path_resolved_against_cwd() {
+        // cwd=店根：裸相对路径落店内 → 判内（原实现 parent() 为空串直接放行——H2）。
+        let root = store("s1");
+        let cwd = root.clone();
+        assert!(path_is_inside_with_cwd(&root, Path::new("x.png"), &cwd));
+        assert!(path_is_inside_with_cwd(&root, Path::new("records/a.md"), &cwd));
+        // cwd=店外：同一路径落店外 → 判外。
+        let outside_cwd = root.parent().unwrap().parent().unwrap().to_path_buf();
+        assert!(!path_is_inside_with_cwd(&root, Path::new("x.png"), &outside_cwd));
+    }
+
+    #[test]
+    fn h2_store_relative_root_resolved_against_cwd() {
+        // 店根相对（--store .）：与目标同 cwd 折叠后比较。
+        let root = store("s2");
+        let cwd = root.clone();
+        assert!(path_is_inside_with_cwd(Path::new("."), Path::new("x.png"), &cwd));
+        assert!(!path_is_inside_with_cwd(Path::new("."), Path::new("../out.png"), &cwd));
+        // cwd=店外、店根为 cwd 下子目录（相对店根形态，含 ./ 折叠）：
+        // 店内目标判内、兄弟/上级目标判外（L1b 误拒修正）。
+        let parent = root.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(parent.join("store-x/sub")).unwrap();
+        assert!(path_is_inside_with_cwd(Path::new("./store-x/."),
+            Path::new("./store-x/sub/b.md"), &parent),
+            "相对店根（含 ./ 折叠）下的目标判内");
+        assert!(!path_is_inside_with_cwd(Path::new("./store-x"),
+            Path::new("./other/c.md"), &parent),
+            "兄弟目录判外（L1a/L1b 误拒修正）");
+    }
+
+    #[test]
+    fn l1a_sibling_directory_not_inside() {
+        // 兄弟目录（store-backup）不得命中店根字符串前缀（L1a）。
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().to_path_buf();
+        let root = parent.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let sibling = parent.join("store-backup").join("out.png");
+        assert!(!path_is_inside_with_cwd(&root, &sibling, &parent),
+            "兄弟目录不得判店内：{sibling:?}");
+        // 店根带尾分隔符的变体同样边界感知。
+        let root_trail = parent.join("store").join("");
+        assert!(!path_is_inside_with_cwd(&root_trail, &sibling, &parent));
+    }
+
+    #[test]
+    fn l1b_parent_relative_target_not_inside() {
+        let root = store("s3");
+        let cwd = root.clone();
+        // cwd=店根：../out.png 落上级（店外）→ 判外（原词法 "." 前缀误判内）。
+        assert!(!path_is_inside_with_cwd(&root, Path::new("../out.png"), &cwd));
+        // 深层 ../：仍外。
+        assert!(!path_is_inside_with_cwd(&root, Path::new("../other/x.png"), &cwd));
+        // ./out.png 落店内 → 判内（正确语义，非误拒）。
+        assert!(path_is_inside_with_cwd(&root, Path::new("./out.png"), &cwd));
+    }
+
+    #[test]
+    fn existing_and_missing_paths_both_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("s4");
+        let inside = root.join("deep").join("new.md");
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, b"x").unwrap();
+        let cwd = tmp.path().to_path_buf();
+        // 已存在目标：规范化兜底（大小写/链接由 canonicalize 承担）。
+        assert!(path_is_inside_with_cwd(&root, &inside, &cwd));
+        assert!(!path_is_inside_with_cwd(&root, &outside, &cwd));
+        // 尚不存在的目标：最近已存在祖先链兜底（词法折叠已先行覆盖常规形态）。
+        assert!(path_is_inside_with_cwd(&root, &root.join("deep").join("missing.md"), &cwd));
+        assert!(!path_is_inside_with_cwd(&root, &tmp.path().join("missing2.md"), &cwd));
+        // 大小写变体（Windows 不敏感；规范化兜底承担）。
+        #[cfg(windows)]
+        {
+            let upper = tmp.path().join("S4").join("deep").join("u.md");
+            assert!(path_is_inside_with_cwd(&root, &upper, &cwd), "大小写变体判内（Windows）");
+        }
+    }
+
+    #[test]
+    fn cwd_unavailable_conservatively_inside() {
+        // 生产入口拿不到 cwd（目录被删等）→ 保守判内（响亮拒绝优于旁挂写入）。
+        let root = store("s5");
+        assert!(path_is_inside(&root, Path::new("x.png")) == path_is_inside(&root, Path::new("x.png")));
+        // 生产入口自 env::current_dir 取 cwd——此处仅锁定"入口不 panic、返回布尔"。
+        let _ = path_is_inside(&root, Path::new("x.png"));
+    }
+
+    #[test]
+    fn absolute_targets_unchanged_semantics() {
+        // 既有语义回归：绝对路径判定不受 cwd 影响。
+        let root = store("s6");
+        let cwd = store("other");
+        assert!(path_is_inside_with_cwd(&root, &root.join("a.md"), &cwd));
+        assert!(!path_is_inside_with_cwd(&root, &cwd.join("b.md"), &cwd));
     }
 }

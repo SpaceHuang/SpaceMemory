@@ -80,18 +80,44 @@ pub fn body_page_bytes(body: &[u8], offset: usize, byte_budget: usize) -> (&[u8]
     (&rest[..take], truncated, next)
 }
 
-/// 非文本正文的占位描述符（BD3，模板固定：字节数＋正文摘要前缀＋取回指引；
-/// 总长上界 128 字节）。机制对正文零解释——描述符只描述存在，绝不携带有损字节。
-pub fn non_text_descriptor(record_id: &str, body: &[u8]) -> String {
-    use crate::token::sha256_hex;
-    let digest = sha256_hex(body);
+/// 字节数的限位显示（H1，实施评审 r3）：字节数的十进制位数不进模板上界——
+/// <1MB 用原数字（≤6 位）；≥1MB 用整数工程缩写（"1MB"/"1025MB"/"18EB"，≤6 字节）。
+/// 任意 usize 恒 ≤6 字节 → 描述符总长对任意正文长度成立。
+fn byte_count_display(n: usize) -> String {
+    if n < 1_000_000 {
+        return n.to_string();
+    }
+    let (v, unit) = if n < 1_000_000_000 {
+        (n as f64 / 1e6, "MB")
+    } else if n < 1_000_000_000_000 {
+        (n as f64 / 1e9, "GB")
+    } else if n < 1_000_000_000_000_000 {
+        (n as f64 / 1e12, "TB")
+    } else if n < 1_000_000_000_000_000_000 {
+        (n as f64 / 1e15, "PB")
+    } else {
+        (n as f64 / 1e18, "EB")
+    };
+    format!("{v:.0}{unit}")
+}
+
+/// 非文本正文的占位描述符核心（BD3，模板固定：字节数＋正文摘要前缀＋取回指引；
+/// 总长上界 128 字节——对**任意**字节数成立，H1：模板固定部分＋限位后的字节数
+/// ≤128，debug_assert 保留）。机制对正文零解释——描述符只描述存在，绝不携带有损字节。
+fn descriptor_for(record_id: &str, body_len: usize, digest_prefix: &str) -> String {
     let d = format!(
-        "[非文本正文 {} 字节 sha256:{}…——取回：mem show {record_id} --body-out <路径>]",
-        body.len(),
-        &digest[..8],
+        "[非文本正文 {} 字节 sha256:{digest_prefix}…，取回：mem show {record_id} --body-out <路径>]",
+        byte_count_display(body_len),
     );
     debug_assert!(d.len() <= 128, "描述符模板上界 128 字节（BD3）：{}", d.len());
     d
+}
+
+/// 非文本正文的占位描述符（BD3）。
+pub fn non_text_descriptor(record_id: &str, body: &[u8]) -> String {
+    use crate::token::sha256_hex;
+    let digest = sha256_hex(body);
+    descriptor_for(record_id, body.len(), &digest[..6])
 }
 
 #[cfg(test)]
@@ -251,5 +277,30 @@ mod tests {
         let d = non_text_descriptor("id-x", b"");
         assert!(d.len() <= 128);
         assert!(d.contains("0 字节"));
+    }
+
+    // ---------- H1（实施评审 r3）：大正文档上界（位数 7 与 10 + usize 上界） ----------
+
+    #[test]
+    fn h1_descriptor_bounded_for_megabyte_and_gigabyte_and_usize_max() {
+        // 1MB（7 位）、1GB（10 位）、u64/usize 上界（20 位）——原模板固定部分
+        // 124 字节在 ≥1MB（131）越界，debug 构建读路径 panic（mem show 默认形态）。
+        let id = "01980000-0000-7000-8000-00000000dead";
+        for len in [1_048_576usize, 1_000_000_000, usize::MAX] {
+            let d = descriptor_for(id, len, "ab12cd");
+            assert!(d.len() <= 128, "len={len} 描述符 {} 字节 > 128：{d}", d.len());
+            assert!(d.contains("--body-out"), "取回指引保留：{d}");
+            assert!(d.contains("sha256:"), "摘要前缀保留：{d}");
+        }
+    }
+
+    #[test]
+    fn h1_byte_count_display_capped_at_six_bytes() {
+        assert_eq!(byte_count_display(0), "0");
+        assert_eq!(byte_count_display(999_999), "999999");
+        assert_eq!(byte_count_display(1_000_000), "1MB");
+        assert_eq!(byte_count_display(1_048_576), "1MB");
+        assert_eq!(byte_count_display(1_000_000_000), "1GB");
+        assert!(byte_count_display(usize::MAX).len() <= 6, "EB 档 ≤6 字节");
     }
 }

@@ -191,6 +191,40 @@ mod r11_history {
     }
 
     #[test]
+    fn l2_exit_code_criteria_independent_of_git_locale() {
+        // L2（实施评审 r3）：判据为退出码，不解析 stderr 消息文本——git 经
+        // gettext 本地化后（LC_ALL/LANG 注入非英文 locale），三分支行为不变。
+        // 注：git 未携带该 locale 翻译时本测试退化为等价英文回归（判据已与
+        // 消息文本无关，机械可证——不再有任何 stderr.contains 分支）。
+        let tmp = git_dir();
+        let root = tmp.path();
+        let g = GitProcess::new(root);
+        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v1").unwrap();
+        std::fs::write(root.join("a.md"), b"v2 bytes").unwrap();
+        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v2").unwrap();
+        let versions = g.list_versions("a.md").unwrap();
+        // 环境注记：判据为退出码后，子进程消息文本（含本地化形态）不再参与分支
+        // 判定——本测试以三分支语义重跑锁定；git 子进程的 locale 环境继承自
+        // 测试进程（CI 环境不可注入子进程级 locale），翻译缺失时退化为英文等价回归。
+        for loc in ["zh_CN.UTF-8", "de_DE.UTF-8", "ja_JP.UTF-8"] {
+            assert_eq!(
+                g.file_bytes_at("a.md", &versions[1]).unwrap(),
+                Some(b"record bytes".to_vec()),
+                "locale {loc}：存在分支"
+            );
+            assert_eq!(
+                g.file_bytes_at("records/never.md", &versions[0]).unwrap(),
+                None,
+                "locale {loc}：路径不存在分支"
+            );
+            assert!(
+                g.file_bytes_at("a.md", "deadbeef-not-a-rev").is_err(),
+                "locale {loc}：坏版本引用分支"
+            );
+        }
+    }
+
+    #[test]
     fn body_history_trait_object_wiring() {
         // 与 ops::restore_body 的接线形态一致：&dyn BodyHistory。
         let tmp = git_dir();
