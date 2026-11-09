@@ -34,7 +34,7 @@ pub fn tool_definitions() -> serde_json::Value {
           "inputSchema": { "type": "object", "properties": {
               "type": { "type": "string" }, "view": { "type": "string" },
               "limit": { "type": "integer" }, "offset": { "type": "integer" } } } },
-        { "name": "mem_show", "description": "钻取单条（返回信封/载荷/正文/令牌；零写盘）。正文按 brief_bytes 截断，body_offset 续读（R4.2/红线9）。正文区合法 UTF-8 → body 文本分页（切点码点对齐）；不合法 → body=null、body_b64 base64 分页（页=brief_bytes 个原始字节）；body_utf8 恒有供机判（R11/BD2）",
+        { "name": "mem_show", "description": "钻取单条（返回信封/载荷/正文/令牌；零写盘）。正文按 brief_bytes 截断，body_offset 续读（R4.2/红线9）。正文区合法 UTF-8 → body 文本分页（切点码点对齐）；不合法 → body=null、body_b64 base64 分页（页=brief_bytes 个原始字节）；body_utf8 恒有供机判（R11/BD2）。body_b64 逐页独立编码（含各自 padding）——宿主必须逐页解码后按字节拼接，不得直接拼接各页 base64 文本",
           "inputSchema": { "type": "object", "required": ["id"], "properties": {
               "id": { "type": "string" },
               "body_offset": { "type": "integer", "description": "正文字节偏移续读（取自上页 resume.body_offset）" } } } },
