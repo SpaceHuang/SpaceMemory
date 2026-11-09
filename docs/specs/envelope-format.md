@@ -58,7 +58,7 @@ conventions  types  records  attic  sessions  agenda  index  events  tmp
 
 1. 第 1 行**恰为** `---`（U+002D ×3，行尾可有 `\r`，见 2.5 行尾）；
 2. 至下一个**恰为** `---` 的行（不含）为 **frontmatter：必须是合法 JSON**（UTF-8，`serde_json` 可解析的单一 JSON object）；
-3. 其余字节为 **Markdown 正文 = 载荷自由文本**（机制零解释）。
+3. 其余字节为**正文区 = 任意字节序列**（机制零解释；文本是常见形态、非唯一合法形态——图片等非文本载荷以字节原样承载，R11/BD6；空正文合法不变）。
 
 frontmatter 顶层**恰有两个键**（所有权字面可见，R2 审计）：
 
@@ -112,7 +112,7 @@ payload 仅由 `types/<type>/schema.json` 解释（R8.4）。机制对 payload �
 
 ### 2.5 字节细节（确定性）
 
-- 文件编码 UTF-8，无 BOM（有 BOM = 响亮错误）。
+- 文件头判定维持：无 BOM（有 BOM = 响亮错误）；**结构头区（frontmatter）必须为 UTF-8**。正文区为任意字节序列（R11/BD6：非文本正文合法——UTF-8 约束不外溢到正文区；读路径对正文零解释、按字节处理）。
 - 行尾：机制写出的文件用 `\n`；**机制再生成 frontmatter 时正文按字节保持**（红线27）——含人手写出的 `\r\n`，原样保留。
 - frontmatter 分隔符行：`---\n`；机制序列化 frontmatter 后以 `---\n` 结尾，随后紧跟原正文字节。
 - 机制写出的 frontmatter JSON：**确定性序列化**——顶层键序固定为 `envelope`、`payload`；envelope 内键按字母序（`aliases, commit, created, evidence_cutoff_seq, id, modified, principal, refs, type, version`）；对象键递归字母序；**数组（refs/aliases）保持写入顺序**；缩进 2 空格；无尾随空格；UTF-8 原文不转义（除 JSON 必需者）。
@@ -171,7 +171,7 @@ frontmatter 损坏的记录：`mem fix <id|路径>` 交互重建——git 历史
 | `ts` | RFC 3339 UTC |
 | `id` | 记录 ID（uuid v7） |
 | `path` | 记录相对路径（`records/…` 或 `attic/…`）——**ID↔路径映射**，支撑已删除/移动记录的定位（B1 前提） |
-| `op` | `create | update | link | delete | restore | external_delete | backfill | fix | merge` |
+| `op` | `create | update | link | delete | restore | external_delete | backfill | fix | merge | restore_body`（R11/BD6：损坏内容恢复——经确认的内容写操作，正文区替换为来源字节） |
 | `old_v`/`new_v` | 操作前/后版本；absent 侧为 `null` |
 | `old_digest`/`new_digest` | 操作前/后全文件 SHA-256；absent 侧为 `null` |
 | `by` | 写入者归属（principal ID + 宿主标签，如 `"0198…(zcode_main)"`；机制回填为 `"mem"`） |
