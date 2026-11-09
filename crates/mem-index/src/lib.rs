@@ -13,6 +13,8 @@
 
 pub mod checkpoint;
 pub mod fts;
+pub mod proved;
 pub mod sqlite;
 
+pub use proved::{open_proved, Proved, ProvedIndex};
 pub use sqlite::{Index, IndexRow, RefRow};

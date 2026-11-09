@@ -104,6 +104,8 @@ impl Index {
 
     /// r4 B2：**只读**打开已存在的索引——文件缺失/schema 不符 → Err（调用方直读）。
     /// 不建库、不建表、不切换 journal mode（读路径零写盘，红线18）。
+    /// r10：只读 schema 门禁扩展到 bad_records（评审 B1/§2.5）——旧代索引缺表即
+    /// 不通过（回退 direct，禁止"空告警的 indexed"）。
     pub fn open_readonly(path: &Path) -> MemResult<Index> {
         if !path.is_file() {
             return Err(MemError::MissingRecord { id_or_path: path.display().to_string() });
@@ -116,7 +118,7 @@ impl Index {
         // schema 存在性核对（只读查询；缺表/缺列 = 物化未完成/旧代索引 → Err 直读）。
         let ok: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('records','refs','meta')",
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('records','refs','meta','bad_records')",
                 [],
                 |r| r.get(0),
             )
@@ -128,10 +130,10 @@ impl Index {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        if ok < 3 || cols < 5 {
+        if ok < 4 || cols < 5 {
             return Err(MemError::Corrupt {
                 path: path.display().to_string(),
-                reason: "索引 schema 不完整或为旧代（物化未完成/异物文件）".into(),
+                reason: "索引 schema 不完整或为旧代（bad_records 缺表 = 告警通道缺席，物化未完成/异物文件）".into(),
             });
         }
         Ok(Index { conn })
@@ -169,6 +171,10 @@ impl Index {
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bad_records (
+                rel TEXT PRIMARY KEY,
+                error TEXT NOT NULL
             );
             "#,
         )
@@ -243,6 +249,10 @@ impl Index {
             .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
         let _ = self.conn.execute("DELETE FROM records", []);
         let _ = self.conn.execute("DELETE FROM refs", []);
+        // r10（决策⑦/B1）：坏记录与正常记录同一次物化扫描、同一事务落库——
+        // 全量替换式物化先清后插；error 列存告警行（"跳过坏条目 {rel}：{原因}"，
+        // 与 direct 扫描告警同模板前段，响应层追加修复入口）。
+        let _ = self.conn.execute("DELETE FROM bad_records", []);
         for s in &scan.records {
             // r11：折叠列统一在物化时计算（逐值/逐别名独立 fold 后 LF 连接——
             // LF 分隔符保证 LIKE 子串匹配不跨值/跨别名）。sync_fts 不再覆盖。
@@ -291,9 +301,35 @@ impl Index {
                 n_refs += 1;
             }
         }
+        for (rel, line) in &scan.bad {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO bad_records(rel, error) VALUES (?1, ?2)",
+                    rusqlite::params![rel, line],
+                )
+                .map_err(sq_err)?;
+        }
         self.conn
             .execute("COMMIT", [])
             .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+        // r10（B1）：stat 集覆盖该次扫描看到的**全部** records/ 文件（含不可解析/
+        // 不可读文件）——否则坏文件的后续外部变化逃过 stat 证明、indexed 告警陈旧。
+        // 与 scan_all 同源枚举（enumerate_md）；metadata 不可读的文件与
+        // stat_snapshot 语义一致（缺席）。
+        for rel in mem_core::event::enumerate_md(store, "records")? {
+            if entries.contains_key(&rel) {
+                continue;
+            }
+            if let Ok(md) = std::fs::metadata(store.abs(&rel)) {
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                entries.insert(rel, (mtime, md.len()));
+            }
+        }
         // 物化代际递增（r4 B2：检查点据此核对与索引同代）。
         let prev = self
             .conn
