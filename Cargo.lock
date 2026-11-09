@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "mem"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -642,14 +642,14 @@ dependencies = [
 
 [[package]]
 name = "mem-assets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "mem-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "mem-schema",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "mem-git"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mem-core",
  "tempfile",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "mem-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mem-core",
  "mem-schema",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "mem-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mem-core",
  "mem-git",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "mem-schema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jsonschema",
  "serde_json",
