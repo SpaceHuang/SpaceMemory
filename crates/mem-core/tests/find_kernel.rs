@@ -589,3 +589,18 @@ fn prefilter_narrowing_intersection_contract() {
     assert_eq!(second, vec!["alt".to_string(), "doc".to_string()], "多条件收窄 = 各兼容类型集交集");
     assert_eq!(seen[2].clone().unwrap(), vec!["doc".to_string()], "单条件收窄 = 其兼容类型集");
 }
+
+/// verify 审计（决策③配套）：形态不支持的 x-filter 声明 → filter_shape_unsupported；
+/// 支持形态不告警。
+#[test]
+fn filter_declaration_audit_reports_unsupported_shapes() {
+    let f = fresh_store();
+    let report = mem_core::find::filter_declaration_audit(&f.types);
+    // doc.obj（object）与 doc.form（纯 enum）不支持；status/score/flag/tags/mixed 支持。
+    let joined = report.join("\n");
+    assert!(joined.contains("doc 字段 obj"), "{report:?}");
+    assert!(joined.contains("doc 字段 form"), "{report:?}");
+    assert!(joined.contains("filter_shape_unsupported"));
+    assert!(!joined.contains("字段 status"), "支持形态不告警：{report:?}");
+    assert!(!joined.contains("字段 mixed"), "数组形态支持：{report:?}");
+}

@@ -343,6 +343,8 @@ pub fn verify_report(store: &Store, types: &TypeSet, deep: bool) -> MemResult<Ve
     // r5 B4：镜像一致性（payload x-ref 与 envelope.refs 双向核对 + payload 悬空）
     // ——merge 分裂曾显示全绿，verify 必须能检出。
     out.extend(crate::ops::mirror_consistency_audit(store, types)?);
+    // R10 决策③配套：x-filter 声明形态审计（filter_shape_unsupported）。
+    out.extend(crate::find::filter_declaration_audit(types));
     if deep {
         out.extend(crate::ops::deep_digest_audit(store)?);
     }

@@ -172,6 +172,27 @@ fn filter_value_matches(shape: &FilterShape, payload: &serde_json::Value, field:
     }
 }
 
+/// x-filter 声明审计（R10 决策③配套规则）：支持形态之外的属性声明了 x-filter →
+/// `filter_shape_unsupported` 告警（verify 透出；运行时对该字段过滤 → 兼容类型集
+/// 为空 → invalid_filter_value）。点名属性缺失在声明加载即响亮失败（与 x-ref
+/// 同族，mem-schema LoadError::UnknownFilterField），故此处只剩形态检查。
+pub fn filter_declaration_audit(types: &TypeSet) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in types.decls() {
+        for (field, shape) in d.filter_fields() {
+            if !shape.is_supported() {
+                out.push(format!(
+                    "filter_shape_unsupported：{} 字段 {} 的声明形态不在 v1 支持集 \
+                     （string/number/boolean/元素为标量的 array）——对该字段过滤将报 invalid_filter_value",
+                    d.type_name(),
+                    field
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// 候选类型集（§2.4）：type 参数/view 限定到的类型集，未限定时 = 全店已加载类型集。
 fn candidate_types(types: &TypeSet, type_narrow: Option<&str>, view_types: &[String]) -> Vec<String> {
     if !view_types.is_empty() {
