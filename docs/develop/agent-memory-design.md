@@ -316,6 +316,28 @@ principal（谁）+ view（看到什么）+ conventions 角色段（怎么行为
 **词汇表属基础设施**（mechanism 认识这五个关键字）；**类型本身仍是纯数据**——新增类型 = 新增 schema.json + conventions.md，零代码（红线13 不破：基础设施新增的是"认识关键字"这一信封级机制，与 R8.2 的"载荷结构零知识"不冲突，载荷字段的含义仍完全由声明提供）。
 **键字符集规则（M1 收尾）**：规范化 NFC；路径推导用 **casefold**（Windows 大小写不敏感，两键一径 → EEXIST → 同一记录）；slug 允许 Unicode 字母/数字/连字符，黑名单 = 路径敌对字符（`<>:"/\|?*`）、控制符、结尾点/空格；保留名禁用（`conventions`、`types`、`records`、`sessions`、`agenda`、`index`、`events` 等店级目录名）；长度上限 128 字节（细则随格式规范 v1 微调）。
 
+### D20 查询词项文法：Unicode 空白切分 + `-` 否定标记
+
+**决策**（R10 决策① 收编，2026-11-10 用户裁决提升）：检索 query 是单参数字符串，词项按 **Unicode White_Space**（Rust `char::is_whitespace`，含 U+3000 全角空格——中文输入法友好）切分；每个词项按折叠单源（NFC + Unicode 小写，`paths::fold`）折叠一次后参与匹配。**否定标记 = 半角 `-`（U+002D）前缀**：`-x` 为否定词项（匹配串 = 去前导 `-` 后的原串）；`--x` = 否定词项、匹配串 `-x`；恰为 `-` 的词项 = 字面肯定词项；全角连字符不是标记。**组合谓词**：命中 := ∀正词项命中 ∧ ∀负词项不命中——谓词本体仍是四域单源 `search::record_matches`（id 前缀 ∪ 逐别名 ∪ 逐 payload 值——键名不参与 ∪ 正文）；正文域要求合法 UTF-8，非合法则该域退出匹配（有损解码伪命中形态废止）。**空查询与纯否定查询显式拒收**（`query_invalid`，两前端同码）——绝不表现为空命中清单或全库清单。
+**登记边界**：以 `-` 开头的字面肯定词项不可直接表达（`-font` 无法作正词项查询；子串语义下查 `font` 仍可命中含 `-font` 的记录，代价是混入所有含 `font` 的记录）——消除随未来短语精确语法。
+**源出与评审**：`keyword-search-design.md` 决策①（六要素与排除方案：NOT 关键字、`!` 前缀）；实施评审四轮见 `docs/review/keyword-search-implementation-review.md`。
+
+### D21 载荷字段过滤：声明词汇 `x-filter` ＋ 规范条件"字段＋标量文本"
+
+**决策**（R10 决策③④ 收编，2026-11-10 用户裁决提升；词汇与等值语义一体，拆开则任一条不自足）：
+- **声明词汇**：payload 属性级 `x-filter: true`（与 x-ref 同位）声明该字段可作清单与检索的过滤条件；**取值形态由属性本体的 `type` 关键字承载，不从 enum 推导**。v1 支持形态 = `string` / `number` / `boolean` / 元素为标量的 `array` 四类；`type: "integer"` 显式排除（2026-11-10 用户裁决维持——需过滤的数值字段请声明 `number`）；支持形态之外的声明 → verify 告警 `filter_shape_unsupported`，运行时过滤 → `invalid_filter_value`（声明不失败，前向容忍）。词汇表版本 1→2（机制关键字 6→7）。
+- **规范条件 = 字段＋标量文本**：CLI `--filter 字段=值` 值原样为文本；MCP `filters` 值一律 JSON 字符串（非字符串 JSON 标量显式拒收）——两端合法条件空间逐字相同，同一条件必得同一命中集；"只要某一形态"的子集表达两端同由 `--type`/`type` 收窄承担。
+- **等值语义**（按记录自身类型的声明解释，精筛裁定）：string → 折叠等值（"Geometry" 与 "geometry" 互可检出）；number → 文本按 JSON 数值文法严格解析后**精确实数等值**（"1" ≍ "1.0"；整数×浮点不经 f64 折叠——实施评审 B1：|v| > 2^53 处相邻整数不误判等值）；boolean → 仅认字面 `true`/`false`；array → 任一元素按其实际 JSON 形态等值即命中。
+- **候选类型集与兼容类型集**：候选集 = type 参数/view 限定到的类型集（两者同给取交集；未限定 = 全店已加载）；候选集中无任何类型声明该字段 → `unknown_filter_field`（防手滑静默空结果）；声明了但文本不可解释（兼容集为空）→ `invalid_filter_value`；未声明/不兼容类型的记录静默不命中、不报错；多条件的 indexed 收窄 = 各兼容类型集交集。
+- **显式错误 4 枚**（可机判，两前端同码）：`query_invalid` / `unknown_filter_field` / `duplicate_filter_field` / `invalid_filter_value`。
+**源出与评审**：`keyword-search-design.md` 决策③④；规范载体 `type-declaration.md` v1.1（x-filter 行 + 配套规则 + 修订表）。
+
+### D22 检索执行器单源下沉 mem-core ＋ 索引"构造即证明"
+
+**决策**（R10 决策② 收编，2026-11-10 用户裁决提升）：检索与过滤清单的执行——词法解析、过滤声明校验、组合谓词、精筛、命中序分页、坏记录告警组装——**单源住在 mem-core（find 模块）**，CLI 与 MCP 两前端同源调用（r7–r11 五轮评审"两套匹配实现必然漂移"教训的制度化收口）。索引注入采用**构造即证明**：`mem-index::open_proved(store, hello)` 是已证明句柄（ProvedIndex）的**唯一构造路径**，门禁 = stat 咨询 ∧ 只读打开（不建库不建表，红线18）∧ 只读 schema 门禁（含 bad_records）∧ epoch 同代核对；`FindPrefilter` trait 只承载已证明句柄的两个查询（candidates 多词项合取超集粗筛 / bad_records 告警清单），**证明逻辑不出现在 trait、不进入执行器、不留在前端**。indexed 执行中任一索引调用失败 → 回退 direct 全量应答（reason 携带真实错误），禁止空命中或空告警的 indexed（红线8）。
+**检查点纪律（r5 B3 立法重申并扩展）**：检查点 stat 集**恰好等于物化那一次扫描看到的文件集合**（scan.records ∪ scan.bad，含坏/不可读文件）——绝不重新枚举磁盘（实施评审 B2：重枚举会让扫描后新落盘的文件被"提前确认"，消掉"新文件不在 entries → 实时枚举失配 → 直读"的信号 → indexed 漏命中/漏告警）；护栏以注入式维护器（rebuild_with_entries_with_hook）固化该窗口。
+**源出与评审**：`keyword-search-design.md` 决策②；红线 8/9/18/21 守恒对账见该文档 §2.8。
+
 ---
 
 ## 3. 组件轮廓
@@ -493,7 +515,7 @@ principal（谁）+ view（看到什么）+ conventions 角色段（怎么行为
 26. 会话级状态的形状：台账是否受管类型。
 27. sessions/ 的 git 策略收尾——与问题28耦合。
 28. 多机同步约定：版本/令牌跨机、aliases 跨机、**事件日志跨机归并**（序号分叉）、sessions/ 同步。
-29. CLI 命名与 MCP 工具面定稿；性能基线（枚举、直读、FTS 降级开关）；**回填/漂移 O(候选×事件) 复杂度**（v1.2 评审 M5/M11：每候选在序列锁内重读全量 events.jsonl——万级记录 + 十万级事件时 reconcile 塌陷；对齐为"一次快照 + 锁内复核增量"可消）。
+29. CLI 命名与 MCP 工具面定稿；性能基线（枚举、直读）；**回填/漂移 O(候选×事件) 复杂度**（v1.2 评审 M5/M11：每候选在序列锁内重读全量 events.jsonl——万级记录 + 十万级事件时 reconcile 塌陷；对齐为"一次快照 + 锁内复核增量"可消）。**检索切片已交付并收编（2026-11-10，实施评审四轮通过）**：MCP 工具面 mem_find 定稿（14→15；query 必填且须含肯定词项，纯过滤由 mem_list 承载）、mem_list 增 filters、查询词项文法（D20）、载荷字段过滤声明词汇与等值语义（D21）、执行器单源下沉与索引"构造即证明"（D22）、坏记录告警经 find/list 透出——记录：`keyword-search-design.md` v0.3；实施评审：`docs/review/keyword-search-implementation-review.md`。**剩余**：merge/bind/agenda/apply/fix/init 的工具映射或豁免盘点；性能基线（回填/漂移复杂度、大库检索成本实测）；FTS 引擎升级（tantivy/sqlite-vec）维持暂不引入，由本问题性能基线触发（R10 粗筛 = 折叠列 LIKE 合取，升级坡道不变）。
 30. principal 注册与托管流程。
 31. view 类型表达力边界。
 32. merge 细节：别名唯一性、tombstone 形态、证据链重挂。
