@@ -151,3 +151,46 @@ mem list --type num --filter score=9007199254740992.0
 **本轮请求批准**：B2 修复完成并通过护栏回归（新增文件不进检查点 entries）之前，不批准 R10 实施合入。
 
 **本轮明确不批**：以 213 项测试全绿替代时序窗口验证；以"窗口概率低/自愈快"为由接受存在坏检查点路径；`enumerate_md` 重枚举作为 stat 补采来源的任何变体。
+
+---
+
+# 第四轮复验（2026-11-10）——B2 修复复验
+
+- 评审对象：`a8bc5be..b7d6f80`（R10-B2 修复 + 第三轮非阻断 L1–L6 处置）
+- 评审方式：修复读码、护栏回归与生产复验测试核验、`cargo check --workspace --all-targets`、`cargo test --workspace`、`git diff --check`
+
+## 复验结论
+
+**B2 关闭，未发现新阻断；第三轮非阻断项全部处置；R10 实施通过本轮评审。**
+
+## 关闭证据
+
+1. **修复本体**：stat 补采的 rel 来源改为 `scan.bad`（`ops::scan_all` 同一次扫描的坏文件清单），采集点与 `bad_records` 落表同循环、同在事务内 COMMIT 前完成——entries 集合恒等于 `scan.records ∪ scan.bad`（扫描时刻枚举全集）；`enumerate_md` 重枚举彻底删除，注释载明"绝不在此处重新枚举磁盘"（r5 B3 / 红线21）。metadata 失败 → 缺席，与 `stat_snapshot` 语义一致。
+2. **窗口可测化**：新增 `rebuild_with_entries_with_hook` 可注入变体（钩子 = 扫描后、事务与 stat 采集前——恰为 B2 的 T0–T2 窗口），生产路径 `rebuild_with_entries` 恒 None、零行为差异。
+3. **护栏回归**（`post_scan_new_file_never_enters_checkpoint_entries`）：钩子注入扫描后落盘的新坏文件，三重断言——entries 不含该文件；`records`/`bad_records` 两表均无其行；实时 stat 与 entries 失配（直读信号在）；另断言钩子确已执行（护栏有效性自证）。
+4. **生产路径复验**（`r10_b2_new_file_first_read_never_lost_cli_and_mcp`）：sidecar 在场、收敛至 indexed 后外部落盘新合法记录——CLI 与 MCP 的第一次读取均命中（stat 失配 → direct 直读真相层）；维护收敛回 indexed 后仍命中，且显式断言 `read_mode=indexed`（非 direct 空转）。
+5. **正路保持**：`bad_records_same_tx_and_stat_covers_all_files`（坏文件先于物化写入 → entries 必须覆盖）全绿——修复未破坏 B1 的告警承接动机。
+
+## 非阻断项处置登记
+
+| # | 处置 |
+|---|---|
+| L1 | 已修：`protocol.rs` 格式恢复两行（人工核验；本机仍无 `cargo-fmt` 组件，未机器复跑） |
+| L2 | 已修：`fts.rs` 与 `Index::search` 整体删除（`lib.rs` 模块声明同步移除）；其中段/后段子串语义回归迁移至 `candidates_mid_substring_semantics`（粗筛契约由 candidates 承担） |
+| L3 | 已修：`candidate_types` 在 `--type` 与 `--view` 同给时取交集，声明检查作用域与精筛（view ∧ type）一致；新增 `filter_candidate_types_view_and_type_intersect`（正向不误报 + 交集空显式报错 + 无过滤时双限定生效） |
+| L4 | 未动，**留用户裁决**（是否扩展 `integer` 支持形态——规范已定稿且实施一致，属词汇面决策非缺陷） |
+| L5 | 已修：AGENTS.md 登记更新为"已实施……实施评审 B1/B2 修复关闭"（本节结论使该措辞成立） |
+| L6 | 已修：R11 提案与评审文档 6 份从本分支移除（不再随 R10 合入） |
+
+## 验证记录
+
+- `cargo test --workspace`：**216 项全部通过，0 失败**（213 项存量 + 净增 3：新增 4 个测试函数——B2 窗口护栏、B2 生产复验、L3 交集、candidates 子串语义迁移版；删除 1 个——`Index::search` 随 L2 移除）。
+- `cargo check --workspace --all-targets`：通过，**零警告**。
+- `git diff --check main...HEAD`：通过。
+- 首轮 B1（数值精度）与第三轮 B2（stat 集来源）修复均在位，回归面齐全。
+
+## 待批准清单
+
+**本轮结论**：R10 实施通过评审，可进入合入与发布准备。
+
+**仍开放（不构成本轮阻断，需用户裁决）**：L4（`type: "integer"` 是否纳入 x-filter 支持形态）；主设计文档衔接（设计 §9 第 2 条：开放问题29 收口、查询文法/x-filter/执行器单源是否立新 D#）随发布准备收口。
