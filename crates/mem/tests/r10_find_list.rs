@@ -222,3 +222,60 @@ fn cli_find_paging_and_type_narrow_kept() {
     assert_eq!(v["truncated"], json!(true));
     assert!(v["note"].as_str().unwrap_or("").contains("--offset"), "截断必须给续读指引：{v}");
 }
+
+/// 数值过滤精确等值（实施评审 B1 回归）：>2^53 的整数×浮点不互认；同一实数的
+/// 整数/浮点表示互认；direct 与 indexed 生产路径命中一致。
+#[test]
+fn cli_number_filter_exact_beyond_f64_safe_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    let s = setup(&dir);
+    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+        r#"{"title":"big-int","status":"x","score":9007199254740993}"#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+        r#"{"title":"big-float","status":"x","score":9007199254740992.0}"#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"].as_array().unwrap()
+            .iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+    };
+    let list = |s: &str, text: &str| {
+        let out = mem().args(["--store", s, "list", "--type", "doc",
+            "--filter", &format!("score={text}")]).output().unwrap();
+        j(&out)
+    };
+
+    // direct：过滤 2^53.0（浮点）只命中浮点记录——不得误命中整数 2^53+1。
+    let vf = list(&s, "9007199254740992.0");
+    assert_eq!(ids(&vf).len(), 1, "direct 过滤 2^53.0：{vf}");
+    let vi = list(&s, "9007199254740993");
+    assert_eq!(ids(&vi).len(), 1, "direct 过滤 2^53+1：{vi}");
+    assert_ne!(ids(&vf)[0], ids(&vi)[0], "两个不同数值不得互认");
+    // 同一实数不同表示：整数文本 9007199254740992 ≍ 浮点 2^53.0 记录。
+    let same = list(&s, "9007199254740992");
+    assert_eq!(ids(&same), ids(&vf), "同一实数互认（决策④的精确承担）");
+
+    // indexed（sidecar 物化后）：与 direct 命中一致。
+    let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
+        .args(["serve", "--store", &s, "--idle-secs", "9"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().unwrap();
+    assert!(wait_for(&dir), "sidecar 物化");
+    let vi2 = list(&s, "9007199254740993");
+    let vf2 = list(&s, "9007199254740992.0");
+    assert_eq!(ids(&vf2), ids(&vf), "indexed 与 direct 一致（B1 修复后）");
+    assert_eq!(ids(&vi2), ids(&vi), "indexed 与 direct 一致（B1 修复后）");
+    serve.kill().ok();
+}
+
+fn wait_for(dir: &std::path::Path) -> bool {
+    for _ in 0..50 {
+        if dir.join("index/index.sqlite").is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}

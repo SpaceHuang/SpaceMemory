@@ -590,6 +590,38 @@ fn prefilter_narrowing_intersection_contract() {
     assert_eq!(seen[2].clone().unwrap(), vec!["doc".to_string()], "单条件收窄 = 其兼容类型集");
 }
 
+/// 大数精度回归（实施评审 B1）：>2^53 的整数×浮点混合比较必须精确实数等值——
+/// 绝不经 f64 化（|v| > 2^53 处相邻整数折叠为同一浮点，不同数值被误判相等）。
+/// 标量与数组元素两面 + 正反两方向；同一实数的整数/浮点表示仍互认（决策④）。
+#[test]
+fn filter_number_precision_beyond_f64_safe_range() {
+    let f = fresh_store();
+    let big1 = seed(&f.store, "doc", "big1", "2026-11-06T00:00:00Z",
+        json!({"title":"big","score":9007199254740993u64}), b"", &[]);          // 整数 2^53+1
+    let big2 = seed(&f.store, "doc", "big2", "2026-11-06T00:00:00Z",
+        json!({"title":"big","score":9007199254740992.0}), b"", &[]);           // 浮点 2^53
+    let big3 = seed(&f.store, "doc", "big3", "2026-11-06T00:00:00Z",
+        json!({"title":"big","mixed":[9007199254740993u64]}), b"", &[]);        // 数组元素·整数
+    let big4 = seed(&f.store, "doc", "big4", "2026-11-06T00:00:00Z",
+        json!({"title":"big","mixed":[9007199254740992.0]}), b"", &[]);         // 数组元素·浮点
+
+    // B1 复现方向：过滤浮点字面 2^53.0 不得命中整数 2^53+1（评审复现为误命中）。
+    assert_eq!(ids(&run(&f, None, &conds(&[("score", "9007199254740992.0")]), None, 50, 0)), vec![big2.clone()]);
+    // 反方向：过滤整数 2^53+1 不得命中浮点 2^53 记录。
+    assert_eq!(ids(&run(&f, None, &conds(&[("score", "9007199254740993")]), None, 50, 0)), vec![big1.clone()]);
+    // 同一实数、不同 JSON 表示：整数文本 9007199254740992 ≍ 浮点 2^53.0（数值等值）。
+    assert_eq!(ids(&run(&f, None, &conds(&[("score", "9007199254740992")]), None, 50, 0)), vec![big2.clone()]);
+    // 数组元素两面同规则。
+    assert_eq!(ids(&run(&f, None, &conds(&[("mixed", "9007199254740992.0")]), None, 50, 0)), vec![big4.clone()]);
+    assert_eq!(ids(&run(&f, None, &conds(&[("mixed", "9007199254740993")]), None, 50, 0)), vec![big3.clone()]);
+    assert_eq!(ids(&run(&f, None, &conds(&[("mixed", "9007199254740992")]), None, 50, 0)), vec![big4.clone()]);
+    // 安全区间内行为不回退："1" ≍ "1.0"（既有决策④用例）。
+    seed_library(&f.store);
+    let d001 = "01f1d000-0000-7000-8000-0000000000d001";
+    let d002 = "01f1d000-0000-7000-8000-0000000000d002";
+    assert_eq!(ids(&run(&f, None, &conds(&[("score", "1")]), None, 50, 0)), vec![d001, d002]);
+}
+
 /// verify 审计（决策③配套）：形态不支持的 x-filter 声明 → filter_shape_unsupported；
 /// 支持形态不告警。
 #[test]

@@ -264,3 +264,36 @@ fn mcp_and_cli_find_hit_sets_equal() {
         assert_eq!(mcp_ids, cli_ids, "CLI 与 MCP 命中集合逐项相等（验收 9）：query={query:?} filters={filters}");
     }
 }
+
+/// 数值过滤精确等值（实施评审 B1 回归，MCP 生产路径）：>2^53 的整数×浮点不互认。
+#[test]
+fn mcp_number_filter_exact_beyond_f64_safe_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    let s = setup(&dir);
+    for payload in [
+        r#"{"title":"big","status":"x","score":9007199254740993}"#,
+        r#"{"title":"big","status":"x","score":9007199254740992.0}"#,
+    ] {
+        let out = mem().args(["--store", &s, "add", "doc", "--payload", payload]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let resps = mcp_session(&s, &[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        call(2, "mem_list", json!({"filters": {"score": "9007199254740992.0"}})),
+        call(3, "mem_list", json!({"filters": {"score": "9007199254740993"}})),
+        call(4, "mem_find", json!({"query": "big", "filters": {"score": "9007199254740992.0"}})),
+    ]);
+    let v_float = tool_result(&resps[1]);
+    let v_int = tool_result(&resps[2]);
+    let v_find = tool_result(&resps[3]);
+    let float_hit = v_float["items"].as_array().unwrap().len();
+    let int_hit = v_int["items"].as_array().unwrap().len();
+    assert_eq!(float_hit, 1, "MCP list 过滤 2^53.0 恰 1 条（不得误命中整数 2^53+1）：{}", resps[1]);
+    assert_eq!(int_hit, 1, "MCP list 过滤 2^53+1 恰 1 条：{}", resps[2]);
+    let f1 = v_float["items"][0]["id"].as_str().unwrap().to_string();
+    let f2 = v_int["items"][0]["id"].as_str().unwrap().to_string();
+    assert_ne!(f1, f2, "两个不同数值不得互认");
+    let find_hits = v_find["hits"].as_array().unwrap();
+    assert_eq!(find_hits.len(), 1, "mem_find 过滤同规则：{}", resps[3]);
+}

@@ -122,8 +122,14 @@ fn parse_number_text(text: &str) -> Option<serde_json::Number> {
     serde_json::from_str::<serde_json::Number>(text).ok()
 }
 
-/// 数值等值：整数按整数比较，其余按 f64（serde_json 的 PosInt/Float 变体不互通，
-/// "1" 与 "1.0" 必须同值——决策④）。
+/// 数值等值（精确实数比较，实施评审 B1 修复）：
+/// - 整数×整数：按整数精确比较；
+/// - 整数×浮点：浮点必须为整值（无分数部分）且经 `i128` 精确展开后与整数相等
+///   ——**绝不经 f64 化比较**（|v| > 2^53 处相邻整数折叠为同一浮点，
+///   9007199254740992.0 曾误命中 9007199254740993）；
+/// - 浮点×浮点：直接比较（两侧本就是 f64 的精确值，比较即实数相等）；
+/// - 同一实数的整数/浮点表示互认（决策④："1" 与 "1.0" 同值——由整数×浮点的
+///   整值精确展开路径承担，不依赖有损转换）。
 fn number_eq(a: &serde_json::Number, b: &serde_json::Number) -> bool {
     if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
         return x == y;
@@ -131,10 +137,23 @@ fn number_eq(a: &serde_json::Number, b: &serde_json::Number) -> bool {
     if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
         return x == y;
     }
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
+    // 剩余组合至少一侧是 Float 变体（整数变体的 as_f64 恒 Some，需按变体区分）。
+    let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) else { return false };
+    let a_int = a.as_i64().map(i128::from).or_else(|| a.as_u64().map(i128::from));
+    let b_int = b.as_i64().map(i128::from).or_else(|| b.as_u64().map(i128::from));
+    match (a_int, b_int) {
+        (Some(i), None) => float_eq_int(y, i),
+        (None, Some(i)) => float_eq_int(x, i),
+        (None, None) => x == y, // 浮点×浮点
+        (Some(_), Some(_)) => unreachable!("整数×整数已在上方返回"),
     }
+}
+
+/// 整值浮点与整数的精确比较：分数部分非零（含 NaN/∞ 的 fract）必不等；
+/// 整值浮点经 `f as i128` 精确展开（截断对整值即恒等；|f| ≥ 2^127 饱和到
+/// i128::MAX/MIN——不可能与 u64/i64 域的整数相等，饱和自安全）。
+fn float_eq_int(f: f64, int: i128) -> bool {
+    f.is_finite() && f.fract() == 0.0 && f as i128 == int
 }
 
 /// 数组元素等值：按元素实际 JSON 形态裁定（§2.4 等值语义）。
