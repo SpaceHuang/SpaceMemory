@@ -76,6 +76,24 @@ SpaceMemory/
 
 Windows 与 macOS。平台差异集中在 `crates/mem-core/src/platform/`：字节范围锁（LockFileEx / fcntl F_SETLK）、原子改名、OS 变更日志订阅（NTFS USN journal / macOS FSEvents —— 证明式新鲜性的覆盖来源，D5）。
 
+## 致谢与第三方项目
+
+项目使用了以下直接 Rust 依赖，感谢其维护者及贡献者：
+
+| 项目 | 用途 |
+|---|---|
+| [Serde](https://github.com/serde-rs/serde) 与 [serde_json](https://github.com/serde-rs/json) | 序列化与 JSON 处理 |
+| [sha2](https://github.com/RustCrypto/hashes) | SHA-256 摘要 |
+| [uuid](https://github.com/uuid-rs/uuid) | UUID 标识 |
+| [thiserror](https://github.com/dtolnay/thiserror) | 错误类型派生 |
+| [unicode-normalization](https://github.com/unicode-rs/unicode-normalization) | Unicode NFC 归一化 |
+| [windows-sys](https://github.com/microsoft/windows-rs) 与 [libc](https://github.com/rust-lang/libc) | Windows 与 Unix/macOS 平台 API 绑定 |
+| [rusqlite](https://github.com/rusqlite/rusqlite)（bundled SQLite） | 派生索引存储；SQLite 由其 bundled 配置提供 |
+| [jsonschema](https://github.com/Stranger6667/jsonschema) | JSON Schema 声明校验 |
+| [clap](https://github.com/clap-rs/clap) | CLI 参数解析 |
+
+测试依赖包括 [tempfile](https://github.com/Stebalien/tempfile) 与 [assert_cmd](https://github.com/assert-rs/assert_cmd)（以及 Windows 平台测试所用的 `windows-sys`），具体版本和使用位置见各 crate 的 `Cargo.toml`。MCP 前端目前采用仓库内的最小 stdio/JSON-RPC 实现，遵循 [MCP 规范](https://modelcontextprotocol.io/specification/)；没有把 rmcp 或官方 MCP memory server 的实现代码作为依赖。以上致谢用于说明项目直接采用的组件和规范，不替代各组件随包提供的许可证与版权声明。
+
 ## 开发
 
 ```sh
