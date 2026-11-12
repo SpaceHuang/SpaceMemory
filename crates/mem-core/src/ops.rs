@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{new_uuid_v7, Envelope, Ref};
+use crate::envelope::{Envelope, Ref, new_uuid_v7};
 use crate::error::{MemError, MemResult};
 use crate::event::{EventLog, Kind, Op};
 use crate::lock;
@@ -109,25 +109,36 @@ pub fn get(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
         // 的内容 + 版本 B 的令牌"拼在一起，调用方按 A 构造更新却携 B 令牌会绕过
         // CAS 语义覆盖 B。
         let abs = store.abs(id_or_path);
-        let bytes = std::fs::read(&abs).map_err(|_e| {
-            MemError::MissingRecord { id_or_path: id_or_path.into() }
+        let bytes = std::fs::read(&abs).map_err(|_e| MemError::MissingRecord {
+            id_or_path: id_or_path.into(),
         })?;
-        let record = Record::from_bytes(&bytes).map_err(|e| {
-            MemError::Corrupt { path: id_or_path.into(), reason: e.to_string() }
+        let record = Record::from_bytes(&bytes).map_err(|e| MemError::Corrupt {
+            path: id_or_path.into(),
+            reason: e.to_string(),
         })?;
         let t = token::for_bytes(record.envelope.version, &bytes);
-        return Ok(Scanned { rel: id_or_path.into(), record, token: t });
+        return Ok(Scanned {
+            rel: id_or_path.into(),
+            record,
+            token: t,
+        });
     }
     let scan = scan_all(store)?;
-    if let Some(hit) = scan.records.iter().find(|r| r.record.envelope.id == id_or_path) {
-        return Ok(hit.clone());
-    }
-    // 别名解析层（D11：别名只作用于查找解析层）。
     if let Some(hit) = scan
         .records
         .iter()
-        .find(|r| r.record.envelope.aliases.iter().any(|a| paths::fold(a) == paths::fold(id_or_path)))
+        .find(|r| r.record.envelope.id == id_or_path)
     {
+        return Ok(hit.clone());
+    }
+    // 别名解析层（D11：别名只作用于查找解析层）。
+    if let Some(hit) = scan.records.iter().find(|r| {
+        r.record
+            .envelope
+            .aliases
+            .iter()
+            .any(|a| paths::fold(a) == paths::fold(id_or_path))
+    }) {
         return Ok(hit.clone());
     }
     // attic（受管 tombstone 可读）。
@@ -144,7 +155,9 @@ pub fn get(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
             }
         }
     }
-    Err(MemError::MissingRecord { id_or_path: id_or_path.into() })
+    Err(MemError::MissingRecord {
+        id_or_path: id_or_path.into(),
+    })
 }
 
 #[cfg(test)]
@@ -157,8 +170,15 @@ mod r15_path_tests {
         let root = tmp.path().join("store");
         crate::store::Store::create(&root).unwrap();
         let store = crate::store::Store::open(&root, crate::store::OpenMode::Auto).unwrap();
-        for p in ["records/../../outside.md", "attic/a/../outside.md", "records//../x.md"] {
-            assert!(validate_store_record_path(&store, p).is_err(), "must reject {p}");
+        for p in [
+            "records/../../outside.md",
+            "attic/a/../outside.md",
+            "records//../x.md",
+        ] {
+            assert!(
+                validate_store_record_path(&store, p).is_err(),
+                "must reject {p}"
+            );
         }
         assert!(validate_store_record_path(&store, "records/task/a.md").is_ok());
         assert!(validate_store_record_path(&store, "attic/task/a.md").is_ok());
@@ -189,14 +209,12 @@ pub struct Added {
 fn key_components(decl: &TypeDecl, payload: &serde_json::Value) -> MemResult<Vec<String>> {
     let mut out = Vec::new();
     for field in decl.unique_key() {
-        let v = payload.get(field).ok_or_else(|| {
-            MemError::SchemaReject {
-                type_name: decl.type_name().to_string(),
-                violations: vec![mem_schema::Violation {
-                    path: format!("/{field}"),
-                    message: "唯一键字段缺失（路径推导依据，D19）".into(),
-                }],
-            }
+        let v = payload.get(field).ok_or_else(|| MemError::SchemaReject {
+            type_name: decl.type_name().to_string(),
+            violations: vec![mem_schema::Violation {
+                path: format!("/{field}"),
+                message: "唯一键字段缺失（路径推导依据，D19）".into(),
+            }],
         })?;
         if v.is_null() {
             return Err(MemError::SchemaReject {
@@ -235,7 +253,10 @@ fn mirror_refs(decl: &TypeDecl, payload: &serde_json::Value, keep: &[Ref]) -> Ve
     for (field, _spec) in decl.ref_specs() {
         if let Some(serde_json::Value::String(t)) = payload.get(field) {
             if !t.is_empty() {
-                refs.push(Ref { rel: field.clone(), target: t.clone() });
+                refs.push(Ref {
+                    rel: field.clone(),
+                    target: t.clone(),
+                });
             }
         }
     }
@@ -279,14 +300,20 @@ fn validate_payload_and_refs(
     if let Some(obj) = payload.as_object() {
         for k in obj.keys() {
             if !known.contains(k) {
-                warnings.push(format!("未知字段（类型声明未定义）：{}/{}", decl.type_name(), k));
+                warnings.push(format!(
+                    "未知字段（类型声明未定义）：{}/{}",
+                    decl.type_name(),
+                    k
+                ));
             }
         }
     }
     // x-ref 存在性（R8.5）：目标必须现存于 records/。
     let scan = scan_all(store)?;
     let exists = |t: &str, id: &str| {
-        scan.records.iter().any(|r| r.record.envelope.r#type == t && r.record.envelope.id == id)
+        scan.records
+            .iter()
+            .any(|r| r.record.envelope.r#type == t && r.record.envelope.id == id)
     };
     for v in decl.check_ref_existence(payload, exists) {
         return Err(MemError::RefTargetMissing {
@@ -314,13 +341,16 @@ fn validate_payload_and_refs(
 pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     ctx.store.check_writable()?;
     crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
-    // 引用/principal 存在性必须与发布处于同一共享屏障内；否则独占删除可在
-    // 校验后、发布前移走目标，留下悬空引用。
-    let _barrier = lock::barrier_shared(ctx.store)?;
     let decl = ctx
         .types
         .get(&args.type_name)
         .ok_or_else(|| MemError::UnknownType(args.type_name.clone()))?;
+    // 引用存在性与发布必须在同一屏障内；新增 x-dag 节点也与全图修改串行。
+    let _barrier = if decl.dag() {
+        lock::barrier_exclusive(ctx.store)?
+    } else {
+        lock::barrier_shared(ctx.store)?
+    };
     let warnings = validate_payload_and_refs(ctx.store, decl, &args.payload, &args.principal)?;
     let comps = key_components(decl, &args.payload)?;
     let id = new_uuid_v7();
@@ -344,6 +374,9 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         commit: None,
         extra: Default::default(),
     };
+    if decl.dag() {
+        dag_candidate_precheck(ctx, &envelope.id, &envelope.r#type, &envelope.refs)?;
+    }
     let bytes = record::serialize_new(&envelope, &args.payload, &args.body);
 
     let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
@@ -388,7 +421,13 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     )?;
     commit_same_batch(ctx, &[rel.clone()], 1)?;
     register_trail(ctx, &id);
-    Ok(Added { rel, record: Record::from_bytes(&bytes).expect("自产字节必可解析"), token: token::for_bytes(1, &bytes), created: true, warnings })
+    Ok(Added {
+        rel,
+        record: Record::from_bytes(&bytes).expect("自产字节必可解析"),
+        token: token::for_bytes(1, &bytes),
+        created: true,
+        warnings,
+    })
 }
 
 // ---------- update ----------
@@ -410,7 +449,21 @@ pub fn update(
     body: Option<Vec<u8>>,
 ) -> MemResult<Updated> {
     ctx.store.check_writable()?;
-    let _barrier = lock::barrier_shared(ctx.store)?;
+    let cur = get(ctx.store, id_or_path)?;
+    if cur.rel.starts_with("attic/") {
+        return Err(MemError::BadArgument(
+            "attic 中的删除记录不能直接更新；请先 restore".into(),
+        ));
+    }
+    let decl = ctx
+        .types
+        .get(&cur.record.envelope.r#type)
+        .ok_or_else(|| MemError::UnknownType(cur.record.envelope.r#type.clone()))?;
+    let _barrier = if decl.dag() {
+        lock::barrier_exclusive(ctx.store)?
+    } else {
+        lock::barrier_shared(ctx.store)?
+    };
     update_locked(ctx, id_or_path, expect, payload, body)
 }
 
@@ -434,12 +487,15 @@ pub fn update_locked(
 
     let _rec = lock::record_lock(ctx.store, &cur.rel, std::time::Duration::from_secs(30))?;
     // 锁内重读 + CAS（版本与全摘要，红线19）。
-    let fresh_bytes = std::fs::read(ctx.store.abs(&cur.rel))
-        .map_err(|e| MemError::io(cur.rel.clone(), e))?;
+    let fresh_bytes =
+        std::fs::read(ctx.store.abs(&cur.rel)).map_err(|e| MemError::io(cur.rel.clone(), e))?;
     let fresh = Record::from_bytes(&fresh_bytes)?;
     let current = token::for_bytes(fresh.envelope.version, &fresh_bytes);
     if let Err(_e) = token::cas_check(expect, &current) {
-        return Err(MemError::Conflict { expected: expect.clone(), current });
+        return Err(MemError::Conflict {
+            expected: expect.clone(),
+            current,
+        });
     }
     // 唯一键不可变（D19/D11：改动 = 移动，v1 拒收）。
     let changed: Vec<String> = decl
@@ -457,6 +513,9 @@ pub fn update_locked(
     env.version += 1;
     env.modified = crate::clock::now_rfc3339();
     env.refs = mirror_refs(decl, &payload, &fresh.envelope.refs);
+    if decl.dag() {
+        dag_candidate_precheck(ctx, &env.id, &env.r#type, &env.refs)?;
+    }
     sync_key_aliases(decl, &payload, &mut env.aliases);
     let bytes = record::serialize_new(&env, &payload, &new_body);
     crate::platform::atomic_write(&ctx.store.abs(&cur.rel), &bytes)
@@ -496,16 +555,28 @@ pub fn link(
 ) -> MemResult<(Token, Token)> {
     ctx.store.check_writable()?;
     crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
+    let initial_a = get(ctx.store, a_id)?;
+    let initial_b = get(ctx.store, b_id)?;
+    ensure_link_endpoint_is_live(&initial_a, "源")?;
+    ensure_link_endpoint_is_live(&initial_b, "目标")?;
+    let is_dag_edge = ctx
+        .types
+        .get(&initial_a.record.envelope.r#type)
+        .is_some_and(|d| d.dag() && d.derived_rel() == rel);
+    let _barrier = if is_dag_edge {
+        lock::barrier_exclusive(ctx.store)?
+    } else {
+        lock::barrier_shared(ctx.store)?
+    };
+    // 在屏障内重解析，删除/恢复不能在验证与发布之间改变端点所在位置。
     let a = get(ctx.store, a_id)?;
     let b = get(ctx.store, b_id)?;
+    ensure_link_endpoint_is_live(&a, "源")?;
+    ensure_link_endpoint_is_live(&b, "目标")?;
     if a.record.envelope.id == b.record.envelope.id {
         return Err(MemError::BadArgument("自引用不允许（环的特例）".into()));
     }
-    // DAG 预检（在锁外做图判定，锁内 CAS 后复核环——两锁串行更新使预检充分：
-    // 环只可能由并发 link 构成，其各自也做同序预检；最终一致由 verify 审计兜底）。
-    dag_precheck(ctx, &a.record, &b.record, rel)?;
     // 锁序：按 rel 字典序取两把记录锁（避免死锁）。
-    let _barrier = lock::barrier_shared(ctx.store)?;
     let mut rels = vec![a.rel.clone(), b.rel.clone()];
     rels.sort();
     let _l1 = lock::record_lock(ctx.store, &rels[0], std::time::Duration::from_secs(30))?;
@@ -523,11 +594,29 @@ pub fn link(
         expected: expect_b.clone(),
         current: tok_b.clone(),
     })?;
-    // 锁内 DAG 复核（两锁都在手上，状态不再变化）。
-    dag_precheck(ctx, &fresh_a.0, &fresh_b.0, rel)?;
     // 边只落在**源记录** a 上（引用方向 = a --rel--> b；双向落边会凭空成环）。
     // 目标 b 仅做存在性 + 令牌 CAS 校验（调用方认知一致），不写不改版本。
-    let (env_a, bytes_a) = apply_ref(ctx, &a.rel, &fresh_a.0, &fresh_a.1, rel, &b.record.envelope.id)?;
+    if is_dag_edge {
+        let mut candidate_refs = fresh_a.0.envelope.refs.clone();
+        candidate_refs.push(Ref {
+            rel: rel.to_string(),
+            target: fresh_b.0.envelope.id.clone(),
+        });
+        dag_candidate_precheck(
+            ctx,
+            &fresh_a.0.envelope.id,
+            &fresh_a.0.envelope.r#type,
+            &candidate_refs,
+        )?;
+    }
+    let (env_a, bytes_a) = apply_ref(
+        ctx,
+        &a.rel,
+        &fresh_a.0,
+        &fresh_a.1,
+        rel,
+        &b.record.envelope.id,
+    )?;
     let log = EventLog::new(ctx.store);
     let nt_a = token::for_bytes(env_a.version, &bytes_a);
     log.append_simple(
@@ -561,51 +650,150 @@ fn apply_ref(
     let mut env = rec.envelope.clone();
     env.version += 1;
     env.modified = crate::clock::now_rfc3339();
-    env.refs.push(Ref { rel: edge_rel.to_string(), target: target.to_string() });
+    env.refs.push(Ref {
+        rel: edge_rel.to_string(),
+        target: target.to_string(),
+    });
     let out = record::serialize_new(&env, &rec.payload, &rec.body);
-    crate::platform::atomic_write(&ctx.store.abs(rel), &out)
-        .map_err(|e| MemError::io(rel, e))?;
+    crate::platform::atomic_write(&ctx.store.abs(rel), &out).map_err(|e| MemError::io(rel, e))?;
     Ok((env, out))
 }
 
-fn dag_precheck(ctx: &WriteContext, a: &Record, b: &Record, rel: &str) -> MemResult<()> {
-    let decl = match ctx.types.get(&a.envelope.r#type) {
-        Some(d) if d.dag() && d.derived_rel() == rel => d,
-        _ => return Ok(()), // 非 x-dag 类型 / 非派生 rel：一般环由 agenda 报告
+fn ensure_link_endpoint_is_live(record: &Scanned, side: &str) -> MemResult<()> {
+    if !record.rel.starts_with("records/") {
+        return Err(MemError::BadArgument(format!(
+            "link 的{side}记录已删除并位于 attic，不能新增引用；如需继续请先 restore"
+        )));
+    }
+    Ok(())
+}
+
+/// 用候选记录替换其派生边后检查整张 x-dag 图。调用方必须持有独占门闩，
+/// 这样 update、link 与维护计划的图变更不会并发拼出环。
+fn dag_candidate_precheck(
+    ctx: &WriteContext,
+    candidate_id: &str,
+    type_name: &str,
+    candidate_refs: &[Ref],
+) -> MemResult<()> {
+    let Some(decl) = ctx.types.get(type_name).filter(|d| d.dag()) else {
+        return Ok(());
     };
-    // 加边 a→b（a 派生自 b）构成环 ⟺ b 可达 a（沿同 rel 边）。
+    let rel = decl.derived_rel();
     let scan = scan_all(ctx.store)?;
-    let mut adj: std::collections::HashMap<&str, Vec<&str>> = Default::default();
-    for r in &scan.records {
-        if r.record.envelope.r#type == a.envelope.r#type {
-            for e in &r.record.envelope.refs {
-                if e.rel == decl.derived_rel() {
-                    adj.entry(&r.record.envelope.id).or_default().push(&e.target);
-                }
+    dag_graph_precheck(
+        type_name,
+        rel,
+        scan.records
+            .iter()
+            .filter(|r| {
+                r.record.envelope.r#type == type_name && r.record.envelope.id != candidate_id
+            })
+            .map(|r| {
+                (
+                    r.record.envelope.id.as_str(),
+                    r.record.envelope.refs.as_slice(),
+                )
+            })
+            .chain(std::iter::once((candidate_id, candidate_refs))),
+    )
+}
+
+fn dag_graph_precheck<'a>(
+    type_name: &str,
+    rel: &str,
+    records: impl Iterator<Item = (&'a str, &'a [Ref])>,
+) -> MemResult<()> {
+    let mut adj: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (id, refs) in records {
+        for e in refs {
+            if e.rel == rel {
+                adj.entry(id.to_string())
+                    .or_default()
+                    .push(e.target.clone());
             }
         }
     }
-    // BFS from b to a（不含新边）。
-    let mut queue = std::collections::VecDeque::new();
-    let mut seen = std::collections::HashSet::new();
-    queue.push_back(b.envelope.id.as_str());
-    seen.insert(b.envelope.id.as_str());
-    while let Some(n) = queue.pop_front() {
-        if n == a.envelope.id {
-            return Err(MemError::CycleDetected(format!(
-                "{a_id} → {b_id} 使 {} 类型派生图成环（rel={rel}）",
-                a.envelope.r#type,
-                a_id = a.envelope.id,
-                b_id = b.envelope.id
-            )));
+    fn visit<'a>(
+        node: &'a str,
+        adj: &'a std::collections::HashMap<String, Vec<String>>,
+        active: &mut std::collections::HashSet<&'a str>,
+        done: &mut std::collections::HashSet<&'a str>,
+    ) -> bool {
+        if active.contains(node) {
+            return true;
         }
-        if let Some(nexts) = adj.get(n) {
-            for nx in nexts {
-                if seen.insert(nx) {
-                    queue.push_back(nx);
+        if done.contains(node) {
+            return false;
+        }
+        active.insert(node);
+        if let Some(next) = adj.get(node) {
+            for target in next {
+                if visit(target, adj, active, done) {
+                    return true;
                 }
             }
         }
+        active.remove(node);
+        done.insert(node);
+        false
+    }
+    let mut active = std::collections::HashSet::new();
+    let mut done = std::collections::HashSet::new();
+    for node in adj.keys() {
+        if visit(node, &adj, &mut active, &mut done) {
+            return Err(MemError::CycleDetected(format!(
+                "{type_name} 类型派生图成环（rel={rel}），涉及 {node}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn dag_merge_precheck(
+    ctx: &WriteContext,
+    scan: &ScanResult,
+    dup_id: &str,
+    canonical_id: &str,
+) -> MemResult<()> {
+    for decl in ctx.types.decls().filter(|d| d.dag()) {
+        let type_name = decl.type_name();
+        let rel = decl.derived_rel();
+        let transformed: Vec<(String, Vec<Ref>)> = scan
+            .records
+            .iter()
+            .filter(|r| r.record.envelope.r#type == type_name && r.record.envelope.id != dup_id)
+            .map(|r| {
+                let refs = r
+                    .record
+                    .envelope
+                    .refs
+                    .iter()
+                    .filter_map(|e| {
+                        if r.record.envelope.id == canonical_id
+                            && e.rel == rel
+                            && e.target == dup_id
+                        {
+                            None
+                        } else {
+                            let mut edge = e.clone();
+                            if edge.target == dup_id {
+                                edge.target = canonical_id.to_string();
+                            }
+                            Some(edge)
+                        }
+                    })
+                    .collect();
+                (r.record.envelope.id.clone(), refs)
+            })
+            .collect();
+        dag_graph_precheck(
+            type_name,
+            rel,
+            transformed
+                .iter()
+                .map(|(id, refs)| (id.as_str(), refs.as_slice())),
+        )?;
     }
     Ok(())
 }
@@ -654,7 +842,10 @@ pub fn delete_locked(
                 "删除被引用阻止：{} 条引用指向 {}（{:?}）——先处理依赖或使用 force（受管 tombstone 可恢复）",
                 dependents.len(),
                 cur.record.envelope.id,
-                dependents.iter().map(|(id, rel)| format!("{id}:{rel}")).collect::<Vec<_>>()
+                dependents
+                    .iter()
+                    .map(|(id, rel)| format!("{id}:{rel}"))
+                    .collect::<Vec<_>>()
             )));
         }
         warnings.push(format!(
@@ -688,7 +879,11 @@ pub fn delete_locked(
     // H2：rename 双侧入批——旧 records 路径的删除进本次提交（否则 HEAD 永留已删文件）。
     commit_same_batch(ctx, &[cur.rel.clone(), attic_rel.clone()], 0)?;
     register_trail(ctx, &fresh.envelope.id);
-    Ok(Deleted { rel: attic_rel, token: current, warnings })
+    Ok(Deleted {
+        rel: attic_rel,
+        token: current,
+        warnings,
+    })
 }
 
 #[derive(Debug)]
@@ -704,7 +899,16 @@ pub fn restore_record(
     expect: Option<&Token>,
 ) -> MemResult<Restored> {
     ctx.store.check_writable()?;
-    let _barrier = lock::barrier_shared(ctx.store)?;
+    let tomb = get(ctx.store, id_or_path)?;
+    let is_dag = ctx
+        .types
+        .get(&tomb.record.envelope.r#type)
+        .is_some_and(|d| d.dag());
+    let _barrier = if is_dag {
+        lock::barrier_exclusive(ctx.store)?
+    } else {
+        lock::barrier_shared(ctx.store)?
+    };
     restore_locked(ctx, id_or_path, expect)
 }
 
@@ -734,6 +938,14 @@ pub fn restore_locked(
         let current = token::for_bytes(fresh.envelope.version, &bytes);
         token::cas_check(expect, &current)?;
     }
+    if let Some(decl) = ctx.types.get(&fresh.envelope.r#type).filter(|d| d.dag()) {
+        dag_candidate_precheck(
+            ctx,
+            &fresh.envelope.id,
+            decl.type_name(),
+            &fresh.envelope.refs,
+        )?;
+    }
     let target_abs = ctx.store.abs(&records_rel);
     std::fs::create_dir_all(target_abs.parent().unwrap())
         .map_err(|e| MemError::io(target_abs.display().to_string(), e))?;
@@ -753,7 +965,10 @@ pub fn restore_locked(
     // H2：rename 双侧入批——attic 侧旧路径的消失进本次提交。
     commit_same_batch(ctx, &[tomb.rel.clone(), records_rel.clone()], 0)?;
     register_trail(ctx, &fresh.envelope.id);
-    Ok(Restored { rel: records_rel, token: token::for_bytes(fresh.envelope.version, &bytes) })
+    Ok(Restored {
+        rel: records_rel,
+        token: token::for_bytes(fresh.envelope.version, &bytes),
+    })
 }
 
 /// 反向索引：谁引用了我（信封 refs；R9.2）。
@@ -796,7 +1011,8 @@ pub fn commit_batch(
         Err(e) => {
             // commit-pending：不分配序号、不回滚真相层（D17）。
             let dir = store.abs(".pending-commits");
-            std::fs::create_dir_all(&dir).map_err(|er| MemError::io(dir.display().to_string(), er))?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|er| MemError::io(dir.display().to_string(), er))?;
             let name = format!(
                 "{}.json",
                 std::time::SystemTime::now()
@@ -809,8 +1025,11 @@ pub fn commit_batch(
                 "ts": crate::clock::now_rfc3339(),
                 "error": e.to_string(),
             });
-            std::fs::write(dir.join(&name), serde_json::to_vec_pretty(&payload).unwrap())
-                .map_err(|er| MemError::io(dir.join(name).display().to_string(), er))?;
+            std::fs::write(
+                dir.join(&name),
+                serde_json::to_vec_pretty(&payload).unwrap(),
+            )
+            .map_err(|er| MemError::io(dir.join(name).display().to_string(), er))?;
             Ok(())
         }
     }
@@ -848,9 +1067,11 @@ pub fn list_pending_commits(store: &Store) -> MemResult<Vec<(String, PendingComm
             continue;
         }
         let bytes = std::fs::read(&p).map_err(|e| MemError::io(p.display().to_string(), e))?;
-        let pc: PendingCommit = serde_json::from_slice(&bytes).map_err(|er| {
-            MemError::PlanCorrupt { path: p.display().to_string(), reason: er.to_string() }
-        })?;
+        let pc: PendingCommit =
+            serde_json::from_slice(&bytes).map_err(|er| MemError::PlanCorrupt {
+                path: p.display().to_string(),
+                reason: er.to_string(),
+            })?;
         out.push((p.display().to_string(), pc));
     }
     Ok(out)
@@ -909,6 +1130,12 @@ pub fn merge_locked(
     let mut touched: Vec<String> = Vec::new();
     let log = EventLog::new(ctx.store);
     let scan = scan_all(ctx.store)?;
+    dag_merge_precheck(
+        ctx,
+        &scan,
+        &dup.record.envelope.id,
+        &canonical.record.envelope.id,
+    )?;
 
     // 1) 引用重挂：第三方记录中指向 dup 的信封引用 → canonical（逐记录重读——
     //    独占门闩内无并发写）。r4 B4：canonical 与 dup **不走本循环**——
@@ -936,8 +1163,7 @@ pub fn merge_locked(
             .iter()
             .any(|e| e.target == dup.record.envelope.id)
             || (!ref_fields.is_empty()
-                && r
-                    .record
+                && r.record
                     .payload
                     .as_object()
                     .map(|o| {
@@ -965,9 +1191,7 @@ pub fn merge_locked(
         let mut payload = fresh.payload.clone();
         if let Some(o) = payload.as_object_mut() {
             for (k, v) in o.iter_mut() {
-                if ref_fields.contains(k)
-                    && v.as_str() == Some(dup.record.envelope.id.as_str())
-                {
+                if ref_fields.contains(k) && v.as_str() == Some(dup.record.envelope.id.as_str()) {
                     *v = serde_json::Value::String(canonical.record.envelope.id.clone());
                 }
             }
@@ -995,9 +1219,7 @@ pub fn merge_locked(
     //    fresh_can 来自锁内重读且循环不再触碰 canonical → 版本链连续（old_v
     //    = fresh_can 版本，new_v = +1）。
     let mut env_can = fresh_can.envelope.clone();
-    env_can
-        .refs
-        .retain(|e| e.target != dup.record.envelope.id);
+    env_can.refs.retain(|e| e.target != dup.record.envelope.id);
     let mut aliases = env_can.aliases.clone();
     for a in &fresh_dup.envelope.aliases {
         if !aliases.contains(a) {
@@ -1014,8 +1236,7 @@ pub fn merge_locked(
         let ref_fields: Vec<String> = decl.ref_specs().keys().cloned().collect();
         if let Some(o) = can_payload.as_object_mut() {
             for (k, v) in o.iter_mut() {
-                if ref_fields.contains(k) && v.as_str() == Some(dup.record.envelope.id.as_str())
-                {
+                if ref_fields.contains(k) && v.as_str() == Some(dup.record.envelope.id.as_str()) {
                     *v = serde_json::Value::Null;
                 }
             }
@@ -1077,7 +1298,6 @@ pub struct Merged {
     pub canonical_token: Token,
 }
 
-
 // ---------- fix（R6.3 修复通道） ----------
 
 #[derive(Debug)]
@@ -1113,7 +1333,8 @@ pub fn fix_record(
     let rel = match get(store, id_or_path) {
         Ok(hit) => hit.rel,
         Err(MemError::MissingRecord { .. } | MemError::Corrupt { .. })
-            if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") => {
+            if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") =>
+        {
             paths::validate_store_record_path(store, id_or_path)?;
             id_or_path.to_string()
         }
@@ -1125,7 +1346,9 @@ pub fn fix_record(
                 .rev()
                 .find(|e| e.id == id_or_path)
                 .map(|e| e.path.clone())
-                .ok_or_else(|| MemError::MissingRecord { id_or_path: id_or_path.into() })?
+                .ok_or_else(|| MemError::MissingRecord {
+                    id_or_path: id_or_path.into(),
+                })?
         }
     };
     paths::validate_store_record_path(store, &rel)?;
@@ -1157,9 +1380,8 @@ pub fn fix_record(
                     .ok_or_else(|| MemError::BadArgument(format!(
                         "fix 失败（{rel}）：frontmatter 损坏（{broken}）且无历史版本可用——请通过 --envelope/--payload 提供重建原料（R6.3 双通道）"
                     )))?;
-                let prev_rec = Record::from_bytes(&prev).map_err(|e| {
-                    MemError::BadArgument(format!("历史版本也损坏（{rel}）：{e}"))
-                })?;
+                let prev_rec = Record::from_bytes(&prev)
+                    .map_err(|e| MemError::BadArgument(format!("历史版本也损坏（{rel}）：{e}")))?;
                 (prev_rec.envelope, prev_rec.payload, false)
             } else {
                 return Err(MemError::BadArgument(format!(
@@ -1172,7 +1394,10 @@ pub fn fix_record(
     if let Some(decl) = types.get(&env.r#type) {
         let violations = decl.validate_payload(&payload);
         if let mem_schema::Policy::Reject = decl.policy(&violations) {
-            return Err(MemError::SchemaReject { type_name: env.r#type.clone(), violations });
+            return Err(MemError::SchemaReject {
+                type_name: env.r#type.clone(),
+                violations,
+            });
         }
     }
     let body = if parseable {
@@ -1199,7 +1424,11 @@ pub fn fix_record(
     // B1：修复版本与事件同批入史（统一写路径提交纪律，D17）——失败转
     // commit-pending，不回滚真相层。
     commit_batch(store, committer, &[rel.clone()])?;
-    Ok(Fixed { rel, record: Record::from_bytes(&out).expect("自产字节必可解析"), token: new_token })
+    Ok(Fixed {
+        rel,
+        record: Record::from_bytes(&out).expect("自产字节必可解析"),
+        token: new_token,
+    })
 }
 
 /// 从损坏文件字节中提取正文：**首个**闭合 `---` 行之后（D18"至下一个 `---`"；
@@ -1210,10 +1439,11 @@ fn split_body_bytes(bytes: &[u8]) -> Vec<u8> {
 
 /// 文件字节的当前令牌（version 取自信封；损坏时以 1 占位——CAS 只对可解析路径生效）。
 fn token_of_bytes(bytes: &[u8]) -> Token {
-    let version = Record::from_bytes(bytes).map(|r| r.envelope.version).unwrap_or(1);
+    let version = Record::from_bytes(bytes)
+        .map(|r| r.envelope.version)
+        .unwrap_or(1);
     token::for_bytes(version.max(1), bytes)
 }
-
 
 // ---------- restore-body（R11 恢复通道，BD4） ----------
 
@@ -1277,7 +1507,8 @@ pub fn restore_body(
     let _barrier = lock::barrier_shared(ctx.store)?;
     let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
     // 锁内重读 + CAS（红线19：经确认的内容写仍是读改写）。
-    let fresh_bytes = std::fs::read(ctx.store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;
+    let fresh_bytes =
+        std::fs::read(ctx.store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;
     // frontmatter 必须可解析（§3.6：两者皆坏 → 先 fix；响亮拒绝不静默）。
     let fresh = Record::from_bytes(&fresh_bytes)?;
     let current = token::for_bytes(fresh.envelope.version, &fresh_bytes);
@@ -1349,14 +1580,11 @@ fn resolve_restore_source(
             let h = history.ok_or_else(|| {
                 MemError::BadArgument("git: 源需要历史通道（BodyHistory）".into())
             })?;
-            let bytes = h.file_bytes_at(rel, rev)?.ok_or_else(|| {
-                MemError::BadArgument(format!("历史版本 {rev} 无该文件：{rel}"))
-            })?;
+            let bytes = h
+                .file_bytes_at(rel, rev)?
+                .ok_or_else(|| MemError::BadArgument(format!("历史版本 {rev} 无该文件：{rel}")))?;
             let body = record::find_body_after_first_delimiter(&bytes)?;
-            Ok((
-                body,
-                serde_json::json!({ "form": "git", "rev": rev }),
-            ))
+            Ok((body, serde_json::json!({ "form": "git", "rev": rev })))
         }
         RestoreSource::File { path } => {
             if crate::paths::path_is_inside(ctx.store.root(), path) {
@@ -1365,8 +1593,9 @@ fn resolve_restore_source(
                     path.display()
                 )));
             }
-            let bytes = std::fs::read(path)
-                .map_err(|e| MemError::BadArgument(format!("file: 源不可读（{}）：{e}", path.display())))?;
+            let bytes = std::fs::read(path).map_err(|e| {
+                MemError::BadArgument(format!("file: 源不可读（{}）：{e}", path.display()))
+            })?;
             let body = record::find_body_after_first_delimiter(&bytes)?;
             Ok((
                 body,
@@ -1397,9 +1626,7 @@ fn resolve_restore_source(
                 return Err(history_window_rejection(ctx, h, id, rel));
             }
             let anchor = last.new_digest.clone().ok_or_else(|| {
-                MemError::BadArgument(format!(
-                    "history 锚定失败（{rel}）：最后事件无登记摘要"
-                ))
+                MemError::BadArgument(format!("history 锚定失败（{rel}）：最后事件无登记摘要"))
             })?;
             // 自新至旧扫历史取全文摘要相符的版本（典型库首数个版本即命中）。
             for sha in h.list_versions(rel)? {
@@ -1437,16 +1664,13 @@ fn history_window_rejection(
     rel: &str,
 ) -> MemError {
     let log = EventLog::new(ctx.store);
-    let last_mech = log
-        .read_log()
-        .ok()
-        .and_then(|l| {
-            l.events
-                .iter()
-                .rev()
-                .find(|e| e.id == id && e.kind == Kind::Op && e.new_digest.is_some())
-                .cloned()
-        });
+    let last_mech = log.read_log().ok().and_then(|l| {
+        l.events
+            .iter()
+            .rev()
+            .find(|e| e.id == id && e.kind == Kind::Op && e.new_digest.is_some())
+            .cloned()
+    });
     let Some(mech) = last_mech else {
         return MemError::BadArgument(format!(
             "history 自动锚定拒绝（{rel}）：窗口外（漂移已收敛或最后事件为回填）——机械上无法推出损坏前版本，不得把盘上字节冒充治愈；无机制写入事件可指引——改用显式来源 git:<版本> 或 file:<店外路径>"
@@ -1476,7 +1700,6 @@ fn history_window_rejection(
     ))
 }
 
-
 /// --deep 维护审计（H3）：**磁盘摘要 vs 事件日志最后 new_digest**。
 ///
 /// 此前实现是"scan 时算一次、再读同文件算一次"的自比自——任何漂移都检不出。
@@ -1489,7 +1712,11 @@ pub fn deep_digest_audit(store: &Store) -> MemResult<Vec<String>> {
     for r in &scan.records {
         let bytes = std::fs::read(store.abs(&r.rel)).unwrap_or_default();
         let disk = token::sha256_hex(&bytes);
-        let last = log.events.iter().rev().find(|e| e.id == r.record.envelope.id);
+        let last = log
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.id == r.record.envelope.id);
         match last {
             None => out.push(format!(
                 "无事件记录（--deep）：{}（创建事件缺失——backfill 待执行）",
@@ -1509,7 +1736,6 @@ pub fn deep_digest_audit(store: &Store) -> MemResult<Vec<String>> {
     Ok(out)
 }
 
-
 /// 镜像一致性检查（r5 B4 验收：verify 不得对 payload/envelope 分裂显示全绿）。
 ///
 /// 镜像纪律（写路径维持）：payload 的 x-ref 字段（非 null）必须镜像进
@@ -1523,10 +1749,15 @@ pub fn mirror_consistency_audit(
 ) -> MemResult<Vec<String>> {
     let scan = scan_all(store)?;
     let mut out = Vec::new();
-    let ids: std::collections::HashSet<_> =
-        scan.records.iter().map(|r| r.record.envelope.id.clone()).collect();
+    let ids: std::collections::HashSet<_> = scan
+        .records
+        .iter()
+        .map(|r| r.record.envelope.id.clone())
+        .collect();
     for r in &scan.records {
-        let Some(decl) = types.get(&r.record.envelope.r#type) else { continue };
+        let Some(decl) = types.get(&r.record.envelope.r#type) else {
+            continue;
+        };
         let refs = decl.ref_specs();
         let obj = match r.record.payload.as_object() {
             Some(o) => o,
@@ -1534,12 +1765,7 @@ pub fn mirror_consistency_audit(
         };
         for (field, spec) in refs {
             let pv = obj.get(field);
-            let mirror = r
-                .record
-                .envelope
-                .refs
-                .iter()
-                .find(|e| e.rel == *field);
+            let mirror = r.record.envelope.refs.iter().find(|e| e.rel == *field);
             match pv {
                 Some(serde_json::Value::String(id)) => {
                     // payload 声明引用 → 镜像必须存在且同 target。

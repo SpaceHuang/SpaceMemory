@@ -31,28 +31,47 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
         "type": "object", "x-grade": "strict", "x-unique-key": ["slug"], "x-dag": true,
         "properties": {
           "slug": { "type": "string", "minLength": 1 },
-          "title": { "type": "string" }
+          "title": { "type": "string" },
+          "derived_from": { "type": ["string", "null"], "x-ref": { "target_type": "lesson", "existence": true } }
         },
         "required": ["slug", "title"]
       }"#,
     )
     .unwrap();
+    let course = types_dir.join("course");
+    std::fs::create_dir_all(&course).unwrap();
+    std::fs::write(
+        course.join("schema.json"),
+        r#"{
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object","x-grade":"strict","x-unique-key":["slug"],"x-dag":true,"x-derived-rel":"based_on",
+        "properties":{"slug":{"type":"string"},"title":{"type":"string"},"based_on":{"type":["string","null"],"x-ref":{"target_type":"course","existence":true}}},
+        "required":["slug","title"]
+      }"#,
+    ).unwrap();
     let store = Store::open(&root, OpenMode::Auto).unwrap();
-    seed_project(&store, "0198f7a9-0000-7cd2-9e3f-000000000001", "0198f7a9-0000-7cd2-9e3f-000000000001");
+    seed_project(
+        &store,
+        "0198f7a9-0000-7cd2-9e3f-000000000001",
+        "0198f7a9-0000-7cd2-9e3f-000000000001",
+    );
     let types = TypeSet::load_dir(&types_dir).unwrap();
     (tmp, store, types)
 }
 
 /// 直接读仓库资产（测试夹具；机制路径仍走数据目录副本）。
 fn mem_assets_bytes() -> Vec<(String, Vec<u8>)> {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/builtin-types");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/builtin-types");
     fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
             let name = e.file_name().to_string_lossy().to_string();
             let p = e.path();
-            let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            let r = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
             if p.is_dir() {
                 walk(&p, &r, out);
             } else {
@@ -81,7 +100,6 @@ impl CommitSink for RecordingSink {
         Ok(Some("deadbeef".into()))
     }
 }
-
 
 /// 手写一条固定 id 的 project 记录（x-ref 存在性的目标；绕过机制写路径=外部写入者）。
 fn seed_project(store: &Store, id: &str, slug: &str) {
@@ -126,18 +144,26 @@ fn task_payload(project: &str, slug: &str, status: &str) -> serde_json::Value {
 fn add_creates_v1_at_derived_path_with_create_event() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
-    let out = ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "login-api", "todo"),
-        body: "# 实现登录接口\n".as_bytes().to_vec(),
-        principal: None,
-    })
+    let out = ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "login-api", "todo"),
+            body: "# 实现登录接口\n".as_bytes().to_vec(),
+            principal: None,
+        },
+    )
     .unwrap();
     assert!(out.created);
     assert_eq!(out.record.envelope.version, 1);
     assert_eq!(out.token.version, 1);
     assert_eq!(out.token.digest.len(), 64);
-    assert!(out.rel.starts_with("records/task/0198f7a9-0000-7cd2-9e3f-000000000001/login-api.md"), "{}", out.rel);
+    assert!(
+        out.rel
+            .starts_with("records/task/0198f7a9-0000-7cd2-9e3f-000000000001/login-api.md"),
+        "{}",
+        out.rel
+    );
     // 文件在磁盘上，内容往返一致。
     let bytes = std::fs::read(store.abs(&out.rel)).unwrap();
     assert_eq!(token::sha256_hex(&bytes), out.token.digest);
@@ -165,7 +191,11 @@ fn add_loser_gets_existing_record_and_token() {
     assert!(!w2.created, "输者协议：返回既有记录及令牌（D11）");
     assert_eq!(w1.record.envelope.id, w2.record.envelope.id);
     assert_eq!(w1.token, w2.token);
-    assert_eq!(EventLog::new(&store).read_log().unwrap().events.len(), 1, "只产生一次 create");
+    assert_eq!(
+        EventLog::new(&store).read_log().unwrap().events.len(),
+        1,
+        "只产生一次 create"
+    );
 }
 
 #[test]
@@ -187,19 +217,23 @@ fn concurrent_double_add_single_winner() {
                 committer: None,
                 session_id: None,
             };
-            ops::add(&c, AddArgs {
-                type_name: "task".into(),
-                payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "race", "todo"),
-                body: b"x".to_vec(),
-                principal: None,
-            })
+            ops::add(
+                &c,
+                AddArgs {
+                    type_name: "task".into(),
+                    payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "race", "todo"),
+                    body: b"x".to_vec(),
+                    principal: None,
+                },
+            )
             .unwrap()
         }));
     }
     let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let created = outs.iter().filter(|o| o.created).count();
     assert_eq!(created, 1, "R3.3：并发创建唯一性由基础设施强制");
-    let ids: std::collections::HashSet<_> = outs.iter().map(|o| o.record.envelope.id.clone()).collect();
+    let ids: std::collections::HashSet<_> =
+        outs.iter().map(|o| o.record.envelope.id.clone()).collect();
     assert_eq!(ids.len(), 1, "输者拿到的都是同一条既有记录");
     assert_eq!(EventLog::new(&store).read_log().unwrap().events.len(), 1);
 }
@@ -208,17 +242,26 @@ fn concurrent_double_add_single_winner() {
 fn add_strict_rejects_bad_payload_with_field_paths() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
-    let err = ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: serde_json::json!({"slug": "x", "status": "不存在的状态", "title": "t"}),
-        body: b"".to_vec(),
-        principal: None,
-    })
+    let err = ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: serde_json::json!({"slug": "x", "status": "不存在的状态", "title": "t"}),
+            body: b"".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap_err();
     match err {
-        MemError::SchemaReject { type_name, violations } => {
+        MemError::SchemaReject {
+            type_name,
+            violations,
+        } => {
             assert_eq!(type_name, "task");
-            assert!(violations.iter().any(|v| v.path.contains("status")), "{violations:?}");
+            assert!(
+                violations.iter().any(|v| v.path.contains("status")),
+                "{violations:?}"
+            );
         }
         e => panic!("{e}"),
     }
@@ -228,15 +271,21 @@ fn add_strict_rejects_bad_payload_with_field_paths() {
 fn add_lenient_tolerates_unknown_fields_with_warning() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
-    let out = ops::add(&c, AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": "记忆", "surprise_field": 42}),
-        body: "内容".as_bytes().to_vec(),
-        principal: None,
-    })
+    let out = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": "记忆", "surprise_field": 42}),
+            body: "内容".as_bytes().to_vec(),
+            principal: None,
+        },
+    )
     .unwrap();
     assert!(out.created);
-    assert!(!out.warnings.is_empty(), "lenient 未知字段必须降级告警（R8.6）");
+    assert!(
+        !out.warnings.is_empty(),
+        "lenient 未知字段必须降级告警（R8.6）"
+    );
 }
 
 #[test]
@@ -244,38 +293,53 @@ fn add_enforces_ref_existence_and_principal_existence() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
     // x-ref 目标不存在 → 拒收（R8.5）。
-    let err = ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000099", "t1", "todo"),
-        body: b"".to_vec(),
-        principal: None,
-    })
+    let err = ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000099", "t1", "todo"),
+            body: b"".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap_err();
     assert!(matches!(err, MemError::RefTargetMissing { .. }), "{err}");
     // principal 存在性强制（红线12）：先建 principal。
-    let p = ops::add(&c, AddArgs {
-        type_name: "principal".into(),
-        payload: serde_json::json!({"slug": "codex_main", "label": "codex_main"}),
-        body: b"".to_vec(),
-        principal: None,
-    })
+    let p = ops::add(
+        &c,
+        AddArgs {
+            type_name: "principal".into(),
+            payload: serde_json::json!({"slug": "codex_main", "label": "codex_main"}),
+            body: b"".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap();
     // 引用 principal 记录本身做归属。
-    let task = ops::add(&c, AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": "m"}),
-        body: b"".to_vec(),
-        principal: Some(p.record.envelope.id.clone()),
-    })
+    let task = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": "m"}),
+            body: b"".to_vec(),
+            principal: Some(p.record.envelope.id.clone()),
+        },
+    )
     .unwrap();
-    assert_eq!(task.record.envelope.principal.as_deref(), Some(p.record.envelope.id.as_str()));
+    assert_eq!(
+        task.record.envelope.principal.as_deref(),
+        Some(p.record.envelope.id.as_str())
+    );
     // 不存在的 principal → 拒收。
-    let err = ops::add(&c, AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": "m2"}),
-        body: b"".to_vec(),
-        principal: Some("0198ghost-0000-7cd2-9e3f-000000000001".into()),
-    })
+    let err = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": "m2"}),
+            body: b"".to_vec(),
+            principal: Some("0198ghost-0000-7cd2-9e3f-000000000001".into()),
+        },
+    )
     .unwrap_err();
     assert!(matches!(err, MemError::RefTargetMissing { .. }), "{err}");
 }
@@ -284,12 +348,15 @@ fn add_enforces_ref_existence_and_principal_existence() {
 
 fn add_task(store: &Store, types: &TypeSet, slug: &str) -> ops::Added {
     let c = ctx(store, types);
-    ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", slug, "todo"),
-        body: b"v1 body".to_vec(),
-        principal: None,
-    })
+    ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", slug, "todo"),
+            body: b"v1 body".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap()
 }
 
@@ -297,15 +364,29 @@ fn add_task(store: &Store, types: &TypeSet, slug: &str) -> ops::Added {
 fn update_with_valid_token_bumps_version_and_logs_event() {
     let (_t, store, types) = fresh_store();
     let added = add_task(&store, &types, "t-update");
-    let mut payload = task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-update", "in_progress");
+    let mut payload = task_payload(
+        "0198f7a9-0000-7cd2-9e3f-000000000001",
+        "t-update",
+        "in_progress",
+    );
     payload["title"] = serde_json::json!("改标题");
     let c = ctx(&store, &types);
-    let out = ops::update(&c, &added.record.envelope.id, &added.token, payload, Some(b"v2 body".to_vec())).unwrap();
+    let out = ops::update(
+        &c,
+        &added.record.envelope.id,
+        &added.token,
+        payload,
+        Some(b"v2 body".to_vec()),
+    )
+    .unwrap();
     assert_eq!(out.record.envelope.version, 2);
     assert_eq!(out.record.payload["status"], "in_progress");
     assert_eq!(out.record.body, b"v2 body");
     // 事件：update，新旧摘要真实。
-    let last = EventLog::new(&store).last_event_for(&added.record.envelope.id).unwrap().unwrap();
+    let last = EventLog::new(&store)
+        .last_event_for(&added.record.envelope.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(last.op, Op::Update);
     assert_eq!(last.old_v, Some(1));
     assert_eq!(last.new_v, Some(2));
@@ -325,8 +406,19 @@ fn update_conflict_is_structured_with_current_token() {
     let added = add_task(&store, &types, "t-conflict");
     // 另一个写入者先完成一次 update。
     let c = ctx(&store, &types);
-    let payload = task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-conflict", "in_progress");
-    let _ = ops::update(&c, &added.record.envelope.id, &added.token, payload.clone(), None).unwrap();
+    let payload = task_payload(
+        "0198f7a9-0000-7cd2-9e3f-000000000001",
+        "t-conflict",
+        "in_progress",
+    );
+    let _ = ops::update(
+        &c,
+        &added.record.envelope.id,
+        &added.token,
+        payload.clone(),
+        None,
+    )
+    .unwrap();
     // 陈旧令牌的 update → 结构化冲突，含当前令牌（D3/R3.2）。
     let err = ops::update(&c, &added.record.envelope.id, &added.token, payload, None).unwrap_err();
     match err {
@@ -348,11 +440,22 @@ fn update_detects_version_preserved_hand_edit() {
     // 保版本手改：直接重写文件，version 不变。
     let bytes = std::fs::read(store.abs(&added.rel)).unwrap();
     let rec = mem_core::record::Record::from_bytes(&bytes).unwrap();
-    let tampered = mem_core::record::serialize_new(&rec.envelope, &rec.payload, "手改正文".as_bytes());
+    let tampered =
+        mem_core::record::serialize_new(&rec.envelope, &rec.payload, "手改正文".as_bytes());
     std::fs::write(store.abs(&added.rel), tampered).unwrap();
     let c = ctx(&store, &types);
-    let err = ops::update(&c, &added.record.envelope.id, &added.token, task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-hand", "done"), None).unwrap_err();
-    assert!(matches!(err, MemError::Conflict { .. }), "保版本手改必被全摘要令牌检出：{err}");
+    let err = ops::update(
+        &c,
+        &added.record.envelope.id,
+        &added.token,
+        task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-hand", "done"),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::Conflict { .. }),
+        "保版本手改必被全摘要令牌检出：{err}"
+    );
     // 手改保留（不被静默覆盖）。
     let cur = std::fs::read(store.abs(&added.rel)).unwrap();
     assert!(window_contains(&cur, "手改正文".as_bytes()));
@@ -363,8 +466,18 @@ fn update_rejects_unique_key_change() {
     let (_t, store, types) = fresh_store();
     let added = add_task(&store, &types, "t-move");
     let c = ctx(&store, &types);
-    let err = ops::update(&c, &added.record.envelope.id, &added.token, task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "moved-away", "todo"), None).unwrap_err();
-    assert!(matches!(err, MemError::UniqueKeyImmut { .. }), "移动语义 v1 拒收：{err}");
+    let err = ops::update(
+        &c,
+        &added.record.envelope.id,
+        &added.token,
+        task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "moved-away", "todo"),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::UniqueKeyImmut { .. }),
+        "移动语义 v1 拒收：{err}"
+    );
 }
 
 // ---------- link / DAG ----------
@@ -375,15 +488,45 @@ fn link_requires_both_tokens_and_logs_events() {
     let a = add_task(&store, &types, "t-a");
     let b = add_task(&store, &types, "t-b");
     let c = ctx(&store, &types);
-    let (ta, tb) = ops::link(&c, &a.record.envelope.id, &b.record.envelope.id, "derived_from", &a.token, &b.token).unwrap();
+    let (ta, tb) = ops::link(
+        &c,
+        &a.record.envelope.id,
+        &b.record.envelope.id,
+        "derived_from",
+        &a.token,
+        &b.token,
+    )
+    .unwrap();
     assert_eq!(ta.version, 2, "源记录写边 → 版本 +1");
     assert_eq!(tb, b.token, "目标仅 CAS 校验，不写不改版本");
     let rec = ops::get(&store, &a.record.envelope.id).unwrap();
-    assert!(rec.record.envelope.refs.iter().any(|r| r.rel == "derived_from" && r.target == b.record.envelope.id));
+    assert!(
+        rec.record
+            .envelope
+            .refs
+            .iter()
+            .any(|r| r.rel == "derived_from" && r.target == b.record.envelope.id)
+    );
     let rec_b = ops::get(&store, &b.record.envelope.id).unwrap();
-    assert!(!rec_b.record.envelope.refs.iter().any(|r| r.rel == "derived_from"), "目标不加边（双向落边会凭空成环）");
+    assert!(
+        !rec_b
+            .record
+            .envelope
+            .refs
+            .iter()
+            .any(|r| r.rel == "derived_from"),
+        "目标不加边（双向落边会凭空成环）"
+    );
     // 陈旧令牌 → 冲突（两次单记录 CAS）。
-    let err = ops::link(&c, &a.record.envelope.id, &b.record.envelope.id, "relates", &a.token, &b.token).unwrap_err();
+    let err = ops::link(
+        &c,
+        &a.record.envelope.id,
+        &b.record.envelope.id,
+        "relates",
+        &a.token,
+        &b.token,
+    )
+    .unwrap_err();
     assert!(matches!(err, MemError::Conflict { .. }));
 }
 
@@ -391,24 +534,484 @@ fn link_requires_both_tokens_and_logs_events() {
 fn dag_cycle_rejected_for_xdag_type() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
-    let mk = |slug: &str| ops::add(&c, AddArgs {
-        type_name: "lesson".into(),
-        payload: serde_json::json!({"slug": slug, "title": slug}),
-        body: b"".to_vec(),
-        principal: None,
-    })
-    .unwrap();
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug": slug, "title": slug}),
+                body: b"".to_vec(),
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
     let a = mk("l-a");
     let b = mk("l-b");
     let cc = mk("l-c");
     let (ta, tb) = (a.token.clone(), b.token.clone());
     // link 返回 (第一个参数的新令牌, 第二个参数的新令牌)。
-    let (tb, _ta2) = ops::link(&c, &b.record.envelope.id, &a.record.envelope.id, "derived_from", &tb, &ta).unwrap();
-    let (tc, _tb2) = ops::link(&c, &cc.record.envelope.id, &b.record.envelope.id, "derived_from", &cc.token, &tb).unwrap();
+    let (tb, _ta2) = ops::link(
+        &c,
+        &b.record.envelope.id,
+        &a.record.envelope.id,
+        "derived_from",
+        &tb,
+        &ta,
+    )
+    .unwrap();
+    let (tc, _tb2) = ops::link(
+        &c,
+        &cc.record.envelope.id,
+        &b.record.envelope.id,
+        "derived_from",
+        &cc.token,
+        &tb,
+    )
+    .unwrap();
     // a → c 构成环 → 拒收（D16/红线17）。
     let a2 = ops::get(&store, &a.record.envelope.id).unwrap();
-    let err = ops::link(&c, &a.record.envelope.id, &cc.record.envelope.id, "derived_from", &a2.token, &tc).unwrap_err();
-    assert!(matches!(err, MemError::CycleDetected(_)), "环必须被拒收：{err}");
+    let err = ops::link(
+        &c,
+        &a.record.envelope.id,
+        &cc.record.envelope.id,
+        "derived_from",
+        &a2.token,
+        &tc,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "环必须被拒收：{err}"
+    );
+}
+
+#[test]
+fn update_payload_xref_rejects_self_two_node_and_longer_dag_cycles() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
+                body: vec![],
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("cycle-a");
+    let b = mk("cycle-b");
+    let d = mk("cycle-c");
+    let err = ops::update(
+        &c,
+        &a.record.envelope.id,
+        &a.token,
+        serde_json::json!({"slug":"cycle-a","title":"cycle-a","derived_from":a.record.envelope.id}),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, MemError::CycleDetected(_)), "自环拒绝：{err}");
+
+    let a2 = ops::update(
+        &c,
+        &a.record.envelope.id,
+        &a.token,
+        serde_json::json!({"slug":"cycle-a","title":"cycle-a","derived_from":b.record.envelope.id}),
+        None,
+    )
+    .unwrap();
+    let err = ops::update(
+        &c,
+        &b.record.envelope.id,
+        &b.token,
+        serde_json::json!({"slug":"cycle-b","title":"cycle-b","derived_from":a.record.envelope.id}),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "双节点环拒绝：{err}"
+    );
+
+    let b2 = ops::update(
+        &c,
+        &b.record.envelope.id,
+        &b.token,
+        serde_json::json!({"slug":"cycle-b","title":"cycle-b","derived_from":d.record.envelope.id}),
+        None,
+    )
+    .unwrap();
+    let err = ops::update(
+        &c,
+        &d.record.envelope.id,
+        &d.token,
+        serde_json::json!({"slug":"cycle-c","title":"cycle-c","derived_from":a.record.envelope.id}),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "多节点环拒绝：{err}"
+    );
+
+    let a_after = ops::get(&store, &a.record.envelope.id).unwrap();
+    assert_eq!(a_after.record.payload["derived_from"], b.record.envelope.id);
+    assert_eq!(a_after.token, a2.token);
+    assert_eq!(
+        ops::get(&store, &b.record.envelope.id).unwrap().token,
+        b2.token
+    );
+    assert!(
+        mem_core::refgraph::audit_dag(&store, &types)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn custom_derived_relation_is_enforced_for_payload_updates_and_verify_audits_external_cycle() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "course".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"based_on":null}),
+                body: vec![],
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("course-a");
+    let b = mk("course-b");
+    ops::update(
+        &c,
+        &a.record.envelope.id,
+        &a.token,
+        serde_json::json!({"slug":"course-a","title":"course-a","based_on":b.record.envelope.id}),
+        None,
+    )
+    .unwrap();
+    let current_b = ops::get(&store, &b.record.envelope.id).unwrap();
+    let err = ops::update(
+        &c,
+        &b.record.envelope.id,
+        &current_b.token,
+        serde_json::json!({"slug":"course-b","title":"course-b","based_on":a.record.envelope.id}),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "自定义 x-derived-rel 必须强制：{err}"
+    );
+
+    // 模拟店外编辑造成的既存环；verify 是损坏检测补充，不能只报全绿。
+    for (record, target) in [(&a, &b.record.envelope.id), (&b, &a.record.envelope.id)] {
+        let cur = ops::get(&store, &record.record.envelope.id).unwrap();
+        let mut env = cur.record.envelope.clone();
+        env.refs.retain(|r| r.rel != "based_on");
+        env.refs.push(mem_core::envelope::Ref {
+            rel: "based_on".into(),
+            target: target.clone(),
+        });
+        let payload = serde_json::json!({"slug":if record.record.payload["slug"] == "course-a" {"course-a"} else {"course-b"},"title":"cycle","based_on":target});
+        let bytes = mem_core::record::serialize_new(&env, &payload, &cur.record.body);
+        std::fs::write(store.abs(&cur.rel), bytes).unwrap();
+    }
+    let reports = mem_core::agenda::verify_report(&store, &types, false).unwrap();
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.contains("派生") && r.contains("环")),
+        "verify 必须报告 DAG 环：{reports:?}"
+    );
+}
+
+#[test]
+fn merge_rejects_reference_rewrite_that_would_create_dag_cycle_before_writes() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "course".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"based_on":null}),
+                body: vec![],
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let canonical = mk("merge-canonical");
+    let middle = mk("merge-middle");
+    let dup = mk("merge-dup");
+    let (canonical_token, _) = ops::link(
+        &c,
+        &canonical.record.envelope.id,
+        &middle.record.envelope.id,
+        "based_on",
+        &canonical.token,
+        &middle.token,
+    )
+    .unwrap();
+    let middle_fresh = ops::get(&store, &middle.record.envelope.id).unwrap();
+    let (middle_token, _) = ops::link(
+        &c,
+        &middle.record.envelope.id,
+        &dup.record.envelope.id,
+        "based_on",
+        &middle_fresh.token,
+        &dup.token,
+    )
+    .unwrap();
+    let before_canonical = std::fs::read(store.abs(&canonical.rel)).unwrap();
+    let before_middle = std::fs::read(store.abs(&middle.rel)).unwrap();
+    let before_dup = std::fs::read(store.abs(&dup.rel)).unwrap();
+    let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let err = ops::merge(
+        &c,
+        &dup.record.envelope.id,
+        &canonical.record.envelope.id,
+        &dup.token,
+        &canonical_token,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "merge 必须拒绝重挂后成环：{err}"
+    );
+    assert_eq!(
+        std::fs::read(store.abs(&canonical.rel)).unwrap(),
+        before_canonical
+    );
+    assert_eq!(
+        std::fs::read(store.abs(&middle.rel)).unwrap(),
+        before_middle
+    );
+    assert_eq!(std::fs::read(store.abs(&dup.rel)).unwrap(), before_dup);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        before_events
+    );
+    assert_eq!(
+        ops::get(&store, &middle.record.envelope.id).unwrap().token,
+        middle_token
+    );
+}
+
+#[test]
+fn concurrent_payload_updates_cannot_create_a_dag_cycle() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
+                body: vec![],
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("thread-a");
+    let b = mk("thread-b");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let launch = |id: String,
+                  slug: &'static str,
+                  token: mem_core::token::Token,
+                  target: String,
+                  start: std::sync::Arc<std::sync::Barrier>| {
+        let root = store.root().to_path_buf();
+        std::thread::spawn(move || {
+            let store = Store::open(&root, OpenMode::Auto).unwrap();
+            let types = TypeSet::load_dir(&store.abs("types")).unwrap();
+            let ctx = WriteContext {
+                store: &store,
+                types: &types,
+                by: "race".into(),
+                committer: None,
+                session_id: None,
+            };
+            start.wait();
+            ops::update(
+                &ctx,
+                &id,
+                &token,
+                serde_json::json!({"slug":slug,"title":"race","derived_from":target}),
+                None,
+            )
+        })
+    };
+    let t1 = launch(
+        a.record.envelope.id.clone(),
+        "thread-a",
+        a.token.clone(),
+        b.record.envelope.id.clone(),
+        start.clone(),
+    );
+    let t2 = launch(
+        b.record.envelope.id.clone(),
+        "thread-b",
+        b.token.clone(),
+        a.record.envelope.id.clone(),
+        start.clone(),
+    );
+    start.wait();
+    let out1 = t1.join().unwrap();
+    let out2 = t2.join().unwrap();
+    assert_eq!(
+        usize::from(out1.is_ok()) + usize::from(out2.is_ok()),
+        1,
+        "exactly one edge update can win: {out1:?} {out2:?}"
+    );
+    let err = if out1.is_err() {
+        out1.unwrap_err()
+    } else {
+        out2.unwrap_err()
+    };
+    assert!(
+        matches!(err, MemError::CycleDetected(_)),
+        "losing update must see the winning edge: {err}"
+    );
+    assert!(
+        mem_core::refgraph::audit_dag(&store, &types)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn maintenance_update_rejects_dag_cycle_before_any_record_or_event_change() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
+                body: vec![],
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("maint-a");
+    let b = mk("maint-b");
+    ops::update(
+        &c,
+        &b.record.envelope.id,
+        &b.token,
+        serde_json::json!({"slug":"maint-b","title":"maint-b","derived_from":a.record.envelope.id}),
+        None,
+    )
+    .unwrap();
+    let a_cur = ops::get(&store, &a.record.envelope.id).unwrap();
+    let a_path = store.abs(&a_cur.rel);
+    let old_bytes = std::fs::read(&a_path).unwrap();
+    let event_count = EventLog::new(&store).read_log().unwrap().events.len();
+    let plan = mem_core::agenda::Plan {
+        id: mem_core::agenda::new_plan_id(),
+        kind: mem_core::agenda::PlanKind::Maintenance,
+        status: mem_core::agenda::PlanStatus::Draft,
+        steps: vec![mem_core::agenda::PlanStep::Update {
+            id: a.record.envelope.id.clone(),
+            payload: serde_json::json!({"slug":"maint-a","title":"maint-a","derived_from":b.record.envelope.id}),
+        }],
+        completed_steps: 0,
+        in_progress: None,
+        created: mem_core::clock::now_rfc3339(),
+    };
+    mem_core::agenda::save_plan(&store, &plan).unwrap();
+
+    let error = mem_core::agenda::apply(&store, &types, &plan.id, None).unwrap_err();
+    assert!(
+        matches!(error, MemError::CycleDetected(_)),
+        "维护更新必须调用相同 DAG 校验：{error}"
+    );
+    assert_eq!(std::fs::read(a_path).unwrap(), old_bytes);
+    assert_eq!(
+        ops::get(&store, &a.record.envelope.id).unwrap().token,
+        a_cur.token
+    );
+    assert_eq!(
+        EventLog::new(&store).read_log().unwrap().events.len(),
+        event_count
+    );
+}
+
+#[test]
+fn link_rejects_tombstone_source_and_target_without_mutation() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let source = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title":"source"}),
+            body: vec![],
+            principal: None,
+        },
+    )
+    .unwrap();
+    let target = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title":"target"}),
+            body: vec![],
+            principal: None,
+        },
+    )
+    .unwrap();
+    ops::delete_record(&c, &target.record.envelope.id, &target.token, false).unwrap();
+    let seq_before = EventLog::new(&store).read_log().unwrap().events.len();
+    let err = ops::link(
+        &c,
+        &source.record.envelope.id,
+        &target.record.envelope.id,
+        "related",
+        &source.token,
+        &target.token,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("attic") || err.to_string().contains("删除"),
+        "{err}"
+    );
+    assert_eq!(
+        ops::get(&store, &source.record.envelope.id).unwrap().token,
+        source.token
+    );
+    assert_eq!(
+        EventLog::new(&store).read_log().unwrap().events.len(),
+        seq_before,
+        "拒绝 link 不追加事件"
+    );
+
+    ops::delete_record(&c, &source.record.envelope.id, &source.token, false).unwrap();
+    let err = ops::link(
+        &c,
+        &source.record.envelope.id,
+        &target.record.envelope.id,
+        "related",
+        &source.token,
+        &target.token,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("attic") || err.to_string().contains("删除"),
+        "{err}"
+    );
 }
 
 // ---------- delete / restore ----------
@@ -419,21 +1022,42 @@ fn delete_blocked_by_reverse_refs_then_force_to_attic_and_restore() {
     let a = add_task(&store, &types, "t-del-a");
     let b = add_task(&store, &types, "t-del-b");
     let c = ctx(&store, &types);
-    let _ = ops::link(&c, &b.record.envelope.id, &a.record.envelope.id, "derived_from", &b.token, &a.token).unwrap();
+    let _ = ops::link(
+        &c,
+        &b.record.envelope.id,
+        &a.record.envelope.id,
+        "derived_from",
+        &b.token,
+        &a.token,
+    )
+    .unwrap();
     // b 引用 a → 删除 a 默认阻止（R3.4/D17）。
     let a2 = ops::get(&store, &a.record.envelope.id).unwrap();
     let err = ops::delete_record(&c, &a.record.envelope.id, &a2.token, false).unwrap_err();
-    assert!(matches!(err, MemError::RefTargetMissing { .. }) || err.to_string().contains("引用"), "{err}");
+    assert!(
+        matches!(err, MemError::RefTargetMissing { .. }) || err.to_string().contains("引用"),
+        "{err}"
+    );
     // force：进入 attic（受管 tombstone）+ delete 事件。
     let out = ops::delete_record(&c, &a.record.envelope.id, &a2.token, true).unwrap();
     assert!(out.rel.starts_with("attic/"), "{}", out.rel);
-    assert!(!store.abs("records/task/0198f7a9-0000-7cd2-9e3f-000000000001/t-del-a.md").exists());
-    let last = EventLog::new(&store).last_event_for(&a.record.envelope.id).unwrap().unwrap();
+    assert!(
+        !store
+            .abs("records/task/0198f7a9-0000-7cd2-9e3f-000000000001/t-del-a.md")
+            .exists()
+    );
+    let last = EventLog::new(&store)
+        .last_event_for(&a.record.envelope.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(last.op, Op::Delete);
     // restore：回 records 同路径 + restore 事件。
     let out2 = ops::restore_record(&c, &a.record.envelope.id, None).unwrap();
     assert!(out2.rel.starts_with("records/"));
-    let last2 = EventLog::new(&store).last_event_for(&a.record.envelope.id).unwrap().unwrap();
+    let last2 = EventLog::new(&store)
+        .last_event_for(&a.record.envelope.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(last2.op, Op::Restore);
 }
 
@@ -449,9 +1073,20 @@ fn r15_reused_record_key_never_overwrites_older_tombstone() {
     let second = add_task(&store, &types, "r15-reuse");
     assert_ne!(first_id, second.record.envelope.id);
     let err = ops::delete_record(&c, &second.record.envelope.id, &second.token, false).unwrap_err();
-    assert!(err.to_string().contains("File exists") || err.to_string().contains("already exists") || err.to_string().contains("已存在"), "{err}");
+    assert!(
+        err.to_string().contains("File exists")
+            || err.to_string().contains("already exists")
+            || err.to_string().contains("已存在"),
+        "{err}"
+    );
     assert_eq!(std::fs::read(store.abs(attic)).unwrap(), preserved);
-    assert_eq!(mem_core::record::Record::from_bytes(&preserved).unwrap().envelope.id, first_id);
+    assert_eq!(
+        mem_core::record::Record::from_bytes(&preserved)
+            .unwrap()
+            .envelope
+            .id,
+        first_id
+    );
 }
 
 #[test]
@@ -464,29 +1099,61 @@ fn r15_merge_never_overwrites_an_existing_different_tombstone() {
     let preserved = std::fs::read(store.abs(attic)).unwrap();
     let dup = add_task(&store, &types, "r15-merge-reuse");
     let canonical = add_task(&store, &types, "r15-merge-canonical");
-    let dependent = ops::add(&c, AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": "points to dup"}),
-        body: b"dependent".to_vec(),
-        principal: None,
-    }).unwrap();
+    let dependent = ops::add(
+        &c,
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": "points to dup"}),
+            body: b"dependent".to_vec(),
+            principal: None,
+        },
+    )
+    .unwrap();
     // 构造已存在的引用边，专门验证 merge 失败时第三方文件不被提前重写。
-    let mut dep_rec = ops::get(&store, &dependent.record.envelope.id).unwrap().record;
+    let mut dep_rec = ops::get(&store, &dependent.record.envelope.id)
+        .unwrap()
+        .record;
     dep_rec.envelope.refs.push(mem_core::envelope::Ref {
-        rel: "test_ref".into(), target: dup.record.envelope.id.clone(),
+        rel: "test_ref".into(),
+        target: dup.record.envelope.id.clone(),
     });
-    let dep_bytes = mem_core::record::serialize_new(&dep_rec.envelope, &dep_rec.payload, &dep_rec.body);
+    let dep_bytes =
+        mem_core::record::serialize_new(&dep_rec.envelope, &dep_rec.payload, &dep_rec.body);
     std::fs::write(store.abs(&dependent.rel), &dep_bytes).unwrap();
     let before_canonical = std::fs::read(store.abs(&canonical.rel)).unwrap();
     let before_dependent = std::fs::read(store.abs(&dependent.rel)).unwrap();
     let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
-    let err = ops::merge(&c, &dup.record.envelope.id, &canonical.record.envelope.id, &dup.token, &canonical.token).unwrap_err();
-    assert!(err.to_string().contains("File exists") || err.to_string().contains("already exists") || err.to_string().contains("已存在"), "{err}");
+    let err = ops::merge(
+        &c,
+        &dup.record.envelope.id,
+        &canonical.record.envelope.id,
+        &dup.token,
+        &canonical.token,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("File exists")
+            || err.to_string().contains("already exists")
+            || err.to_string().contains("已存在"),
+        "{err}"
+    );
     assert_eq!(std::fs::read(store.abs(attic)).unwrap(), preserved);
-    assert!(store.abs(&dup.rel).is_file(), "冲突时 dup 原记录必须仍在 records");
-    assert_eq!(std::fs::read(store.abs(&canonical.rel)).unwrap(), before_canonical);
-    assert_eq!(std::fs::read(store.abs(&dependent.rel)).unwrap(), before_dependent);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+    assert!(
+        store.abs(&dup.rel).is_file(),
+        "冲突时 dup 原记录必须仍在 records"
+    );
+    assert_eq!(
+        std::fs::read(store.abs(&canonical.rel)).unwrap(),
+        before_canonical
+    );
+    assert_eq!(
+        std::fs::read(store.abs(&dependent.rel)).unwrap(),
+        before_dependent
+    );
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        before_events
+    );
 }
 
 #[test]
@@ -505,21 +1172,32 @@ fn r16_add_revalidates_reference_after_waiting_for_shared_barrier() {
         let types2 = TypeSet::load_dir(&root.join("types")).unwrap();
         let c2 = ctx(&store2, &types2);
         tx.send(()).unwrap();
-        ops::add(&c2, AddArgs {
-            type_name: "task".into(),
-            payload: task_payload(&id, "r16-reference-race", "todo"),
-            body: b"race".to_vec(),
-            principal: None,
-        })
+        ops::add(
+            &c2,
+            AddArgs {
+                type_name: "task".into(),
+                payload: task_payload(&id, "r16-reference-race", "todo"),
+                body: b"race".to_vec(),
+                principal: None,
+            },
+        )
     });
     rx.recv().unwrap();
     // 在创建方等待共享门闩期间完成删除；之后创建方必须在门闩内重新校验引用。
     ops::delete_locked(&c, &target_id, &token, false).unwrap();
     drop(gate);
     let err = creator.join().unwrap().unwrap_err();
-    assert!(matches!(err, MemError::RefTargetMissing { .. }), "创建必须拒绝已删除目标：{err}");
-    assert!(!ops::scan_all(&store).unwrap().records.iter()
-        .any(|r| r.record.envelope.aliases.iter().any(|a| a == "r16-reference-race")));
+    assert!(
+        matches!(err, MemError::RefTargetMissing { .. }),
+        "创建必须拒绝已删除目标：{err}"
+    );
+    assert!(!ops::scan_all(&store).unwrap().records.iter().any(|r| {
+        r.record
+            .envelope
+            .aliases
+            .iter()
+            .any(|a| a == "r16-reference-race")
+    }));
 }
 
 #[test]
@@ -527,16 +1205,35 @@ fn r16_fix_rejects_lexical_escape_without_touching_outside_record() {
     let (_t, store, types) = fresh_store();
     let outside = store.root().parent().unwrap().join("outside-fix-r16.md");
     let env = mem_core::envelope::Envelope {
-        id: "outside-r16".into(), r#type: "memory".into(),
-        created: "2026-11-12T00:00:00Z".into(), modified: "2026-11-12T00:00:00Z".into(),
-        version: 1, principal: None, refs: vec![], aliases: vec![], evidence_cutoff_seq: None,
-        commit: None, extra: Default::default(),
+        id: "outside-r16".into(),
+        r#type: "memory".into(),
+        created: "2026-11-12T00:00:00Z".into(),
+        modified: "2026-11-12T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec![],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
     };
-    let bytes = mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"body");
+    let bytes =
+        mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"body");
     std::fs::write(&outside, &bytes).unwrap();
-    let err = ops::fix_record(&store, &types, "records/../../outside-fix-r16.md", None,
-        None, None, None).unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "路径拒绝必须原样返回：{err}");
+    let err = ops::fix_record(
+        &store,
+        &types,
+        "records/../../outside-fix-r16.md",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "路径拒绝必须原样返回：{err}"
+    );
     assert_eq!(std::fs::read(&outside).unwrap(), bytes);
     assert!(!outside.with_file_name("outside-fix-r16.md.lock").exists());
     std::fs::remove_file(outside).unwrap();
@@ -549,29 +1246,50 @@ fn r16_record_path_rejects_symlink_escape() {
     let outside_dir = tempfile::tempdir().unwrap();
     let outside = outside_dir.path().join("outside.md");
     let env = mem_core::envelope::Envelope {
-        id: "0198f7a9-0000-7cd2-9e3f-000000000099".into(), r#type: "memory".into(),
-        created: "2026-11-12T00:00:00Z".into(), modified: "2026-11-12T00:00:00Z".into(),
-        version: 1, principal: None, refs: vec![], aliases: vec!["outside-alias".into()],
-        evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+        id: "0198f7a9-0000-7cd2-9e3f-000000000099".into(),
+        r#type: "memory".into(),
+        created: "2026-11-12T00:00:00Z".into(),
+        modified: "2026-11-12T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["outside-alias".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
     };
-    let bytes = mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"sentinel");
+    let bytes =
+        mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"sentinel");
     std::fs::write(&outside, &bytes).unwrap();
     std::os::unix::fs::symlink(outside_dir.path(), store.abs("records/escape")).unwrap();
     let err = ops::get(&store, "records/escape/outside.md").unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "符号链接越界应拒绝：{err}");
-    assert!(matches!(ops::get(&store, &env.id), Err(MemError::MissingRecord { .. })));
-    assert!(matches!(ops::get(&store, "outside-alias"), Err(MemError::MissingRecord { .. })));
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "符号链接越界应拒绝：{err}"
+    );
+    assert!(matches!(
+        ops::get(&store, &env.id),
+        Err(MemError::MissingRecord { .. })
+    ));
+    assert!(matches!(
+        ops::get(&store, "outside-alias"),
+        Err(MemError::MissingRecord { .. })
+    ));
     assert_eq!(std::fs::read(outside).unwrap(), bytes);
 }
 
 #[cfg(unix)]
 fn add_memory(store: &Store, types: &TypeSet, title: &str) -> ops::Added {
-    ops::add(&ctx(store, types), AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": title}),
-        body: b"memory body".to_vec(),
-        principal: None,
-    }).unwrap()
+    ops::add(
+        &ctx(store, types),
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": title}),
+            body: b"memory body".to_vec(),
+            principal: None,
+        },
+    )
+    .unwrap()
 }
 
 #[cfg(unix)]
@@ -581,14 +1299,25 @@ fn r17_add_rejects_symlinked_record_destination_before_side_effects() {
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), store.abs("records/memory")).unwrap();
     let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
-    let err = ops::add(&ctx(&store, &types), AddArgs {
-        type_name: "memory".into(),
-        payload: serde_json::json!({"title": "outside-created"}),
-        body: b"outside".to_vec(), principal: None,
-    }).unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "外链目标必须拒绝：{err}");
+    let err = ops::add(
+        &ctx(&store, &types),
+        AddArgs {
+            type_name: "memory".into(),
+            payload: serde_json::json!({"title": "outside-created"}),
+            body: b"outside".to_vec(),
+            principal: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "外链目标必须拒绝：{err}"
+    );
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        before_events
+    );
 }
 
 #[cfg(unix)]
@@ -600,10 +1329,22 @@ fn r17_delete_rejects_symlinked_attic_destination_without_moving_record() {
     let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), store.abs("attic/memory")).unwrap();
-    let err = ops::delete_record(&ctx(&store, &types), &added.record.envelope.id, &added.token, false).unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "外链 tombstone 目标必须拒绝：{err}");
+    let err = ops::delete_record(
+        &ctx(&store, &types),
+        &added.record.envelope.id,
+        &added.token,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "外链 tombstone 目标必须拒绝：{err}"
+    );
     assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), record_before);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        events_before
+    );
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
@@ -620,9 +1361,15 @@ fn r17_restore_rejects_symlinked_records_destination_without_moving_tombstone() 
     std::fs::remove_dir_all(store.abs("records/memory")).unwrap();
     std::os::unix::fs::symlink(outside.path(), store.abs("records/memory")).unwrap();
     let err = ops::restore_record(&c, &added.record.envelope.id, None).unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "外链 records 目标必须拒绝：{err}");
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "外链 records 目标必须拒绝：{err}"
+    );
     assert_eq!(std::fs::read(store.abs(&deleted.rel)).unwrap(), tomb_before);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        events_before
+    );
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
@@ -640,12 +1387,24 @@ fn r17_update_rejects_symlinked_lock_without_overwriting_external_file() {
     std::os::unix::fs::symlink(&external, &lock_path).unwrap();
     let record_before = std::fs::read(store.abs(&added.rel)).unwrap();
     let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
-    let err = ops::update(&ctx(&store, &types), &added.record.envelope.id, &added.token,
-        serde_json::json!({"title": "changed"}), None).unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "外链锁目标必须拒绝：{err}");
+    let err = ops::update(
+        &ctx(&store, &types),
+        &added.record.envelope.id,
+        &added.token,
+        serde_json::json!({"title": "changed"}),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "外链锁目标必须拒绝：{err}"
+    );
     assert_eq!(std::fs::read(external).unwrap(), original);
     assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), record_before);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        events_before
+    );
 }
 
 #[test]
@@ -670,8 +1429,15 @@ fn r15_nonforce_delete_serializes_with_new_reference_creation() {
     rx.recv().unwrap();
     drop(gate);
     let err = deleter.join().unwrap().unwrap_err();
-    assert!(err.to_string().contains("引用"), "删除必须被新引用阻止：{err}");
-    assert!(store.abs("records/project/0198f7a9-0000-7cd2-9e3f-000000000001.md").exists());
+    assert!(
+        err.to_string().contains("引用"),
+        "删除必须被新引用阻止：{err}"
+    );
+    assert!(
+        store
+            .abs("records/project/0198f7a9-0000-7cd2-9e3f-000000000001.md")
+            .exists()
+    );
 }
 
 #[test]
@@ -680,7 +1446,10 @@ fn r15_get_rejects_paths_that_escape_store_root() {
     let outside = tmp.path().join("outside.md");
     std::fs::write(&outside, b"outside sentinel").unwrap();
     let err = ops::get(&store, "records/../../outside.md").unwrap_err();
-    assert!(matches!(err, MemError::BadArgument(_)), "应在文件访问前拒绝路径：{err}");
+    assert!(
+        matches!(err, MemError::BadArgument(_)),
+        "应在文件访问前拒绝路径：{err}"
+    );
     assert_eq!(std::fs::read(outside).unwrap(), b"outside sentinel");
 }
 
@@ -697,12 +1466,15 @@ fn commits_include_record_and_events_same_batch() {
         committer: Some(&sink),
         session_id: None,
     };
-    let out = ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-git", "todo"),
-        body: b"".to_vec(),
-        principal: None,
-    })
+    let out = ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-git", "todo"),
+            body: b"".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap();
     let batches = sink.batches.lock().unwrap();
     assert_eq!(batches.len(), 1, "高优1：记录路径 + events.jsonl 同批提交");
@@ -714,7 +1486,10 @@ fn commits_include_record_and_events_same_batch() {
 #[test]
 fn commit_failure_becomes_pending_not_rollback() {
     let (_t, store, types) = fresh_store();
-    let sink = RecordingSink { batches: Default::default(), fail: true };
+    let sink = RecordingSink {
+        batches: Default::default(),
+        fail: true,
+    };
     let c = WriteContext {
         store: &store,
         types: &types,
@@ -722,12 +1497,15 @@ fn commit_failure_becomes_pending_not_rollback() {
         committer: Some(&sink),
         session_id: None,
     };
-    let out = ops::add(&c, AddArgs {
-        type_name: "task".into(),
-        payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-pending", "todo"),
-        body: b"".to_vec(),
-        principal: None,
-    })
+    let out = ops::add(
+        &c,
+        AddArgs {
+            type_name: "task".into(),
+            payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-pending", "todo"),
+            body: b"".to_vec(),
+            principal: None,
+        },
+    )
     .unwrap();
     // 真相层已生效（文件 + 事件），提交滞后合法（D17）。
     assert!(store.abs(&out.rel).is_file());
@@ -750,9 +1528,21 @@ fn scan_skips_corrupt_records_with_warning() {
     std::fs::create_dir_all(store.abs("records/task/0198proj")).unwrap();
     std::fs::write(store.abs(bad_rel), b"---\n{broken json\n---\n").unwrap();
     let scanned = ops::scan_all(&store).unwrap();
-    assert!(scanned.records.iter().any(|r| r.record.envelope.id == a.record.envelope.id));
-    assert_eq!(scanned.warnings.len(), 1, "坏条目跳过 + 告警，不崩溃（R6.2）");
+    assert!(
+        scanned
+            .records
+            .iter()
+            .any(|r| r.record.envelope.id == a.record.envelope.id)
+    );
+    assert_eq!(
+        scanned.warnings.len(),
+        1,
+        "坏条目跳过 + 告警，不崩溃（R6.2）"
+    );
     // 读路径 get 对坏记录：响亮报告（R6.1），修理由 fix 承担。
     let err = ops::get(&store, bad_rel).unwrap_err();
-    assert!(err.to_string().contains("frontmatter") || err.to_string().contains("损坏"), "{err}");
+    assert!(
+        err.to_string().contains("frontmatter") || err.to_string().contains("损坏"),
+        "{err}"
+    );
 }
