@@ -188,6 +188,8 @@ args = ["mcp"]
 
 ### Claude Code
 
+Windows 上 npm 生成的 `claude.ps1` 启动入口由 `powershell.exe` 执行。启动器只为这一次 PowerShell 进程传入 `-ExecutionPolicy Bypass`，避免常见的 `Restricted` 用户默认策略阻止 npm 脚本；该参数不改注册表或持久设置。组织级组策略仍优先于此参数，若组策略禁止脚本，安装失败时必须如实报告，不应尝试修改策略或绕过组织限制。
+
 预检和写后确认只读解析当前用户 MCP JSON 配置；不得调用 `claude mcp list` 或 `claude mcp get`。默认配置在 `~/.claude.json`；设置 `CLAUDE_CONFIG_DIR` 时，首版必须先用隔离目录验证客户端实际读写文件路径，路径无法确定时停止并转为通用引导。仅检查用户范围；项目/本地范围的同名配置可能遮蔽用户范围条目，安装器不修改这些文件。
 
 逻辑调用为：

@@ -528,6 +528,8 @@ mod tests {
         let prefix = vec![
             OsString::from("-NoProfile"),
             OsString::from("-NonInteractive"),
+            OsString::from("-ExecutionPolicy"),
+            OsString::from("Bypass"),
             OsString::from("-File"),
             OsString::from("/tmp/Claude Code/claude.ps1"),
         ];

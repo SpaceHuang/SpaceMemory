@@ -167,6 +167,89 @@ fn has_config_entry(config: &std::path::Path, mem: &std::path::Path) -> bool {
         && parsed["mcp_servers"]["spacememory"]["args"][0].as_str() == Some("mcp")
 }
 
+#[cfg(windows)]
+#[test]
+fn installer_runs_npm_powershell_shim_under_restricted_policy_and_preserves_argv() {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("npm bin 空格 ' & (x)");
+    let codex_home = temp.path().join("Codex 用户配置");
+    let mem_dir = temp.path().join("mem 路径 ' & (x)");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::create_dir_all(&mem_dir).unwrap();
+
+    let cli = bin.join("codex.ps1");
+    let receipt = temp.path().join("received-arguments.json");
+    let policy_receipt = temp.path().join("effective-policy.txt");
+    let config = codex_home.join("config.toml");
+    let script = format!(
+        r####"$ErrorActionPreference = 'Stop'
+$received = @($args)
+[System.IO.File]::WriteAllText('{receipt}', (ConvertTo-Json -InputObject $received -Compress), (New-Object System.Text.UTF8Encoding $false))
+[System.IO.File]::WriteAllText('{policy_receipt}', (Get-ExecutionPolicy), (New-Object System.Text.UTF8Encoding $false))
+if ($received.Count -ne 6 -or $received[0] -ne 'mcp' -or $received[1] -ne 'add' -or $received[2] -ne 'spacememory' -or $received[3] -ne '--' -or $received[5] -ne 'mcp') {{ exit 31 }}
+$command = $received[4].Replace('\', '\\').Replace('"', '\"')
+$toml = "[mcp_servers.spacememory]`ncommand = `"$command`"`nargs = [`"mcp`"]`n"
+[System.IO.File]::WriteAllText('{config}', $toml, (New-Object System.Text.UTF8Encoding $false))
+"####,
+        receipt = ps_literal(&receipt),
+        policy_receipt = ps_literal(&policy_receipt),
+        config = ps_literal(&config),
+    );
+    let mut script_bytes = vec![0xEF, 0xBB, 0xBF];
+    script_bytes.extend_from_slice(script.as_bytes());
+    std::fs::write(&cli, script_bytes).unwrap();
+
+    let mem_source = assert_cmd::cargo::cargo_bin("mem");
+    let mem_exe = mem_dir.join("记忆 mem.exe");
+    std::fs::copy(mem_source, &mem_exe).unwrap();
+    let path = std::env::join_paths([&bin]).unwrap();
+    let mut cmd = std::process::Command::new(&mem_exe);
+    cmd.args(["mcp", "install", "--client", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", &codex_home)
+        .env("PSExecutionPolicyPreference", "Restricted")
+        .creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let received: Vec<String> = serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(
+        received,
+        [
+            "mcp",
+            "add",
+            "spacememory",
+            "--",
+            mem_exe.to_str().unwrap(),
+            "mcp"
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(policy_receipt).unwrap(), "Bypass");
+    assert!(has_windows_config_entry(&config, &mem_exe));
+}
+
+#[cfg(windows)]
+fn ps_literal(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\'', "''")
+}
+
+#[cfg(windows)]
+fn has_windows_config_entry(config: &std::path::Path, mem: &std::path::Path) -> bool {
+    let text = std::fs::read_to_string(config).unwrap();
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
+    parsed["mcp_servers"]["spacememory"]["command"].as_str() == mem.to_str()
+        && parsed["mcp_servers"]["spacememory"]["args"][0].as_str() == Some("mcp")
+}
+
 #[test]
 fn bare_mcp_still_serves_initialize_and_tools_list() {
     use std::io::Write;

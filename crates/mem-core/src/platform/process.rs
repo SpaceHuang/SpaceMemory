@@ -72,8 +72,9 @@ fn resolve_windows_entry(
             });
         }
 
-        // npm 会为同一个 JS CLI 生成 .ps1 与 .cmd。PowerShell 用 -File 接收脚本路径，
-        // 后续参数仍由 Command 逐项传入；不通过 cmd /c 拼接，也不执行 .cmd 文件。
+        // npm 会为同一个 JS CLI 生成 .ps1 与 .cmd。对这个子进程指定 Bypass：只影响
+        // 当前进程，不写入注册表；组策略仍然优先。-File 后的路径与参数仍由 Command
+        // 逐项传入；不通过 cmd /c 拼接，也不执行 .cmd 文件。
         let script = dir.join(format!("{name}.ps1"));
         if script.is_file() {
             if let Some(powershell) = powershell {
@@ -82,6 +83,8 @@ fn resolve_windows_entry(
                     prefix_args: vec![
                         OsString::from("-NoProfile"),
                         OsString::from("-NonInteractive"),
+                        OsString::from("-ExecutionPolicy"),
+                        OsString::from("Bypass"),
                         OsString::from("-File"),
                         script.into_os_string(),
                     ],
@@ -130,6 +133,8 @@ mod tests {
             vec![
                 OsString::from("-NoProfile"),
                 OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
                 OsString::from("-File"),
                 script.into_os_string(),
             ]
@@ -158,7 +163,7 @@ mod tests {
         let plan = resolve_windows_entry("codex", &[second.clone()], Some(&powershell)).unwrap();
         assert_eq!(plan.program, powershell);
         assert_eq!(
-            plan.prefix_args[3],
+            plan.prefix_args[5],
             second.join("codex.ps1").into_os_string()
         );
     }
