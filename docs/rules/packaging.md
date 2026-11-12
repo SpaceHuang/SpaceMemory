@@ -22,7 +22,7 @@ macOS `.app` 形态（若做）：`Contents/MacOS/mem` + `Contents/Resources/bui
 
 - [ ] 发布工具配置 extra 静态资产：`assets/builtin-types/` 原样复制进**每个**发布物（zip/tar 中位于 exe 同级的 `builtin-types/`）；
 - [ ] Windows 安装器（MSI/NSIS）：目录装入安装根（与 mem.exe 同级）；
-- [ ] macOS tarball：同上布局；Homebrew：装入 `share/mem/builtin-types/`，查找逻辑须覆盖 exe 的 `../share/mem/builtin-types`（参照 helix runtime 的 brew 布局）；pkg/.app：Resources 路径；
+- [x] macOS tarball：`scripts/package-release-macos.sh` 在 macOS runner 上生成 `mem` + 同级 `builtin-types/` 的 `.tar.gz` 并运行外部资产播种冒烟；当前 GitHub Release 发布 Apple Silicon（`aarch64-apple-darwin`）包。Homebrew：装入 `share/mem/builtin-types/`，查找逻辑须覆盖 exe 的 `../share/mem/builtin-types`（参照 helix runtime 的 brew 布局）；pkg/.app：Resources 路径仍未实现；
 - [ ] `mem init` 查找顺序实现齐全：模板覆盖配置 > exe 旁 `builtin-types/` > 内嵌字节；
 - [ ] 验收两条播种路径：① 移走/改名外部目录 → init 走嵌入兜底成功；② 外部在场 → 优先走外部（临时污染外部内容可验证优先级）；
 - [ ] 模板覆盖配置实现并测试（配置名随格式规范 v1 定稿，git 的对应物是 `init.templateDir`）。
