@@ -109,6 +109,64 @@ fn misspelled_mcp_subcommand_is_an_error_not_an_empty_server_start() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"));
 }
 
+#[cfg(unix)]
+#[test]
+fn installer_skips_non_executable_client_file_and_finds_later_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second dir");
+    let codex_home = temp.path().join("codex home");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::create_dir_all(&codex_home).unwrap();
+
+    let not_executable = first.join("codex");
+    std::fs::write(&not_executable, "not executable").unwrap();
+    std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let cli = second.join("codex");
+    std::fs::write(
+        &cli,
+        r#"#!/bin/sh
+if [ "$1" != mcp ] || [ "$2" != add ] || [ "$3" != spacememory ] || [ "$4" != -- ] || [ "$5" != "$EXPECTED_MEM" ] || [ "$6" != mcp ]; then exit 31; fi
+printf '[mcp_servers.spacememory]\ncommand = "%s"\nargs = ["mcp"]\n' "$EXPECTED_MEM" > "$CODEX_HOME/config.toml"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mem_source = assert_cmd::cargo::cargo_bin("mem");
+    let mem_dir = temp.path().join("mem with spaces");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+    let mem_exe = mem_dir.join("记忆 mem");
+    std::fs::copy(mem_source, &mem_exe).unwrap();
+    std::fs::set_permissions(&mem_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([first, second]).unwrap();
+    let out = std::process::Command::new(&mem_exe)
+        .args(["mcp", "install", "--client", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", &codex_home)
+        .env("EXPECTED_MEM", &mem_exe)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(has_config_entry(&codex_home.join("config.toml"), &mem_exe));
+}
+
+#[cfg(unix)]
+fn has_config_entry(config: &std::path::Path, mem: &std::path::Path) -> bool {
+    let text = std::fs::read_to_string(config).unwrap();
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
+    parsed["mcp_servers"]["spacememory"]["command"].as_str() == mem.to_str()
+        && parsed["mcp_servers"]["spacememory"]["args"][0].as_str() == Some("mcp")
+}
+
 #[test]
 fn bare_mcp_still_serves_initialize_and_tools_list() {
     use std::io::Write;

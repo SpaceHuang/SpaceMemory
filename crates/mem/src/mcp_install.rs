@@ -1,5 +1,6 @@
 //! `mem mcp install`：Agent 宿主 MCP 注册与通用引导。
 
+use mem_core::platform::process::ProcessCommand;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -129,11 +130,12 @@ pub fn run(install: bool, client: Option<&str>, dry_run: bool) -> Result<(), Str
             "找不到客户端命令；未运行客户端 CLI",
         )
     })?;
-    install_with_paths(
+    install_with_prefix(
         client,
         dry_run,
         &config,
-        &cli,
+        &cli.program,
+        &cli.prefix_args,
         &mem_exe,
         &mut |program, args| {
             let status = std::process::Command::new(program).args(args).status()?;
@@ -153,23 +155,8 @@ pub fn print_generic_guide(mem_exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        // `.cmd`/`.bat` 需要经 shell 启动；为了保持 argv 原样传递，这里只接受原生 exe。
-        for ext in ["exe"] {
-            let candidate = dir.join(format!("{name}.{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+fn find_executable(name: &str) -> Option<ProcessCommand> {
+    mem_core::platform::process::resolve_client_command(name, std::env::var_os("PATH").as_deref())
 }
 
 fn has_service(client: Client, path: &Path) -> Result<bool, String> {
@@ -270,6 +257,7 @@ fn has_expected_service(
     }
 }
 
+#[cfg(test)]
 fn install_with_paths<F>(
     client: Client,
     dry_run: bool,
@@ -281,10 +269,26 @@ fn install_with_paths<F>(
 where
     F: FnMut(&OsStr, &[OsString]) -> std::io::Result<bool>,
 {
+    install_with_prefix(client, dry_run, config, cli, &[], mem_exe, run_cli)
+}
+
+fn install_with_prefix<F>(
+    client: Client,
+    dry_run: bool,
+    config: &Path,
+    cli: &Path,
+    prefix_args: &[OsString],
+    mem_exe: &Path,
+    run_cli: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&OsStr, &[OsString]) -> std::io::Result<bool>,
+{
     let command = mem_exe
         .to_str()
         .ok_or("mem 可执行文件路径无法表示为 Unicode 文本")?;
-    let args = client.add_args(mem_exe.as_os_str());
+    let mut args = prefix_args.to_vec();
+    args.extend(client.add_args(mem_exe.as_os_str()));
     if dry_run {
         println!(
             "预演：将调用 {} {:?}\n配置范围：用户级\n配置文件：{}\n不会写配置或启动 MCP 服务。",
@@ -338,17 +342,24 @@ where
             &format!("{} 返回成功，但配置没有读回预期命令和参数", cli.display()),
         ));
     }
-    println!(
-        "已登记 {SERVICE} 到 {} 用户配置。若当前 Agent 未显示工具，请重启客户端或开启新会话。项目级同名配置可能覆盖此用户级设置。{}SpaceMemory MCP 可提供会改动记忆数据的工具。",
-        match client {
-            Client::Codex =>
-                "预检不能阻止另一程序在检查后同时添加同名服务；Codex 命令可能替换并发添加的配置。",
-            Client::ClaudeCode =>
-                "若另一程序在预检后同时登记同名服务，Claude Code 可能拒绝本次添加。",
-        },
-        client.executable()
-    );
+    println!("{}", success_message(client));
     Ok(())
+}
+
+fn success_message(client: Client) -> String {
+    let (client_name, concurrent_note) = match client {
+        Client::Codex => (
+            "Codex",
+            "预检不能阻止另一程序在检查后同时添加同名服务；Codex 命令可能替换并发添加的配置。",
+        ),
+        Client::ClaudeCode => (
+            "Claude Code",
+            "若另一程序在预检后同时登记同名服务，Claude Code 可能拒绝本次添加。",
+        ),
+    };
+    format!(
+        "已登记 {SERVICE} 到 {client_name} 用户配置。若当前 Agent 未显示工具，请重启客户端或开启新会话。项目级同名配置可能覆盖此用户级设置。{concurrent_note} SpaceMemory MCP 可提供会改动记忆数据的工具。"
+    )
 }
 
 fn manual_instructions(client: Client, mem_exe: &Path, config: &Path, reason: &str) -> String {
@@ -514,13 +525,23 @@ mod tests {
         let config = temp.path().join("config.json");
         let cli = Path::new("fake-claude");
         let mem = Path::new("/tmp/mem");
-        let result = install_with_paths(
+        let prefix = vec![
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-File"),
+            OsString::from("/tmp/Claude Code/claude.ps1"),
+        ];
+        let mut received = Vec::new();
+        let result = install_with_prefix(
             Client::ClaudeCode,
             false,
             &config,
             cli,
+            &prefix,
             mem,
             &mut |_, args| {
+                received = args.to_vec();
+                assert_eq!(&args[..prefix.len()], prefix.as_slice());
                 assert!(args.iter().any(|a| a == "--scope"));
                 std::fs::write(
                     &config,
@@ -530,6 +551,11 @@ mod tests {
             },
         );
         assert!(result.is_ok());
+        assert_eq!(&received[..prefix.len()], prefix.as_slice());
+        assert_eq!(received[prefix.len()], "mcp");
+        assert_eq!(received[prefix.len() + 7], "--");
+        assert_eq!(received[prefix.len() + 8], "/tmp/mem");
+        assert_eq!(received[prefix.len() + 9], "mcp");
     }
 
     #[test]
@@ -609,5 +635,43 @@ mod tests {
                 .unwrap_err()
                 .contains("codex、claude-code")
         );
+    }
+
+    #[test]
+    fn success_messages_name_the_client_before_describing_the_race() {
+        let codex = success_message(Client::Codex);
+        assert!(codex.contains("到 Codex 用户配置。"), "{codex}");
+        assert!(codex.find("到 Codex 用户配置").unwrap() < codex.find("预检不能阻止").unwrap());
+        let claude = success_message(Client::ClaudeCode);
+        assert!(claude.contains("到 Claude Code 用户配置。"), "{claude}");
+        assert!(claude.find("到 Claude Code 用户配置").unwrap() < claude.find("预检后").unwrap());
+    }
+
+    #[test]
+    fn codex_preflight_race_is_explicitly_accepted_and_warned() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let result = install_with_paths(
+            Client::Codex,
+            false,
+            &config,
+            Path::new("fake-codex"),
+            Path::new("/tmp/mem"),
+            &mut |_, _| {
+                // 交错：预检已通过后，另一个写入者添加同名配置；模拟 Codex add 将其替换。
+                std::fs::write(
+                    &config,
+                    "[mcp_servers.spacememory]\ncommand='/concurrent/mem'\nargs=['mcp']\n",
+                )?;
+                std::fs::write(
+                    &config,
+                    "[mcp_servers.spacememory]\ncommand='/tmp/mem'\nargs=['mcp']\n",
+                )?;
+                Ok(true)
+            },
+        );
+        assert!(result.is_ok());
+        assert!(has_expected_service(Client::Codex, &config, "/tmp/mem").unwrap());
+        assert!(success_message(Client::Codex).contains("可能替换并发添加的配置"));
     }
 }
