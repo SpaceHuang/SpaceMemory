@@ -150,6 +150,42 @@ fn live_holder_is_never_stolen() {
     drop(g);
 }
 
+#[test]
+fn r15_child_lock_probe() {
+    let Ok(root) = std::env::var("MEM_R15_LOCK_PROBE_ROOT") else { return };
+    let store = Store::open(std::path::Path::new(&root), OpenMode::Auto).unwrap();
+    match std::env::var("MEM_R15_LOCK_PROBE_KIND").as_deref() {
+        Ok("barrier") => { lock::try_barrier_exclusive(&store).expect("跨进程独占门闩可获取"); }
+        _ => { lock::try_record_lock(&store, REC).unwrap().expect("跨进程记录锁可获取"); }
+    }
+}
+
+fn child_probe(store: &Store, kind: &str) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "r15_child_lock_probe", "--nocapture"])
+        .env("MEM_R15_LOCK_PROBE_ROOT", store.root())
+        .env("MEM_R15_LOCK_PROBE_KIND", kind)
+        .output().unwrap()
+}
+
+#[test]
+fn r15_macos_lock_guards_remain_cross_process_until_last_drop() {
+    let (_t, store) = fresh_store();
+    let g1 = lock::barrier_shared(&store).unwrap();
+    let g2 = lock::barrier_shared(&store).unwrap();
+    assert!(!child_probe(&store, "barrier").status.success());
+    drop(g1);
+    assert!(!child_probe(&store, "barrier").status.success(), "g2 仍活跃时子进程仍不得取得独占");
+    drop(g2);
+    assert!(child_probe(&store, "barrier").status.success());
+
+    let g = lock::record_lock(&store, REC, Duration::from_secs(2)).unwrap();
+    assert!(lock::record_lock(&store, REC, Duration::from_millis(40)).is_err());
+    assert!(!child_probe(&store, "record").status.success(), "超时诊断不能关闭/释放原 guard 的跨进程锁");
+    drop(g);
+    assert!(child_probe(&store, "record").status.success());
+}
+
 // ---------- 序列锁：叶子、全库串行（红线24） ----------
 
 #[test]

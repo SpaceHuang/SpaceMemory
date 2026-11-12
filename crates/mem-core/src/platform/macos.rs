@@ -28,19 +28,21 @@ impl LockFile {
     }
 }
 
+/// 目标必须不存在时原子改名（tombstone 发布；目标冲突不会替换旧副本）。
+pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source 路径含 NUL"))?;
+    let to = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target 路径含 NUL"))?;
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 impl std::fmt::Debug for LockFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LockFile").finish_non_exhaustive()
     }
-}
-
-#[repr(C)]
-struct Flock {
-    l_start: libc::off_t,
-    l_len: libc::off_t,
-    l_pid: libc::pid_t,
-    l_type: libc::c_short,
-    l_whence: libc::c_short,
 }
 
 impl LockFile {
@@ -48,17 +50,14 @@ impl LockFile {
         OpenOptions::new().read(true).write(true).create(true).open(path)
     }
 
+    fn open_existing(path: &Path) -> io::Result<File> {
+        OpenOptions::new().read(true).write(true).open(path)
+    }
+
     fn lock(file: &File, exclusive: bool, blocking: bool) -> io::Result<()> {
-        let l_type = if exclusive { libc::F_WRLCK } else { libc::F_RDLCK };
-        let cmd = if blocking { libc::F_SETLKW } else { libc::F_SETLK };
-        let fl = Flock {
-            l_start: super::LOCK_OFFSET as libc::off_t,
-            l_len: 1,
-            l_pid: 0,
-            l_type,
-            l_whence: libc::SEEK_SET as libc::c_short,
-        };
-        let rc = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &fl) };
+        let mut op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        if !blocking { op |= libc::LOCK_NB; }
+        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
         if rc == -1 {
             Err(io::Error::last_os_error())
         } else {
@@ -67,16 +66,7 @@ impl LockFile {
     }
 
     fn unlock(file: &File) {
-        let fl = Flock {
-            l_start: super::LOCK_OFFSET as libc::off_t,
-            l_len: 1,
-            l_pid: 0,
-            l_type: libc::F_UNLCK,
-            l_whence: libc::SEEK_SET as libc::c_short,
-        };
-        unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &fl);
-        }
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN); }
     }
 
     pub fn acquire_exclusive(path: &Path) -> io::Result<LockFile> {
@@ -93,6 +83,12 @@ impl LockFile {
 
     pub fn acquire_shared(path: &Path) -> io::Result<LockFile> {
         let file = Self::open(path)?;
+        Self::lock(&file, false, true)?;
+        Ok(LockFile { file })
+    }
+
+    pub fn acquire_shared_existing(path: &Path) -> io::Result<LockFile> {
+        let file = Self::open_existing(path)?;
         Self::lock(&file, false, true)?;
         Ok(LockFile { file })
     }

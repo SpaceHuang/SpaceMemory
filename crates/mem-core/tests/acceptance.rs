@@ -141,7 +141,6 @@ fn set_mtime(path: &std::path::Path, epoch_secs: u64) {
 fn set_mtime_to(path: &std::path::Path, t: std::time::SystemTime) {
     #[cfg(unix)]
     {
-        use std::os::unix::time::SystemTimeExt;
         // unix: filetime crate 未引入——用 libc utimes 的最小封装。
         let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         unsafe {

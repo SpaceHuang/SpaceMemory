@@ -41,6 +41,8 @@ pub struct RefRow {
 
 pub struct Index {
     pub(crate) conn: Connection,
+    // declared after conn so SQLite closes before the cross-process snapshot lock releases
+    _snapshot_lock: mem_core::platform::LockFile,
 }
 
 /// r10 B7-2：payload 折叠列内容——**逐值独立 fold** 后以 LF 连接。
@@ -49,7 +51,7 @@ pub struct Index {
 pub fn payload_values_folded(payload: &serde_json::Value) -> String {
     fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
-            serde_json::Value::String(s) => out.push(mem_core::paths::fold(s)),
+            serde_json::Value::String(s) => out.push(index_safe(&mem_core::paths::fold(s))),
             serde_json::Value::Number(n) => out.push(n.to_string()),
             serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
             serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
@@ -59,6 +61,36 @@ pub fn payload_values_folded(payload: &serde_json::Value) -> String {
     let mut parts = Vec::new();
     walk(payload, &mut parts);
     parts.join("\n")
+}
+
+pub(crate) fn index_safe(s: &str) -> String {
+    s.replace('\u{e000}', "\u{e000}\u{e001}").replace('\0', "\u{e000}\u{e002}")
+}
+
+fn snapshot_lock_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn sqlite_uri_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+    let mut encoded = String::with_capacity(bytes.len());
+    for b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{b:02X}");
+        }
+    }
+    encoded
 }
 
 /// FTS 索引文本：机械递归提取 payload 的**字符串值**（键名不进索引——否则
@@ -96,10 +128,13 @@ impl Index {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
         }
+        let lock_path = snapshot_lock_path(path);
+        let snapshot_lock = mem_core::platform::LockFile::acquire_exclusive(&lock_path)
+            .map_err(|e| MemError::io(lock_path.display().to_string(), e))?;
         let conn = Connection::open(path)
             .map_err(|e| MemError::Corrupt { path: path.display().to_string(), reason: e.to_string() })?;
         Self::init_schema(&conn)?;
-        Ok(Index { conn })
+        Ok(Index { conn, _snapshot_lock: snapshot_lock })
     }
 
     /// r4 B2：**只读**打开已存在的索引——文件缺失/schema 不符 → Err（调用方直读）。
@@ -110,9 +145,15 @@ impl Index {
         if !path.is_file() {
             return Err(MemError::MissingRecord { id_or_path: path.display().to_string() });
         }
+        let lock_path = snapshot_lock_path(path);
+        let snapshot_lock = mem_core::platform::LockFile::acquire_shared_existing(&lock_path)
+            .map_err(|e| MemError::io(lock_path.display().to_string(), e))?;
+        // immutable 只读 URI 禁止 SQLite 建立 -wal/-shm。该连接只用于派生索引，
+        // 其结果仍受 open_proved 新鲜性证明约束；失败/无法证明时执行器直读。
+        let uri = format!("file:{}?immutable=1", sqlite_uri_path(path));
         let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(|e| MemError::Corrupt { path: path.display().to_string(), reason: e.to_string() })?;
         // schema 存在性核对（只读查询；缺表/缺列 = 物化未完成/旧代索引 → Err 直读）。
@@ -136,7 +177,7 @@ impl Index {
                 reason: "索引 schema 不完整或为旧代（bad_records 缺表 = 告警通道缺席，物化未完成/异物文件）".into(),
             });
         }
-        Ok(Index { conn })
+        Ok(Index { conn, _snapshot_lock: snapshot_lock })
     }
 
     fn init_schema(conn: &Connection) -> MemResult<()> {
@@ -192,12 +233,14 @@ impl Index {
 
     /// 打开店索引（维护路径，index/index.sqlite）。
     pub fn open_store(store: &Store) -> MemResult<Index> {
-        Self::open(&store.abs("index/index.sqlite"))
+        let path = validate_store_index_paths(store)?;
+        Self::open(&path)
     }
 
     /// 打开店索引（读路径，只读；缺失/不完整 → Err → 调用方直读）。
     pub fn open_store_readonly(store: &Store) -> MemResult<Index> {
-        Self::open_readonly(&store.abs("index/index.sqlite"))
+        let path = validate_store_index_paths(store)?;
+        Self::open_readonly(&path)
     }
 
     /// 物化代际（r4 B2）：每次 rebuild 递增；检查点发布时记录该值，读路径核对
@@ -280,14 +323,14 @@ impl Index {
             // "无正文检索素材"；粗筛超集性质保证新旧索引行为等价，真值由
             // record_matches 精筛裁定）。废除有损解码入素材列。
             let body_folded = mem_core::body::text_or_none(&s.record.body)
-                .map(mem_core::paths::fold)
+                .map(|s| index_safe(&mem_core::paths::fold(s)))
                 .unwrap_or_default();
             let aliases_folded = s
                 .record
                 .envelope
                 .aliases
                 .iter()
-                .map(|a| mem_core::paths::fold(a))
+                .map(|a| index_safe(&mem_core::paths::fold(a)))
                 .collect::<Vec<_>>()
                 .join("
 ");
@@ -374,6 +417,8 @@ impl Index {
                 [mem_core::clock::now_rfc3339()],
             )
             .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
         let _ = scan.warnings;
         Ok((n_records, n_refs, entries))
     }
@@ -413,13 +458,13 @@ impl Index {
             // ——LF 分隔符保证 LIKE 子串匹配不会跨值/跨别名产生假命中
             // （此前空格连接：值 "ab"+"cd" 拼出 "abcd"，查询 "bc" 误命中）。
             let payload_folded = payload_values_folded(&s.record.payload);
-            let body_folded = mem_core::paths::fold(&body);
+            let body_folded = index_safe(&mem_core::paths::fold(&body));
             let aliases_folded = s
                 .record
                 .envelope
                 .aliases
                 .iter()
-                .map(|a| mem_core::paths::fold(a))
+                .map(|a| index_safe(&mem_core::paths::fold(a)))
                 .collect::<Vec<_>>()
                 .join("\n");
             self.conn
@@ -432,6 +477,8 @@ impl Index {
                 )
                 .map_err(sq_err)?;
         }
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
         Ok(())
     }
 
@@ -545,6 +592,14 @@ impl Index {
         }
         Ok(out)
     }
+}
+
+/// 店级入口拥有 Store 边界，必须在通用路径 API 创建目录、打开 snapshot 锁或 SQLite
+/// 之前检查数据库及锁文件。通用 `open(Path)` 继续服务于显式独立数据库调用方。
+fn validate_store_index_paths(store: &Store) -> MemResult<std::path::PathBuf> {
+    mem_core::paths::validate_store_relative_path(store, "index/index.sqlite")?;
+    mem_core::paths::validate_store_relative_path(store, "index/index.sqlite.lock")?;
+    Ok(store.abs("index/index.sqlite"))
 }
 
 fn row_to_index(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {

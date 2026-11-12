@@ -104,6 +104,7 @@ pub fn scan_all(store: &Store) -> MemResult<ScanResult> {
 /// 按 id / 别名 / 路径 解析记录（读路径；存在性含 attic 的读取通道）。
 pub fn get(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
     if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") {
+        paths::validate_store_record_path(store, id_or_path)?;
         // r4 H1：**单次读取**同时派生 Record 与 Token——两次磁盘读取会把"版本 A
         // 的内容 + 版本 B 的令牌"拼在一起，调用方按 A 构造更新却携 B 令牌会绕过
         // CAS 语义覆盖 B。
@@ -144,6 +145,24 @@ pub fn get(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
         }
     }
     Err(MemError::MissingRecord { id_or_path: id_or_path.into() })
+}
+
+#[cfg(test)]
+mod r15_path_tests {
+    use crate::paths::validate_store_record_path;
+
+    #[test]
+    fn store_record_paths_reject_parent_and_non_normal_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        crate::store::Store::create(&root).unwrap();
+        let store = crate::store::Store::open(&root, crate::store::OpenMode::Auto).unwrap();
+        for p in ["records/../../outside.md", "attic/a/../outside.md", "records//../x.md"] {
+            assert!(validate_store_record_path(&store, p).is_err(), "must reject {p}");
+        }
+        assert!(validate_store_record_path(&store, "records/task/a.md").is_ok());
+        assert!(validate_store_record_path(&store, "attic/task/a.md").is_ok());
+    }
 }
 
 // ---------- add ----------
@@ -295,6 +314,9 @@ fn validate_payload_and_refs(
 pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     ctx.store.check_writable()?;
     crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
+    // 引用/principal 存在性必须与发布处于同一共享屏障内；否则独占删除可在
+    // 校验后、发布前移走目标，留下悬空引用。
+    let _barrier = lock::barrier_shared(ctx.store)?;
     let decl = ctx
         .types
         .get(&args.type_name)
@@ -303,6 +325,7 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     let comps = key_components(decl, &args.payload)?;
     let id = new_uuid_v7();
     let rel = paths::derive_record_rel(&args.type_name, &comps, &id)?;
+    paths::validate_store_record_path(ctx.store, &rel)?;
     let now = crate::clock::now_rfc3339();
     let envelope = Envelope {
         id: id.clone(),
@@ -323,7 +346,6 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     };
     let bytes = record::serialize_new(&envelope, &args.payload, &args.body);
 
-    let _barrier = lock::barrier_shared(ctx.store)?;
     let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
     // 唯一性强制点：路径原子独占（不在索引，红线8）。
     let target = ctx.store.abs(&rel);
@@ -606,7 +628,8 @@ pub fn delete_record(
     force: bool,
 ) -> MemResult<Deleted> {
     ctx.store.check_writable()?;
-    let _barrier = lock::barrier_shared(ctx.store)?;
+    // 反向引用检查必须与所有引用写入互斥，否则检查后可并发新增悬空引用。
+    let _barrier = lock::barrier_exclusive(ctx.store)?;
     delete_locked(ctx, id_or_path, expect, force)
 }
 
@@ -640,6 +663,7 @@ pub fn delete_locked(
         ));
     }
     let attic_rel = paths::attic_rel(&cur.rel)?;
+    paths::validate_store_record_path(ctx.store, &attic_rel)?;
     let _rec = lock::record_lock(ctx.store, &cur.rel, std::time::Duration::from_secs(30))?;
     let (fresh, bytes) = read_fresh(ctx.store, &cur.rel)?;
     let current = token::for_bytes(fresh.envelope.version, &bytes);
@@ -648,7 +672,7 @@ pub fn delete_locked(
     let attic_abs = ctx.store.abs(&attic_rel);
     std::fs::create_dir_all(attic_abs.parent().unwrap())
         .map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
-    std::fs::rename(ctx.store.abs(&cur.rel), &attic_abs)
+    crate::platform::rename_noreplace(&ctx.store.abs(&cur.rel), &attic_abs)
         .map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
     let log = EventLog::new(ctx.store);
     log.append_simple(
@@ -696,6 +720,7 @@ pub fn restore_locked(
         return Err(MemError::BadArgument("记录不在 attic（非受管删除）".into()));
     }
     let records_rel = paths::records_rel(&tomb.rel)?;
+    paths::validate_store_record_path(ctx.store, &records_rel)?;
     // 同规范路径锁：restore 与缺失记录回填/重建互斥（红线24）。
     let _rec = lock::record_lock(ctx.store, &records_rel, std::time::Duration::from_secs(30))?;
     if ctx.store.abs(&records_rel).is_file() {
@@ -859,6 +884,16 @@ pub fn merge_locked(
     if dup.record.envelope.id == canonical.record.envelope.id {
         return Err(MemError::BadArgument("不能与自身 merge".into()));
     }
+    // 预先检查确定性 tombstone 冲突，避免之后已经重挂引用/改 canonical 才失败。
+    // 末尾 rename_noreplace 仍保留，防范屏障外部写入或文件系统错误。
+    let dup_attic_preflight = paths::attic_rel(&dup.rel)?;
+    paths::validate_store_record_path(ctx.store, &dup_attic_preflight)?;
+    if std::fs::symlink_metadata(ctx.store.abs(&dup_attic_preflight)).is_ok() {
+        return Err(MemError::io(
+            dup_attic_preflight.clone(),
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "tombstone 目标已存在"),
+        ));
+    }
     let mut rels = vec![dup.rel.clone(), canonical.rel.clone()];
     rels.sort();
     let _l1 = lock::record_lock(ctx.store, &rels[0], std::time::Duration::from_secs(30))?;
@@ -1007,7 +1042,7 @@ pub fn merge_locked(
     let attic_abs = ctx.store.abs(&dup_attic);
     std::fs::create_dir_all(attic_abs.parent().unwrap())
         .map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
-    std::fs::rename(ctx.store.abs(&dup.rel), &attic_abs)
+    crate::platform::rename_noreplace(&ctx.store.abs(&dup.rel), &attic_abs)
         .map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
     log.append_simple(
         &fresh_dup.envelope.id,
@@ -1077,9 +1112,12 @@ pub fn fix_record(
     // H1：定位（只读解析路径；真正的内容读取全部在锁内）。
     let rel = match get(store, id_or_path) {
         Ok(hit) => hit.rel,
-        Err(_) if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") => {
+        Err(MemError::MissingRecord { .. } | MemError::Corrupt { .. })
+            if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") => {
+            paths::validate_store_record_path(store, id_or_path)?;
             id_or_path.to_string()
         }
+        Err(e @ MemError::BadArgument(_)) => return Err(e),
         Err(_) => {
             let log = EventLog::new(store).read_log()?;
             log.events
@@ -1090,6 +1128,7 @@ pub fn fix_record(
                 .ok_or_else(|| MemError::MissingRecord { id_or_path: id_or_path.into() })?
         }
     };
+    paths::validate_store_record_path(store, &rel)?;
     let _barrier = lock::barrier_shared(store)?;
     let _rec = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     // H1：锁内读——并发窗口内的 update 成果不会被 fix 的旧字节覆盖。

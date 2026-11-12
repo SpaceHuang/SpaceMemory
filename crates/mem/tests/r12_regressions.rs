@@ -17,11 +17,13 @@ fn mem() -> Command {
     Command::cargo_bin("mem").expect("mem 二进制")
 }
 
+#[cfg(windows)]
 fn j(out: &std::process::Output) -> Value {
     serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("输出不是 JSON：{e}\n{}", String::from_utf8_lossy(&out.stdout)))
 }
 
+#[cfg(windows)]
 fn wait_until(mut cond: impl FnMut() -> bool, tries: usize, ms: u64) -> bool {
     for _ in 0..tries {
         if cond() {
@@ -58,6 +60,7 @@ fn seed_memory(dir: &std::path::Path, id_tail: &str, aliases: Vec<&str>, title: 
 }
 
 #[test]
+#[cfg(windows)]
 fn r12_literal_lf_and_backslash_direct_indexed_equal() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");

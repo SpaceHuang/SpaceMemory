@@ -11,6 +11,108 @@
 //! 作用于查找解析层（D11 / 红线11）。
 
 use crate::error::{MemError, MemResult};
+use crate::store::Store;
+
+/// 校验 records/ 或 attic/ 下的实际文件路径仍落在所选店目录中。
+///
+/// 词法路径检查阻止 `..`；逐组件拒绝符号链接/重解析点，避免静态链接把目标或
+/// 锁文件引到店外；最后以 canonicalize 的最近存在祖先再次确认实际落点。
+pub fn validate_store_record_path(store: &Store, rel: &str) -> MemResult<()> {
+    let mut parts = std::path::Path::new(rel).components();
+    let expected = if rel.starts_with("records/") { "records" } else if rel.starts_with("attic/") {
+        "attic"
+    } else {
+        return Err(MemError::BadArgument(format!("记录路径非法：{rel}")));
+    };
+    if !matches!(parts.next(), Some(std::path::Component::Normal(p)) if p == expected)
+        || parts.clone().count() == 0
+        || parts.any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(MemError::BadArgument(format!("记录路径非法：{rel}")));
+    }
+
+    validate_store_relative_path(store, rel)?;
+    Ok(())
+}
+
+/// 校验任意 store 内部资源路径。锁文件也用此函数，因此 sessions/ 等机制锁
+/// 仍可使用，但不能经过符号链接/重解析点离开店目录。
+pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
+    let components: Vec<_> = std::path::Path::new(rel).components().collect();
+    if components.is_empty()
+        || components.iter().any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(MemError::BadArgument(format!("店内路径非法：{rel}")));
+    }
+    let root = std::fs::canonicalize(store.root())
+        .map_err(|_| MemError::BadArgument(format!("无法确认路径位于店内：{rel}")))?;
+    let mut current = store.root().to_path_buf();
+    for component in &components {
+        let std::path::Component::Normal(part) = component else { unreachable!() };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if is_link_or_reparse_point(&metadata) => {
+                return Err(MemError::BadArgument(format!("店内路径不能经过符号链接：{rel}")));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(MemError::io(current.display().to_string(), e)),
+        }
+    }
+    let target = store.abs(rel);
+    let mut ancestor = target.as_path();
+    let canonical_target = loop {
+        if let Ok(path) = std::fs::canonicalize(ancestor) {
+            break path;
+        }
+        ancestor = ancestor.parent().ok_or_else(|| {
+            MemError::BadArgument(format!("无法确认路径位于店内：{rel}"))
+        })?;
+    };
+    if !canonical_target.starts_with(&root) {
+        return Err(MemError::BadArgument(format!("路径越出店目录：{rel}")));
+    }
+    Ok(())
+}
+
+/// 校验 store 根目录中的机制锁文件；只允许列明的固定文件名。
+pub fn validate_store_root_lock(store: &Store, rel: &str) -> MemResult<()> {
+    if !matches!(rel, "barrier.lock" | "events.lock" | "serve.lock") {
+        return Err(MemError::BadArgument(format!("机制锁路径非法：{rel}")));
+    }
+    let root = std::fs::canonicalize(store.root())
+        .map_err(|_| MemError::BadArgument(format!("无法确认锁文件位于店内：{rel}")))?;
+    let target = store.abs(rel);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if is_link_or_reparse_point(&metadata) => {
+            return Err(MemError::BadArgument(format!("锁文件不能是符号链接：{rel}")));
+        }
+        Ok(_) => {
+            let canonical = std::fs::canonicalize(&target)
+                .map_err(|e| MemError::io(target.display().to_string(), e))?;
+            if !canonical.starts_with(&root) {
+                return Err(MemError::BadArgument(format!("锁文件越出店目录：{rel}")));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(MemError::io(target.display().to_string(), e)),
+    }
+    Ok(())
+}
+
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
 
 /// 店级保留名（envelope-format.md §1.2；大小写折叠后精确匹配）。
 const RESERVED: &[&str] = &[

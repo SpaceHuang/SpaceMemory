@@ -56,17 +56,11 @@ pub fn scan_current_drift(store: &Store, limit: usize) -> MemResult<DriftScan> {
         let last_state = last.map(event::triple_from_event);
         let last_path = last.map(|e| e.path.clone()).unwrap_or_else(|| c.lock_rel.clone());
         // 损坏记录：verify 域，不进漂移（R6.2 隔离）。
-        let cur = match event::current_state(store, &c.lock_rel) {
+        let cur = match event::current_state_for_id(store, &c.lock_rel, Some(&c.id)) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let cur_path = if store.abs(&c.lock_rel).is_file() {
-            Some(c.lock_rel.clone())
-        } else if store.abs(crate::paths::attic_rel(&c.lock_rel)?).is_file() {
-            Some(crate::paths::attic_rel(&c.lock_rel)?)
-        } else {
-            None
-        };
+        let cur_path = event::current_path_for_id(store, &c.lock_rel, &c.id)?;
         // 稳定态判定与回填一致：absent==absent 不比路径；present 路径变化 = 漂移。
         let equal = match &last_state {
             None => cur == event::StateTriple::ABSENT,

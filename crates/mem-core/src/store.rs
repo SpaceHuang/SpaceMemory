@@ -225,6 +225,7 @@ impl Store {
 /// M6a 归档裁决（v1.2 评审）：Store::open 的探针写在 `.tmp/`（运行时区，规范
 /// §1.1 明示无规范意义）——不违反红线18；替代方案（ACL 查询）跨平台不可靠。
 fn probe_writable(root: &Path) -> bool {
+    static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = root.join(".tmp");
     if !tmp.is_dir() {
         // .tmp 无法创建 → 只读（或损坏；两者都按只读降级，写类操作拒绝）。
@@ -233,12 +234,13 @@ fn probe_writable(root: &Path) -> bool {
         }
     }
     let probe = tmp.join(format!(
-        ".probe-{}-{}",
+        ".probe-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     match std::fs::OpenOptions::new()
         .write(true)

@@ -226,6 +226,7 @@ fn cli_find_paging_and_type_narrow_kept() {
 /// 数值过滤精确等值（实施评审 B1 回归）：>2^53 的整数×浮点不互认；同一实数的
 /// 整数/浮点表示互认；direct 与 indexed 生产路径命中一致。
 #[test]
+#[cfg(windows)]
 fn cli_number_filter_exact_beyond_f64_safe_range() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
@@ -281,6 +282,7 @@ fn cli_number_filter_exact_beyond_f64_safe_range() {
     serve.kill().ok();
 }
 
+#[cfg(windows)]
 fn wait_for(dir: &std::path::Path) -> bool {
     for _ in 0..50 {
         if dir.join("index/index.sqlite").is_file() {
@@ -293,6 +295,7 @@ fn wait_for(dir: &std::path::Path) -> bool {
 }
 
 /// 轮询直到读命令的 read_mode 达到期望（indexed/direct）。
+#[cfg(windows)]
 fn wait_until_mode(s: &str, mode: &str, tries: usize, ms: u64) -> bool {
     for _ in 0..tries {
         let v = {
