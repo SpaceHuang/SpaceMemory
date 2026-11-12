@@ -6,12 +6,18 @@
 mod cli;
 mod commands;
 mod mcp;
+mod mcp_install;
 mod serve;
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
-        Some("serve") => serve::run(),
-        Some("mcp") => mcp::run(),
+    let mut args = std::env::args();
+    let first = args.nth(1);
+    let second = args.next();
+    match (first.as_deref(), second.as_deref()) {
+        (Some("serve"), _) => serve::run(),
+        (Some("mcp"), None) => mcp::run(),
+        (Some("mcp"), Some("--help" | "-h" | "help")) => mcp_install::print_help(),
+        (Some("mcp"), Some(_)) => cli::run(),
         _ => cli::run(),
     }
 }

@@ -212,6 +212,24 @@ pub enum Cmd {
         #[arg(long)]
         source: String,
     },
+    /// 安装 SpaceMemory MCP，或输出通用 Agent 安装引导
+    Mcp {
+        #[command(subcommand)]
+        sub: Option<McpCmd>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum McpCmd {
+    /// 将本机 SpaceMemory MCP 注册到支持的 Agent
+    Install {
+        /// 目标 Agent；省略时输出不绑定宿主的引导
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        client: Option<String>,
+        /// 只展示安装计划，不写配置
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -237,6 +255,22 @@ pub enum SessionCmd {
 
 pub fn run() {
     let cli = Cli::parse();
+    if let Cmd::Mcp { sub } = &cli.cmd {
+        let result = match sub {
+            Some(McpCmd::Install { client, dry_run }) => {
+                crate::mcp_install::run(true, client.as_deref(), *dry_run)
+            }
+            None => {
+                crate::mcp_install::print_help();
+                Ok(())
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match commands::dispatch(&cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {

@@ -219,6 +219,7 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     cmd_restore_body(&store, &types, id, expect, source)?;
                     Ok(0)
                 }
+                Cmd::Mcp { .. } => unreachable!("MCP 安装入口由 CLI 启动层处理"),
             }
         }
     }
