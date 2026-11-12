@@ -35,6 +35,14 @@ fn to_wide(p: &Path) -> Vec<u16> {
     v
 }
 
+/// 目标必须不存在时原子改名（不传 REPLACE_EXISTING）。
+pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+    let from = to_wide(source);
+    let to = to_wide(target);
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 /// 文件字节范围锁句柄（Drop 即解锁+关闭）。
 ///
 /// Windows 锁按**句柄**：同进程两个句柄同样互斥（多线程并发安全的底座）。
@@ -85,6 +93,10 @@ impl LockFile {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn open_existing_locked(path: &Path) -> io::Result<File> {
+        OpenOptions::new().read(true).write(true).open(path)
     }
 
     fn lock(file: &File, exclusive: bool, fail_immediately: bool) -> io::Result<()> {
@@ -141,6 +153,12 @@ impl LockFile {
 
     pub fn acquire_shared(path: &Path) -> io::Result<LockFile> {
         let file = Self::open_locked(path, true)?;
+        Self::lock(&file, false, false)?;
+        Ok(LockFile { file })
+    }
+
+    pub fn acquire_shared_existing(path: &Path) -> io::Result<LockFile> {
+        let file = Self::open_existing_locked(path)?;
         Self::lock(&file, false, false)?;
         Ok(LockFile { file })
     }

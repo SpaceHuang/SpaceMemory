@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! R10 验收面补齐（TDD-5；keyword-search-design.md §4.1/§4.2——既有测试未覆盖的
 //! indexed 侧与四面对账）：
 //! - 验收 2/5/6/7：indexed 与 direct 逐 ID 等价（多词项与四类记录、与位排除）、
@@ -144,6 +146,7 @@ fn mcp_find(s: &str, query: &str, filter: Option<(&str, &str)>) -> Value {
 // ---------- 验收 2/5/6/7/8/9：两执行器 × 两前端对账 ----------
 
 #[test]
+#[cfg(windows)]
 fn r10_executor_and_frontend_equivalence_matrix() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
@@ -266,6 +269,7 @@ fn r10_executor_and_frontend_equivalence_matrix() {
 // ---------- 验收 10：indexed 告警承接与新鲜性 ----------
 
 #[test]
+#[cfg(windows)]
 fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
@@ -331,6 +335,7 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
 
 /// 201 条坏记录：告警上限 = list_limit_max（200），rel 升序截断，双路径同序同子集。
 #[test]
+#[cfg(windows)]
 fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
@@ -371,6 +376,7 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
 /// 因"扫描后新增文件被检查点提前确认"而漏——direct（stat 失配）必命中；收敛回
 /// indexed 后（下一次物化将其入扫描）仍命中且 read_mode=indexed。CLI 与 MCP 各验。
 #[test]
+#[cfg(windows)]
 fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");

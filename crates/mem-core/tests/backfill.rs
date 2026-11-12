@@ -510,6 +510,51 @@ fn diff_since_separates_log_filter_and_drift() {
 }
 
 #[test]
+fn r16_reused_path_keeps_drift_identity_with_original_tombstone() {
+    let (_t, store) = fresh_store();
+    let rel = "records/task/p/reused.md";
+    hand_write(&store, rel, "id-a", "task", 1, "A");
+    event::reconcile_backfill(&store, "t", None).unwrap();
+    let attic = mem_core::paths::attic_rel(rel).unwrap();
+    std::fs::create_dir_all(store.abs(&attic).parent().unwrap()).unwrap();
+    std::fs::rename(store.abs(rel), store.abs(&attic)).unwrap();
+    event::reconcile_backfill(&store, "t", None).unwrap();
+    hand_write(&store, rel, "id-b", "task", 1, "B");
+    event::reconcile_backfill(&store, "t", None).unwrap();
+
+    let before = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
+    assert!(before.current_drift.items.is_empty(), "A 已在 attic，B 已登记，均应稳定");
+    let report = event::reconcile_backfill(&store, "t", None).unwrap();
+    assert!(report.appended.is_empty());
+    let after = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
+    assert!(after.current_drift.items.is_empty());
+
+    let rewrite = |path: &str, body: &[u8]| {
+        let old = std::fs::read(store.abs(path)).unwrap();
+        let rec = mem_core::record::Record::from_bytes(&old).unwrap();
+        let bytes = mem_core::record::serialize_new(&rec.envelope, &rec.payload, body);
+        std::fs::write(store.abs(path), &bytes).unwrap();
+        bytes
+    };
+    let a_bytes = rewrite(&attic, b"A changed");
+    let drift_a = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
+    assert_eq!(drift_a.current_drift.items.len(), 1);
+    assert_eq!(drift_a.current_drift.items[0].id, "id-a");
+    assert_eq!(drift_a.current_drift.items[0].cur_path.as_deref(), Some(attic.as_str()));
+    assert_eq!(drift_a.current_drift.items[0].token.as_ref().unwrap().digest,
+        mem_core::token::sha256_hex(&a_bytes));
+    event::reconcile_backfill(&store, "t", None).unwrap();
+
+    let b_bytes = rewrite(rel, b"B changed");
+    let drift_b = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
+    assert_eq!(drift_b.current_drift.items.len(), 1);
+    assert_eq!(drift_b.current_drift.items[0].id, "id-b");
+    assert_eq!(drift_b.current_drift.items[0].cur_path.as_deref(), Some(rel));
+    assert_eq!(drift_b.current_drift.items[0].token.as_ref().unwrap().digest,
+        mem_core::token::sha256_hex(&b_bytes));
+}
+
+#[test]
 fn diff_works_without_git() {
     // 与 git 完全无关（红线10/26）：目录里没有 .git。
     let (_t, store) = fresh_store();

@@ -159,9 +159,31 @@ fn readonly_open_never_creates_and_epoch_advances() {
     let store = fake_store(tmp.path());
     let mut idx = mem_index::Index::open(&path).unwrap();
     idx.rebuild(&store).unwrap();
+    drop(idx);
+    let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(path.parent().unwrap()).unwrap()
+        .map(|e| { let p = e.unwrap().path(); (p.file_name().unwrap().to_os_string(), std::fs::read(p).unwrap()) })
+        .collect();
     let ro = mem_index::Index::open_readonly(&path).expect("建库后只读打开成功");
     let e1 = ro.epoch().unwrap();
+    assert!(!path.with_extension("sqlite-wal").exists());
+    assert!(!path.with_extension("sqlite-shm").exists());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let _idx = mem_index::Index::open(&writer_path).unwrap();
+        tx.send(()).unwrap();
+    });
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(80)).is_err(), "只读快照存活时维护写入须等待");
+    drop(ro);
+    rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    writer.join().unwrap();
+    let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(path.parent().unwrap()).unwrap()
+        .map(|e| { let p = e.unwrap().path(); (p.file_name().unwrap().to_os_string(), std::fs::read(p).unwrap()) })
+        .collect();
+    assert_eq!(before, after, "只读打开期间索引目录文件与内容不变");
+    let mut idx = mem_index::Index::open(&path).unwrap();
     idx.rebuild(&store).unwrap();
+    drop(idx);
     let ro2 = mem_index::Index::open_readonly(&path).unwrap();
     let e2 = ro2.epoch().unwrap();
     assert_eq!(e2, e1 + 1, "epoch 随 rebuild 严格递增（{e1} → {e2}）");

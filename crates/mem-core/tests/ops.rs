@@ -437,6 +437,253 @@ fn delete_blocked_by_reverse_refs_then_force_to_attic_and_restore() {
     assert_eq!(last2.op, Op::Restore);
 }
 
+#[test]
+fn r15_reused_record_key_never_overwrites_older_tombstone() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let first = add_task(&store, &types, "r15-reuse");
+    let first_id = first.record.envelope.id.clone();
+    ops::delete_record(&c, &first_id, &first.token, false).unwrap();
+    let attic = "attic/task/0198f7a9-0000-7cd2-9e3f-000000000001/r15-reuse.md";
+    let preserved = std::fs::read(store.abs(attic)).unwrap();
+    let second = add_task(&store, &types, "r15-reuse");
+    assert_ne!(first_id, second.record.envelope.id);
+    let err = ops::delete_record(&c, &second.record.envelope.id, &second.token, false).unwrap_err();
+    assert!(err.to_string().contains("File exists") || err.to_string().contains("already exists") || err.to_string().contains("已存在"), "{err}");
+    assert_eq!(std::fs::read(store.abs(attic)).unwrap(), preserved);
+    assert_eq!(mem_core::record::Record::from_bytes(&preserved).unwrap().envelope.id, first_id);
+}
+
+#[test]
+fn r15_merge_never_overwrites_an_existing_different_tombstone() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let old = add_task(&store, &types, "r15-merge-reuse");
+    let attic = "attic/task/0198f7a9-0000-7cd2-9e3f-000000000001/r15-merge-reuse.md";
+    ops::delete_record(&c, &old.record.envelope.id, &old.token, false).unwrap();
+    let preserved = std::fs::read(store.abs(attic)).unwrap();
+    let dup = add_task(&store, &types, "r15-merge-reuse");
+    let canonical = add_task(&store, &types, "r15-merge-canonical");
+    let dependent = ops::add(&c, AddArgs {
+        type_name: "memory".into(),
+        payload: serde_json::json!({"title": "points to dup"}),
+        body: b"dependent".to_vec(),
+        principal: None,
+    }).unwrap();
+    // 构造已存在的引用边，专门验证 merge 失败时第三方文件不被提前重写。
+    let mut dep_rec = ops::get(&store, &dependent.record.envelope.id).unwrap().record;
+    dep_rec.envelope.refs.push(mem_core::envelope::Ref {
+        rel: "test_ref".into(), target: dup.record.envelope.id.clone(),
+    });
+    let dep_bytes = mem_core::record::serialize_new(&dep_rec.envelope, &dep_rec.payload, &dep_rec.body);
+    std::fs::write(store.abs(&dependent.rel), &dep_bytes).unwrap();
+    let before_canonical = std::fs::read(store.abs(&canonical.rel)).unwrap();
+    let before_dependent = std::fs::read(store.abs(&dependent.rel)).unwrap();
+    let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let err = ops::merge(&c, &dup.record.envelope.id, &canonical.record.envelope.id, &dup.token, &canonical.token).unwrap_err();
+    assert!(err.to_string().contains("File exists") || err.to_string().contains("already exists") || err.to_string().contains("已存在"), "{err}");
+    assert_eq!(std::fs::read(store.abs(attic)).unwrap(), preserved);
+    assert!(store.abs(&dup.rel).is_file(), "冲突时 dup 原记录必须仍在 records");
+    assert_eq!(std::fs::read(store.abs(&canonical.rel)).unwrap(), before_canonical);
+    assert_eq!(std::fs::read(store.abs(&dependent.rel)).unwrap(), before_dependent);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+}
+
+#[test]
+fn r16_add_revalidates_reference_after_waiting_for_shared_barrier() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let target_id = "0198f7a9-0000-7cd2-9e3f-000000000001".to_string();
+    let target = ops::get(&store, &target_id).unwrap();
+    let gate = mem_core::lock::barrier_exclusive(&store).unwrap();
+    let root = store.root().to_path_buf();
+    let id = target_id.clone();
+    let token = target.token.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = std::thread::spawn(move || {
+        let store2 = Store::open(&root, OpenMode::Auto).unwrap();
+        let types2 = TypeSet::load_dir(&root.join("types")).unwrap();
+        let c2 = ctx(&store2, &types2);
+        tx.send(()).unwrap();
+        ops::add(&c2, AddArgs {
+            type_name: "task".into(),
+            payload: task_payload(&id, "r16-reference-race", "todo"),
+            body: b"race".to_vec(),
+            principal: None,
+        })
+    });
+    rx.recv().unwrap();
+    // 在创建方等待共享门闩期间完成删除；之后创建方必须在门闩内重新校验引用。
+    ops::delete_locked(&c, &target_id, &token, false).unwrap();
+    drop(gate);
+    let err = creator.join().unwrap().unwrap_err();
+    assert!(matches!(err, MemError::RefTargetMissing { .. }), "创建必须拒绝已删除目标：{err}");
+    assert!(!ops::scan_all(&store).unwrap().records.iter()
+        .any(|r| r.record.envelope.aliases.iter().any(|a| a == "r16-reference-race")));
+}
+
+#[test]
+fn r16_fix_rejects_lexical_escape_without_touching_outside_record() {
+    let (_t, store, types) = fresh_store();
+    let outside = store.root().parent().unwrap().join("outside-fix-r16.md");
+    let env = mem_core::envelope::Envelope {
+        id: "outside-r16".into(), r#type: "memory".into(),
+        created: "2026-11-12T00:00:00Z".into(), modified: "2026-11-12T00:00:00Z".into(),
+        version: 1, principal: None, refs: vec![], aliases: vec![], evidence_cutoff_seq: None,
+        commit: None, extra: Default::default(),
+    };
+    let bytes = mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"body");
+    std::fs::write(&outside, &bytes).unwrap();
+    let err = ops::fix_record(&store, &types, "records/../../outside-fix-r16.md", None,
+        None, None, None).unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "路径拒绝必须原样返回：{err}");
+    assert_eq!(std::fs::read(&outside).unwrap(), bytes);
+    assert!(!outside.with_file_name("outside-fix-r16.md.lock").exists());
+    std::fs::remove_file(outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn r16_record_path_rejects_symlink_escape() {
+    let (_t, store, _types) = fresh_store();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.md");
+    let env = mem_core::envelope::Envelope {
+        id: "0198f7a9-0000-7cd2-9e3f-000000000099".into(), r#type: "memory".into(),
+        created: "2026-11-12T00:00:00Z".into(), modified: "2026-11-12T00:00:00Z".into(),
+        version: 1, principal: None, refs: vec![], aliases: vec!["outside-alias".into()],
+        evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+    };
+    let bytes = mem_core::record::serialize_new(&env, &serde_json::json!({"title":"outside"}), b"sentinel");
+    std::fs::write(&outside, &bytes).unwrap();
+    std::os::unix::fs::symlink(outside_dir.path(), store.abs("records/escape")).unwrap();
+    let err = ops::get(&store, "records/escape/outside.md").unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "符号链接越界应拒绝：{err}");
+    assert!(matches!(ops::get(&store, &env.id), Err(MemError::MissingRecord { .. })));
+    assert!(matches!(ops::get(&store, "outside-alias"), Err(MemError::MissingRecord { .. })));
+    assert_eq!(std::fs::read(outside).unwrap(), bytes);
+}
+
+#[cfg(unix)]
+fn add_memory(store: &Store, types: &TypeSet, title: &str) -> ops::Added {
+    ops::add(&ctx(store, types), AddArgs {
+        type_name: "memory".into(),
+        payload: serde_json::json!({"title": title}),
+        body: b"memory body".to_vec(),
+        principal: None,
+    }).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn r17_add_rejects_symlinked_record_destination_before_side_effects() {
+    let (_t, store, types) = fresh_store();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), store.abs("records/memory")).unwrap();
+    let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let err = ops::add(&ctx(&store, &types), AddArgs {
+        type_name: "memory".into(),
+        payload: serde_json::json!({"title": "outside-created"}),
+        body: b"outside".to_vec(), principal: None,
+    }).unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "外链目标必须拒绝：{err}");
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+}
+
+#[cfg(unix)]
+#[test]
+fn r17_delete_rejects_symlinked_attic_destination_without_moving_record() {
+    let (_t, store, types) = fresh_store();
+    let added = add_memory(&store, &types, "delete-link");
+    let record_before = std::fs::read(store.abs(&added.rel)).unwrap();
+    let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), store.abs("attic/memory")).unwrap();
+    let err = ops::delete_record(&ctx(&store, &types), &added.record.envelope.id, &added.token, false).unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "外链 tombstone 目标必须拒绝：{err}");
+    assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), record_before);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn r17_restore_rejects_symlinked_records_destination_without_moving_tombstone() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let added = add_memory(&store, &types, "restore-link");
+    let deleted = ops::delete_record(&c, &added.record.envelope.id, &added.token, false).unwrap();
+    let tomb_before = std::fs::read(store.abs(&deleted.rel)).unwrap();
+    let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(store.abs("records/memory")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), store.abs("records/memory")).unwrap();
+    let err = ops::restore_record(&c, &added.record.envelope.id, None).unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "外链 records 目标必须拒绝：{err}");
+    assert_eq!(std::fs::read(store.abs(&deleted.rel)).unwrap(), tomb_before);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn r17_update_rejects_symlinked_lock_without_overwriting_external_file() {
+    let (_t, store, types) = fresh_store();
+    let added = add_memory(&store, &types, "lock-link");
+    let lock_path = store.abs(&format!("{}.lock", added.rel));
+    std::fs::remove_file(&lock_path).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let external = outside.path().join("unrelated.txt");
+    let original = b"valuable unrelated bytes";
+    std::fs::write(&external, original).unwrap();
+    std::os::unix::fs::symlink(&external, &lock_path).unwrap();
+    let record_before = std::fs::read(store.abs(&added.rel)).unwrap();
+    let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let err = ops::update(&ctx(&store, &types), &added.record.envelope.id, &added.token,
+        serde_json::json!({"title": "changed"}), None).unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "外链锁目标必须拒绝：{err}");
+    assert_eq!(std::fs::read(external).unwrap(), original);
+    assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), record_before);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), events_before);
+}
+
+#[test]
+fn r15_nonforce_delete_serializes_with_new_reference_creation() {
+    let (_t, store, types) = fresh_store();
+    let target_id = "0198f7a9-0000-7cd2-9e3f-000000000001".to_string();
+    let target = ops::get(&store, &target_id).unwrap();
+    let gate = mem_core::lock::barrier_shared(&store).unwrap();
+    // 新引用与待运行的删除交错：删除申请独占门闩后，引用已完成在共享门闩内的发布。
+    let _dependent = add_task(&store, &types, "r15-racing-dependent");
+    let root = store.root().to_path_buf();
+    let token = target.token.clone();
+    let id = target_id.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let deleter = std::thread::spawn(move || {
+        let store2 = Store::open(&root, OpenMode::Auto).unwrap();
+        let types2 = TypeSet::load_dir(&root.join("types")).unwrap();
+        let c = ctx(&store2, &types2);
+        tx.send(()).unwrap();
+        ops::delete_record(&c, &id, &token, false)
+    });
+    rx.recv().unwrap();
+    drop(gate);
+    let err = deleter.join().unwrap().unwrap_err();
+    assert!(err.to_string().contains("引用"), "删除必须被新引用阻止：{err}");
+    assert!(store.abs("records/project/0198f7a9-0000-7cd2-9e3f-000000000001.md").exists());
+}
+
+#[test]
+fn r15_get_rejects_paths_that_escape_store_root() {
+    let (tmp, store, _) = fresh_store();
+    let outside = tmp.path().join("outside.md");
+    std::fs::write(&outside, b"outside sentinel").unwrap();
+    let err = ops::get(&store, "records/../../outside.md").unwrap_err();
+    assert!(matches!(err, MemError::BadArgument(_)), "应在文件访问前拒绝路径：{err}");
+    assert_eq!(std::fs::read(outside).unwrap(), b"outside sentinel");
+}
+
 // ---------- git 同批提交 / commit-pending ----------
 
 #[test]

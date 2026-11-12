@@ -131,6 +131,7 @@ pub fn serve_with_maintainer(
     store.check_writable()?;
     // 单实例：serve.lock 独占（进程死亡自动释放——kill 安全）。
     let _single = {
+        crate::paths::validate_store_root_lock(store, "serve.lock")?;
         let name = store.abs("serve.lock");
         match crate::platform::LockFile::try_acquire_exclusive(&name) {
             Ok(l) => l,
@@ -220,6 +221,8 @@ impl Subscription {
         match self {
             #[cfg(windows)]
             Subscription::Rdc(_) => "rdc",
+            #[cfg(not(windows))]
+            _ => "unavailable",
         }
     }
 
@@ -237,20 +240,24 @@ impl Subscription {
                 }
                 Some(total)
             }
+            #[cfg(not(windows))]
+            _ => None,
         }
     }
 
     /// M12：维护失败的信号回注（下次 fresh 查询返回 → tick 路径重试；
     /// 持续失败则 tick 路径的 run_maintenance Err 终止 serve——语义汇合）。
-    fn reinject(&mut self, n: u64) {
+    fn reinject(&mut self, _n: u64) {
         match self {
             #[cfg(windows)]
             Subscription::Rdc(ws) => {
                 // 回注到首个订阅者即可（合并计数语义）。
                 if let Some(w) = ws.first() {
-                    w.reinject(n);
+                    w.reinject(_n);
                 }
             }
+            #[cfg(not(windows))]
+            _ => {},
         }
     }
 }
@@ -275,6 +282,7 @@ fn attach_subscription(store: &Store) -> Option<Subscription> {
     }
     #[cfg(not(windows))]
     {
+        let _ = store;
         None
     }
 }

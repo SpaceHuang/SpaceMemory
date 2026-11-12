@@ -238,6 +238,7 @@ fn show_text_body_multipage_assembly_identity() {
 // ---------- 验收 5：检索对二进制正文的排除边界（直读与快路径两执行器） ----------
 
 #[test]
+#[cfg(windows)]
 fn acceptance5_find_excludes_binary_body_coincidence_both_executors() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");

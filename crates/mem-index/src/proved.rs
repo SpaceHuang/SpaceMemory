@@ -112,9 +112,10 @@ impl FindPrefilter for ProvedIndex {
         let mut params: Vec<String> = Vec::new();
         let mut conds: Vec<String> = Vec::with_capacity(terms_folded.len() + 1);
         let mut n = 0usize;
-        for t in terms_folded {
-            let pat_prefix = format!("{}%", esc(t));
-            let pat_sub = format!("%{}%", esc(t));
+        for raw_t in terms_folded {
+            let t = super::sqlite::index_safe(raw_t);
+            let pat_prefix = format!("{}%", esc(&t));
+            let pat_sub = format!("%{}%", esc(&t));
             let (a, b, c, d) = (n + 1, n + 2, n + 3, n + 4);
             n += 4;
             params.push(pat_prefix);

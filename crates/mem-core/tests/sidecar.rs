@@ -80,6 +80,7 @@ fn single_instance_enforced() {
 }
 
 #[test]
+#[cfg(windows)] // 无 FSEvents 实现的平台不能证明新鲜性，也不会发布索引检查点
 fn maintenance_rebuilds_checkpoint_on_change() {
     let (_t, store) = fresh_store();
     let store2 = {

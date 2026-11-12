@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! r4 B3 维护竞态回归：维护期间二次写入不得被检查点"提前确认"。
 //!
 //! 评审复现方式：使用与生产 serve 相同的真实 mem-index rebuild 物化器，在每次
@@ -100,6 +102,7 @@ fn set_mtime_nanos(path: &std::path::Path, ft100: u64) {
 fn set_mtime_nanos(_path: &std::path::Path, _ft100: u64) {}
 
 #[test]
+#[cfg(windows)] // 该端到端竞态断言依赖 sidecar 变更订阅与 indexed 读取
 fn maintenance_race_second_write_not_confirmed_early() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");

@@ -176,6 +176,29 @@ fn candidates_multiterm_conjunctive_superset_and_narrowing() {
     assert_eq!(row.digest.len(), 64);
 }
 
+#[test]
+fn r15_nul_does_not_hide_text_after_it_from_like_prefilter() {
+    let (_tmp, store) = fresh_store();
+    std::fs::create_dir_all(store.abs("types/doc")).unwrap();
+    std::fs::write(store.abs("types/doc/schema.json"), r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"title":{"type":"string"}}}"#).unwrap();
+    let id = seed(&store, "doc", "nul01", "2026-11-02T00:00:00Z", json!({"title":"before\0needle-after"}), "");
+    let (epoch, entries) = materialize(&store).unwrap();
+    publish(&store, epoch, entries);
+    let proved = proven(&store);
+    let pf = proved.index.as_ref().expect("构造并证明");
+    let rows = pf.candidates(&["needle".to_string()], None).unwrap();
+    assert!(rows.iter().any(|r| r.id == id), "NUL 后的文本仍须进入候选超集");
+    let types = mem_schema::TypeSet::load_dir(&store.abs("types")).unwrap();
+    let run = |prefilter, mode| find::execute(FindParams {
+        store: &store, types: &types, query: Some("needle"), filters: &[], type_narrow: None,
+        view: None, limit: 20, offset: 0, mode, prefilter,
+    }).unwrap();
+    let indexed = run(Some(pf), proved.mode.clone());
+    let direct = run(None, ReadMode::Direct { reason: "r15 对照".into() });
+    assert_eq!(ids(&indexed), vec![id]);
+    assert_eq!(ids(&indexed), ids(&direct), "直读与索引检索必须同命中");
+}
+
 // ---------- open_proved：构造即证明（唯一证明点） ----------
 
 #[test]

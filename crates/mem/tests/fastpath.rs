@@ -314,8 +314,10 @@ fn r4_regressions_view_index_paging() {
     let out_e = mem().args(["--store", &s, "view", &vid_empty]).output().unwrap();
     assert!(out_e.status.success(), "空类型视图不得 panic：{}", String::from_utf8_lossy(&out_e.stderr));
 
-    // ---- B2：sidecar 运行中删除 index.sqlite → 第一次读取返回完整真相，且
-    //         索引文件不由读命令重建 ----
+    // ---- B2：停止 sidecar 后删除 index.sqlite → 第一次读取返回完整真相，且
+    //         索引文件不由读命令重建。Windows 不允许删除仍被 sidecar/SQLite 打开的文件。 ----
+    serve.kill().ok();
+    let _ = serve.wait();
     std::fs::remove_file(dir.join("index/index.sqlite")).unwrap();
     let out2 = mem().args(["--store", &s, "list", "--type", "task"]).output().unwrap();
     let v2 = j(&out2);
@@ -326,8 +328,13 @@ fn r4_regressions_view_index_paging() {
     let n2b = mem().args(["--store", &s, "list", "--type", "task"]).output().unwrap();
     let v2b = j(&n2b);
     assert_eq!(v2b["items"].as_array().unwrap().len(), 2, "第二次读取仍直读真相");
+    assert!(!dir.join("index/index.sqlite").exists(), "读命令不得重建索引文件");
 
     // ---- B7：FTS 分页（需要快路径）——先触发 sidecar 维护让索引回来 ----
+    serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
+        .args(["serve", "--store", &s, "--idle-secs", "9"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().expect("sidecar 重启");
     // 写一条 memory（变更触发收敛维护）。
     mem().args(["--store", &s, "add", "memory", "--payload",
         r#"{"title":"shared-alpha"}"#]).output().unwrap();
@@ -649,6 +656,7 @@ fn r8_regressions_hit_surface_budget_floor_trace_budget() {
 /// 跨模式分页续读（direct 第 1 页 ↔ indexed 第 2 页，无重复无遗漏）、
 /// brief 16 字节语义（r9 skip 语义）复核。
 #[test]
+#[cfg(windows)] // 真正进入 indexed 需要本仓库已实现的 RDC 变更订阅
 fn r11_regressions_case_insensitive_prefix_cross_mode_paging() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");

@@ -99,6 +99,7 @@ fn barrier_path(store: &Store) -> PathBuf {
 
 /// 普通写路径：共享门闩，贯穿写路径全程（红线20）。
 pub fn barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
+    crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = BarrierSlot::Read(barrier_rw(store.root()).read().unwrap());
     let file = platform::LockFile::acquire_shared(&barrier_path(store))
         .map_err(|e| MemError::io(barrier_path(store).display().to_string(), e))?;
@@ -107,6 +108,7 @@ pub fn barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
 
 /// 维护/merge/apply：独占门闩（阻塞直到所有共享持有者退出）。
 pub fn barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
+    crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = BarrierSlot::Write(barrier_rw(store.root()).write().unwrap());
     let file = platform::LockFile::acquire_exclusive(&barrier_path(store))
         .map_err(|e| MemError::io(barrier_path(store).display().to_string(), e))?;
@@ -115,6 +117,7 @@ pub fn barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
 
 /// 非阻塞尝试（测试与快失败场景）。
 pub fn try_barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
+    crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = match barrier_rw(store.root()).try_write() {
         Ok(g) => BarrierSlot::Write(g),
         Err(_) => {
@@ -129,6 +132,7 @@ pub fn try_barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
 
 /// 非阻塞尝试共享。
 pub fn try_barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
+    crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = match barrier_rw(store.root()).try_read() {
         Ok(g) => BarrierSlot::Read(g),
         Err(_) => {
@@ -214,7 +218,12 @@ pub fn record_lock(
     timeout: Duration,
 ) -> MemResult<RecordLockGuard> {
     let deadline = Instant::now() + timeout;
+    crate::paths::validate_store_relative_path(store, record_rel)?;
     let path = lock_file_path(store, record_rel);
+    crate::paths::validate_store_relative_path(
+        store,
+        &crate::paths::record_lock_rel(record_rel),
+    )?;
     ensure_parent(&path)?;
     let state = record_state(&path);
     loop {
@@ -299,7 +308,12 @@ pub fn try_record_lock(
     store: &Store,
     record_rel: &str,
 ) -> MemResult<Option<RecordLockGuard>> {
+    crate::paths::validate_store_relative_path(store, record_rel)?;
     let path = lock_file_path(store, record_rel);
+    crate::paths::validate_store_relative_path(
+        store,
+        &crate::paths::record_lock_rel(record_rel),
+    )?;
     ensure_parent(&path)?;
     let state = record_state(&path);
     {
@@ -336,6 +350,7 @@ pub fn try_record_lock(
 /// 全库事件序号唯一分配点（红线24）：闭包内完成"读最后事件 → 分配序号 → 追加"。
 /// 叶子锁：闭包内不得再取门闩/记录锁。
 pub fn with_sequence_lock<T>(store: &Store, f: impl FnOnce() -> T) -> MemResult<T> {
+    crate::paths::validate_store_root_lock(store, "events.lock")?;
     let inproc = seq_mutex(store.root());
     let _g: MutexGuard<'static, ()> = inproc.lock().unwrap();
     let _file = platform::LockFile::acquire_exclusive(&store.abs("events.lock"))
