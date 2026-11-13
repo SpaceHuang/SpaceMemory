@@ -950,6 +950,128 @@ fn maintenance_update_rejects_dag_cycle_before_any_record_or_event_change() {
 }
 
 #[test]
+fn fix_rejects_dag_cycle_without_changing_corrupt_record_or_event_log() {
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
+                body: b"preserve this body exactly\n".to_vec(),
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("fix-dag-a");
+    let b = mk("fix-dag-b");
+    ops::update(&c, &b.record.envelope.id, &b.token,
+        serde_json::json!({"slug":"fix-dag-b","title":"fix-dag-b","derived_from":a.record.envelope.id}), None).unwrap();
+    let path = store.abs(&a.rel);
+    let corrupt = b"not valid frontmatter\n---\npreserve this body exactly\n".to_vec();
+    std::fs::write(&path, &corrupt).unwrap();
+    let current = ops::get(&store, &b.record.envelope.id).unwrap();
+    let mut repaired = a.record.envelope.clone();
+    repaired.refs = vec![mem_core::envelope::Ref {
+        rel: "derived_from".into(),
+        target: b.record.envelope.id.clone(),
+    }];
+    let payload = serde_json::json!({"slug":"fix-dag-a","title":"fix-dag-a","derived_from":b.record.envelope.id});
+    let events_before = EventLog::new(&store).read_log().unwrap().events.len();
+    let error = ops::fix_record(
+        &store,
+        &types,
+        &a.rel,
+        None,
+        Some((repaired, payload)),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, MemError::CycleDetected(_)),
+        "fix 不得恢复出 DAG 环：{error}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), corrupt);
+    assert_eq!(
+        EventLog::new(&store).read_log().unwrap().events.len(),
+        events_before
+    );
+    assert_eq!(current.record.envelope.id, b.record.envelope.id);
+}
+
+#[test]
+fn fix_history_source_rejects_dag_cycle_without_mutating_corruption() {
+    struct History {
+        rel: String,
+        bytes: Vec<u8>,
+    }
+    impl ops::HistoryStore for History {
+        fn previous_file(&self, rel: &str) -> Result<Option<Vec<u8>>, MemError> {
+            Ok((rel == self.rel).then(|| self.bytes.clone()))
+        }
+    }
+    let (_t, store, types) = fresh_store();
+    let c = ctx(&store, &types);
+    let mk = |slug: &str| {
+        ops::add(
+            &c,
+            AddArgs {
+                type_name: "lesson".into(),
+                payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
+                body: b"history body\n".to_vec(),
+                principal: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = mk("history-dag-a");
+    let b = mk("history-dag-b");
+    let a_edge = ops::update(&c, &a.record.envelope.id, &a.token,
+        serde_json::json!({"slug":"history-dag-a","title":"history-dag-a","derived_from":b.record.envelope.id}), None).unwrap();
+    let historical = ops::get(&store, &a.record.envelope.id).unwrap();
+    assert_eq!(historical.token, a_edge.token);
+    let historical_bytes = std::fs::read(store.abs(&historical.rel)).unwrap();
+
+    ops::update(
+        &c,
+        &a.record.envelope.id,
+        &a_edge.token,
+        serde_json::json!({"slug":"history-dag-a","title":"history-dag-a","derived_from":null}),
+        None,
+    )
+    .unwrap();
+    ops::update(&c, &b.record.envelope.id, &b.token,
+        serde_json::json!({"slug":"history-dag-b","title":"history-dag-b","derived_from":a.record.envelope.id}), None).unwrap();
+    let damaged = b"---\n{broken\n---\nhistory body\n".to_vec();
+    std::fs::write(store.abs(&a.rel), &damaged).unwrap();
+    let history = History {
+        rel: a.rel.clone(),
+        bytes: historical_bytes,
+    };
+    // The saved history must be the earlier edge A -> B, not the current corrupted file.
+    let historic_record = mem_core::record::Record::from_bytes(&history.bytes).unwrap();
+    assert_eq!(
+        historic_record.envelope.refs[0].target,
+        b.record.envelope.id
+    );
+    let event_count = EventLog::new(&store).read_log().unwrap().events.len();
+    let error =
+        ops::fix_record(&store, &types, &a.rel, Some(&history), None, None, None).unwrap_err();
+    assert!(
+        matches!(error, MemError::CycleDetected(_)),
+        "历史原料冲突应拒绝：{error}"
+    );
+    assert_eq!(std::fs::read(store.abs(&a.rel)).unwrap(), damaged);
+    assert_eq!(
+        EventLog::new(&store).read_log().unwrap().events.len(),
+        event_count
+    );
+}
+
+#[test]
 fn link_rejects_tombstone_source_and_target_without_mutation() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);

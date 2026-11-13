@@ -1230,3 +1230,128 @@ fn merge_canonical_own_xref_to_dup_is_nulled_consistently() {
         &can.record.envelope.id,
     );
 }
+
+#[test]
+fn concurrent_apply_reloads_plan_after_acquiring_barrier() {
+    let (_t, store, types) = fresh_store(false);
+    let c = ctx(&store, &types);
+    let record = ops::add(
+        &c,
+        ops::AddArgs {
+            type_name: "topic".into(),
+            payload: serde_json::json!({"slug":"apply-once","title":"apply once"}),
+            body: vec![],
+            principal: None,
+        },
+    )
+    .unwrap();
+    let plan = Plan {
+        id: agenda::new_plan_id(),
+        kind: agenda::PlanKind::Maintenance,
+        status: agenda::PlanStatus::Draft,
+        steps: vec![PlanStep::Update {
+            id: record.record.envelope.id.clone(),
+            payload: serde_json::json!({"slug":"apply-once","title":"updated"}),
+        }],
+        completed_steps: 0,
+        in_progress: None,
+        created: mem_core::clock::now_rfc3339(),
+    };
+    agenda::save_plan(&store, &plan).unwrap();
+    let held = mem_core::lock::barrier_exclusive(&store).unwrap();
+    let root = store.root().to_path_buf();
+    let id = plan.id.clone();
+    let spawn = || {
+        let root = root.clone();
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let store = Store::open(&root, OpenMode::Auto).unwrap();
+            let types = TypeSet::load_dir(&store.abs("types")).unwrap();
+            agenda::apply(&store, &types, &id, None).unwrap()
+        })
+    };
+    let first = spawn();
+    let second = spawn();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(held);
+    let reports = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(
+        reports.iter().map(|r| r.executed).sum::<usize>(),
+        1,
+        "一个计划步骤只能执行一次：{reports:?}"
+    );
+    let fresh = ops::get(&store, &record.record.envelope.id).unwrap();
+    assert_eq!(fresh.record.envelope.version, 2);
+    assert_eq!(fresh.record.payload["title"], "updated");
+    let saved = agenda::load_plan(&store, &plan.id).unwrap().unwrap();
+    assert_eq!(saved.status, agenda::PlanStatus::Done);
+    assert_eq!(saved.completed_steps, 1);
+}
+
+#[test]
+fn concurrent_delete_apply_does_not_replace_done_with_failed() {
+    let (_t, store, types) = fresh_store(false);
+    let c = ctx(&store, &types);
+    let record = ops::add(
+        &c,
+        ops::AddArgs {
+            type_name: "topic".into(),
+            payload: serde_json::json!({"slug":"delete-once","title":"delete once"}),
+            body: vec![],
+            principal: None,
+        },
+    )
+    .unwrap();
+    let plan = Plan {
+        id: agenda::new_plan_id(),
+        kind: agenda::PlanKind::Maintenance,
+        status: agenda::PlanStatus::Draft,
+        steps: vec![PlanStep::Delete {
+            id: record.record.envelope.id.clone(),
+            force: true,
+        }],
+        completed_steps: 0,
+        in_progress: None,
+        created: mem_core::clock::now_rfc3339(),
+    };
+    agenda::save_plan(&store, &plan).unwrap();
+    let held = mem_core::lock::barrier_exclusive(&store).unwrap();
+    let root = store.root().to_path_buf();
+    let id = plan.id.clone();
+    let spawn = || {
+        let root = root.clone();
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let store = Store::open(&root, OpenMode::Auto).unwrap();
+            let types = TypeSet::load_dir(&store.abs("types")).unwrap();
+            agenda::apply(&store, &types, &id, None)
+        })
+    };
+    let first = spawn();
+    let second = spawn();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(held);
+    let outcomes = [first.join().unwrap(), second.join().unwrap()];
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "后到执行者应识别 done：{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|r| r.as_ref().unwrap().executed)
+            .sum::<usize>(),
+        1
+    );
+    let saved = agenda::load_plan(&store, &plan.id).unwrap().unwrap();
+    assert_eq!(saved.status, agenda::PlanStatus::Done);
+    assert_eq!(saved.completed_steps, 1);
+    let deletes = EventLog::new(&store)
+        .read_log()
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.id == record.record.envelope.id && e.op == Op::Delete)
+        .count();
+    assert_eq!(deletes, 1, "删除事件不能重复");
+}

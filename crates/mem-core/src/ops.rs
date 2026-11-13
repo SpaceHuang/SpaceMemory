@@ -1352,7 +1352,9 @@ pub fn fix_record(
         }
     };
     paths::validate_store_record_path(store, &rel)?;
-    let _barrier = lock::barrier_shared(store)?;
+    // fix 可能重新引入类型声明中的派生边；整个读—校验—写过程使用图级独占屏障，
+    // 不在共享锁下检查后再升级，以免与其他 DAG 写入共同发布成环。
+    let _barrier = lock::barrier_exclusive(store)?;
     let _rec = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     // H1：锁内读——并发窗口内的 update 成果不会被 fix 的旧字节覆盖。
     let bytes = std::fs::read(store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;
@@ -1398,6 +1400,20 @@ pub fn fix_record(
                 type_name: env.r#type.clone(),
                 violations,
             });
+        }
+        if decl.dag() {
+            dag_candidate_precheck(
+                &WriteContext {
+                    store,
+                    types,
+                    by: "mem fix".into(),
+                    committer,
+                    session_id: None,
+                },
+                &env.id,
+                &env.r#type,
+                &env.refs,
+            )?;
         }
     }
     let body = if parseable {

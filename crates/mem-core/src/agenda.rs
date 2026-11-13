@@ -379,6 +379,9 @@ pub fn apply(
     committer: Option<&dyn ops::CommitSink>,
 ) -> MemResult<AppliedReport> {
     store.check_writable()?;
+    // 计划状态与进度决定本次要执行哪些动作，必须在独占屏障内读取，
+    // 否则并发 apply 会带着屏障外的旧快照覆盖 done/检查点并重复动作。
+    let _barrier = crate::lock::barrier_exclusive(store)?;
     let mut plan = load_plan(store, plan_id)?.ok_or_else(|| MemError::MissingRecord {
         id_or_path: format!("plan {plan_id}"),
     })?;
@@ -399,8 +402,6 @@ pub fn apply(
             reason: "计划步骤进度与步骤列表不一致".into(),
         });
     }
-    // 屏障覆盖计划状态与每步检查点，普通写不能改变执行快照。
-    let _barrier = crate::lock::barrier_exclusive(store)?;
     // executing 标记先落盘（崩溃可检出，D17）。
     plan.status = PlanStatus::Executing;
     save_plan(store, &plan)?;
