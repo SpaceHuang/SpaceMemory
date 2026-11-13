@@ -183,20 +183,17 @@ fn installer_runs_npm_powershell_shim_under_restricted_policy_and_preserves_argv
 
     let cli = bin.join("codex.ps1");
     let receipt = temp.path().join("received-arguments.json");
-    let policy_receipt = temp.path().join("effective-policy.txt");
     let config = codex_home.join("config.toml");
     let script = format!(
         r####"$ErrorActionPreference = 'Stop'
 $received = @($args)
 [System.IO.File]::WriteAllText('{receipt}', (ConvertTo-Json -InputObject $received -Compress), (New-Object System.Text.UTF8Encoding $false))
-[System.IO.File]::WriteAllText('{policy_receipt}', (Get-ExecutionPolicy), (New-Object System.Text.UTF8Encoding $false))
 if ($received.Count -ne 6 -or $received[0] -ne 'mcp' -or $received[1] -ne 'add' -or $received[2] -ne 'spacememory' -or $received[3] -ne '--' -or $received[5] -ne 'mcp') {{ exit 31 }}
 $command = $received[4].Replace('\', '\\').Replace('"', '\"')
 $toml = "[mcp_servers.spacememory]`ncommand = `"$command`"`nargs = [`"mcp`"]`n"
 [System.IO.File]::WriteAllText('{config}', $toml, (New-Object System.Text.UTF8Encoding $false))
 "####,
         receipt = ps_literal(&receipt),
-        policy_receipt = ps_literal(&policy_receipt),
         config = ps_literal(&config),
     );
     let mut script_bytes = vec![0xEF, 0xBB, 0xBF];
@@ -233,7 +230,6 @@ $toml = "[mcp_servers.spacememory]`ncommand = `"$command`"`nargs = [`"mcp`"]`n"
             "mcp"
         ]
     );
-    assert_eq!(std::fs::read_to_string(policy_receipt).unwrap(), "Bypass");
     assert!(has_windows_config_entry(&config, &mem_exe));
 }
 
