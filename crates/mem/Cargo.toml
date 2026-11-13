@@ -16,6 +16,7 @@ mem-assets.workspace = true
 mem-schema.workspace = true
 mem-git.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 mem-mcp.workspace = true
 mem-index.workspace = true

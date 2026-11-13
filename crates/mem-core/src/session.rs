@@ -72,6 +72,13 @@ fn ledgers_dir(store: &Store) -> std::path::PathBuf {
     store.abs("sessions")
 }
 
+fn ledger_rel(store: &Store, id: &str) -> MemResult<String> {
+    crate::paths::validate_component(id)?;
+    let rel = format!("sessions/{id}.json");
+    crate::paths::validate_store_relative_path(store, &rel)?;
+    Ok(rel)
+}
+
 // M6b 归档裁决（v1.2 评审）：scan_ledgers 对缺失 sessions/ 目录做 mkdir——写的是
 // 运行时目录骨架（锁文件/台账的宿主），非真相层数据；红线18 管辖"真相与派生缓存"
 // 的内容写。避免它需要把目录保障挪进 session start（写路径）——brief 扫描空目录
@@ -83,6 +90,7 @@ pub fn scan_ledgers(store: &Store) -> MemResult<(Vec<Ledger>, Vec<String>)> {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     let dir = ledgers_dir(store);
+    crate::paths::validate_store_relative_path(store, "sessions")?;
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
         return Ok((out, warnings));
@@ -93,9 +101,22 @@ pub fn scan_ledgers(store: &Store) -> MemResult<(Vec<Ledger>, Vec<String>)> {
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
+        let Some(file_id) = p.file_stem().and_then(|s| s.to_str()) else {
+            warnings.push(format!("跳过非法台账文件名：{}", p.display()));
+            continue;
+        };
+        let rel = format!("sessions/{file_id}.json");
+        if let Err(err) = ledger_rel(store, file_id) {
+            warnings.push(format!("跳过店外或非法台账 {}：{err}", p.display()));
+            continue;
+        }
         match std::fs::read(&p).map_err(|er| MemError::io(p.display().to_string(), er)) {
             Ok(bytes) => match serde_json::from_slice::<Ledger>(&bytes) {
-                Ok(l) => out.push(l),
+                Ok(l) if l.id == file_id => out.push(l),
+                Ok(l) => warnings.push(format!(
+                    "跳过台账身份不匹配 {}（文件名 {file_id}，内容 id {}）",
+                    rel, l.id
+                )),
                 Err(er) => warnings.push(format!("跳过坏台账 {}：{er}", p.display())),
             },
             Err(er) => warnings.push(format!("跳过不可读台账 {}：{er}", p.display())),
@@ -106,23 +127,36 @@ pub fn scan_ledgers(store: &Store) -> MemResult<(Vec<Ledger>, Vec<String>)> {
 }
 
 pub fn get(store: &Store, session_id: &str) -> MemResult<Option<Ledger>> {
-    let p = ledgers_dir(store).join(format!("{session_id}.json"));
+    let rel = ledger_rel(store, session_id)?;
+    let p = store.abs(&rel);
     if !p.is_file() {
         return Ok(None);
     }
     let bytes = std::fs::read(&p).map_err(|e| MemError::io(p.display().to_string(), e))?;
-    Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
-        MemError::Corrupt { path: p.display().to_string(), reason: e.to_string() }
-    })?))
+    let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
+        path: p.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    if ledger.id != session_id {
+        return Err(MemError::Corrupt {
+            path: p.display().to_string(),
+            reason: format!(
+                "台账内容 id {:?} 与文件 id {:?} 不匹配",
+                ledger.id, session_id
+            ),
+        });
+    }
+    Ok(Some(ledger))
 }
 
 fn persist(store: &Store, ledger: &Ledger) -> MemResult<()> {
+    let rel = ledger_rel(store, &ledger.id)?;
     let dir = ledgers_dir(store);
     std::fs::create_dir_all(&dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
-    let p = dir.join(format!("{}.json", ledger.id));
+    crate::paths::validate_store_relative_path(store, &rel)?;
+    let p = store.abs(&rel);
     let bytes = serde_json::to_vec_pretty(ledger).expect("台账序列化不会失败");
-    crate::platform::atomic_write(&p, &bytes)
-        .map_err(|e| MemError::io(p.display().to_string(), e))
+    crate::platform::atomic_write(&p, &bytes).map_err(|e| MemError::io(p.display().to_string(), e))
 }
 
 fn new_session_id() -> String {
@@ -180,9 +214,7 @@ pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
 
     let (all, _warnings) = scan_ledgers(store)?;
     let same_key = |l: &Ledger| {
-        l.principal == args.principal
-            && l.view == args.view
-            && l.task_ref == args.task_ref
+        l.principal == args.principal && l.view == args.view && l.task_ref == args.task_ref
     };
     // 1) 幂等命中。
     if let Some(active) = all
@@ -216,8 +248,16 @@ pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
                     src.view, args.view
                 )));
             }
+            if src.task_ref != args.task_ref && src.task_ref.is_some() {
+                return Err(MemError::BadArgument(format!(
+                    "显式接手跨 task_ref：来源 task_ref={:?}，请求 task_ref={:?}",
+                    src.task_ref, args.task_ref
+                )));
+            }
             if !is_resumable(&src, args.idle_secs, now_epoch) {
-                return Err(MemError::BadArgument(format!("来源会话 {id} 活跃，不可接手")));
+                return Err(MemError::BadArgument(format!(
+                    "来源会话 {id} 活跃，不可接手"
+                )));
             }
             inherited_watermark = Some(src.watermark);
             resumed_from = Some(src);
@@ -232,7 +272,11 @@ pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
                     .collect::<Vec<_>>()
             };
             let pool = candidates(&args.task_ref);
-            let pool = if pool.is_empty() { candidates(&None) } else { pool };
+            let pool = if pool.is_empty() {
+                candidates(&None)
+            } else {
+                pool
+            };
             resumed_from = pool.last().cloned();
             if let Some(src) = &resumed_from {
                 inherited_watermark = Some(src.watermark);
@@ -247,8 +291,8 @@ pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
         }
     }
     // 3) 新台账（接手 = 新建，原件保留）。
-    let watermark =
-        inherited_watermark.unwrap_or_else(|| crate::event::EventLog::new(store).max_seq().unwrap_or(0));
+    let watermark = inherited_watermark
+        .unwrap_or_else(|| crate::event::EventLog::new(store).max_seq().unwrap_or(0));
     let now = crate::clock::now_rfc3339();
     let ledger = Ledger {
         id: new_session_id(),
@@ -265,14 +309,21 @@ pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
         last_write: now,
     };
     persist(store, &ledger)?;
-    Ok(StartOutcome { ledger, resumed_from, peers, idempotent: false })
+    Ok(StartOutcome {
+        ledger,
+        resumed_from,
+        peers,
+        idempotent: false,
+    })
 }
 
 fn read_conventions_version(store: &Store) -> u64 {
     std::fs::read_to_string(store.abs("conventions/CONVENTIONS.md"))
         .ok()
         .and_then(|t| {
-            t.lines().find_map(|l| l.trim().strip_prefix("- version:")).and_then(|v| v.trim().parse().ok())
+            t.lines()
+                .find_map(|l| l.trim().strip_prefix("- version:"))
+                .and_then(|v| v.trim().parse().ok())
         })
         .unwrap_or(1)
 }
@@ -308,7 +359,7 @@ pub fn ensure_for_write(
 
 /// 写通道登记（写路径顺带；幂等去重）。
 pub fn register_trail(store: &Store, session_id: &str, record_id: &str) -> MemResult<()> {
-    let rel = format!("sessions/{session_id}.json");
+    let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     let Some(mut ledger) = get(store, session_id)? else {
         return Ok(()); // 台账不存在（如测试直写）：静默跳过——trail 是尽力登记
@@ -328,17 +379,20 @@ pub fn flush(
     committer: Option<&dyn crate::ops::CommitSink>,
 ) -> MemResult<Ledger> {
     store.check_writable()?;
-    let rel = format!("sessions/{session_id}.json");
+    let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
-    let mut ledger =
-        get(store, session_id)?.ok_or_else(|| MemError::MissingRecord { id_or_path: rel.clone() })?;
+    let mut ledger = get(store, session_id)?.ok_or_else(|| MemError::MissingRecord {
+        id_or_path: rel.clone(),
+    })?;
     for t in read_trail {
         if !ledger.read_trail.contains(&t) {
             ledger.read_trail.push(t);
         }
     }
     ledger.status = Status::Flushed;
-    ledger.watermark = crate::event::EventLog::new(store).max_seq().unwrap_or(ledger.watermark);
+    ledger.watermark = crate::event::EventLog::new(store)
+        .max_seq()
+        .unwrap_or(ledger.watermark);
     ledger.last_write = crate::clock::now_rfc3339();
     persist(store, &ledger)?;
     // git 策略：随 flush 合并提交（开放问题27 → v1：随 flush 提交台账文件）。
@@ -351,7 +405,7 @@ pub fn flush(
 /// 显式关闭。
 pub fn close(store: &Store, session_id: &str) -> MemResult<Ledger> {
     store.check_writable()?;
-    let rel = format!("sessions/{session_id}.json");
+    let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     let mut ledger =
         get(store, session_id)?.ok_or_else(|| MemError::MissingRecord { id_or_path: rel })?;

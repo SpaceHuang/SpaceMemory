@@ -13,6 +13,8 @@
 //! 不互斥）——同进程内的并发互斥由 lock.rs 的进程内注册表补足（§8-4b）。
 //! 文件 watcher（notify）只是订阅之上的便利层，非新鲜度依据（红线21）。
 
+pub mod process;
+
 #[cfg(windows)]
 pub mod windows;
 
