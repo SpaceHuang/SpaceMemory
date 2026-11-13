@@ -20,6 +20,7 @@
 | `docs/develop/binary-content-design.md` | R11 二进制承载实施设计 v0.3——读回通道（CLI --body-out / MCP body_b64 分页）、G1/G2 判定与分页单源、检索正文域门槛、restore-body 恢复通道、.gitattributes 字节直通；r2 复审通过，本轮 TDD 实施完成（验收 1–7 测试面全绿） |
 | `docs/specs/` | 三个公开规范 v1（envelope-format / type-declaration / conventions-source）；规范与实现冲突时以规范评审结论为准 |
 | `docs/rules/` | 操作型指南（流程性规则，如打包分发 `packaging.md`）——执行对应任务时按需读取全文，本文件只登记存在与触发时机 |
+| `docs/user-guide/` | 面向产品使用者的使用指南；按具体任务阅读相关条目 |
 | `docs/review/` | 评审记录归档（历史评审文件缺失，待补） |
 | `docs/explain/` | 解释层：架构图与网页格式的易读说明/介绍——**非权威**，不承载规则；与规范/设计冲突时以后者为准，漂移修 explain 不修真源 |
 | 各目录 `README.md` | 该目录的局部规则与裁决记录（如 `assets/builtin-types/README.md`） |
