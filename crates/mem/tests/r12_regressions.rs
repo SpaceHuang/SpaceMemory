@@ -135,19 +135,19 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         .unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
     // 数据库文件会在首次物化开始时创建；文件存在不代表索引与真相层已收敛。
-    // 等待 init principal 与四条手写记录都已进入索引读取的列表，再验证快路径。
+    // principal 已在前面移除；等待四条手写记录都已进入索引读取的列表，再验证快路径。
     assert!(
         wait_until(
             || {
                 let o = mem().args(["--store", &s, "list", "--limit", "50"]).output().unwrap();
                 let v = j(&o);
-                v["items"].as_array().map(|items| items.len() == 5).unwrap_or(false)
+                v["items"].as_array().map(|items| items.len() == 4).unwrap_or(false)
                     && v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false)
             },
             50,
             100
         ),
-        "sidecar 应先将 init principal 和四条记录全部物化到索引"
+        "sidecar 应先将四条手写记录全部物化到索引"
     );
     assert!(
         wait_until(
