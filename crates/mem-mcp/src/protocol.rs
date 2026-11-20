@@ -50,7 +50,7 @@ fn initialize(store_root: &Path, _params: Option<&Value>) -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "mem", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "SpaceMemory 机制层。先 mem_session_start 显式建立台账（principal 必填，防错报不防伪装）；写工具携带 expect 全令牌（红线19）。",
+        "instructions": "SpaceMemory 机制层。先 mem_session_start 显式建立台账（principal 必填，防错报不防伪装），之后写入自动继承台账身份（无台账且无显式 principal 的创建会被拒绝）；写工具携带 expect 全令牌（红线19）。",
     })
 }
 
@@ -353,7 +353,9 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
                 type_name: args.get("type").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("type 必填".into()))?.to_string(),
                 payload: args.get("payload").cloned().ok_or_else(|| MemError::BadArgument("payload 必填".into()))?,
                 body: body_bytes(args)?.unwrap_or_default(),
-                principal: arg_str!(args, "principal").map(|p| resolve_principal(&store, &p)).transpose()?,
+                // raw 透传（方案 principal-binding 决策②：前端零逻辑）——短名/ID
+                // 解析与两阶段校验单源在核心。
+                principal: arg_str!(args, "principal").map(String::from),
             })?;
             Ok(json!({
                 "created": out.created, "id": out.record.envelope.id, "rel": out.rel,
@@ -476,6 +478,9 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
                     }
                 }
             }
+            // 归属完整性审计（方案 principal-binding 决策⑦）：单源核心，引用边 ∪ 归属
+            // 字段域统一出断链注记（repair 按缺位形态分写）。
+            dangling.extend(mem_core::ops::principal_binding_audit(&store)?);
             // H3：deep 对照事件日志摘要；r5 B4：镜像一致性 + 计划审计。
             let mut digest_mismatches = Vec::new();
             if deep {
@@ -586,6 +591,8 @@ fn make_ctx<'a>(
         by: format!("{principal_label}(mcp)"),
         committer: if store.root().join(".git").exists() { Some(&CommitViaCurrent) } else { None },
         session_id,
+        // 可控暂停点（验收用）：生产前端恒 None（先例 event.rs PauseHook）。
+        pause_hook: None,
     }
 }
 
@@ -604,11 +611,8 @@ pub fn remember_root(root: &Path) {
 }
 
 fn resolve_principal(store: &Store, id_or_slug: &str) -> MemResult<String> {
-    let hit = ops::get(store, id_or_slug)?;
-    if hit.record.envelope.r#type != "principal" {
-        return Err(MemError::BadArgument(format!("{id_or_slug} 不是 principal 记录")));
-    }
-    Ok(hit.record.envelope.id)
+    // 单源收口（方案 principal-binding 决策②）：解析逻辑在核心，MCP 只转发。
+    ops::resolve_principal_ref(store, id_or_slug)
 }
 
 /// M4：正文传输——`body`（UTF-8 字符串）或 `body_b64`（base64 字节保真；

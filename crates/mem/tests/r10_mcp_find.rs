@@ -86,7 +86,9 @@ fn mcp_find_full_chain_no_degradation() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = setup(&dir);
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"Geometry notebook","status":"Geometry","score":1}"#])
         .output().unwrap();
     assert!(out.status.success());
@@ -144,7 +146,9 @@ fn mcp_find_rejection_kinds_match_cli() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = setup(&dir);
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"x","status":"1"}"#]).output().unwrap();
     assert!(out.status.success());
 
@@ -181,10 +185,14 @@ fn mcp_list_filters_and_unified_shape() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = setup(&dir);
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"a","status":"1","score":1}"#]).output().unwrap();
     assert!(out.status.success());
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"b","status":"2","score":2}"#]).output().unwrap();
     assert!(out.status.success());
     std::fs::write(dir.join("records/doc/bad-1.md"), b"corrupt").unwrap();
@@ -227,7 +235,9 @@ fn mcp_and_cli_find_hit_sets_equal() {
         r#"{"title":"geometry homework","status":"active","score":1.0}"#,
         r#"{"title":"unrelated","status":"active"}"#,
     ] {
-        let out = mem().args(["--store", &s, "add", "doc", "--payload", payload]).output().unwrap();
+        let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload", payload]).output().unwrap();
         assert!(out.status.success());
     }
 
@@ -275,7 +285,9 @@ fn mcp_number_filter_exact_beyond_f64_safe_range() {
         r#"{"title":"big","status":"x","score":9007199254740993}"#,
         r#"{"title":"big","status":"x","score":9007199254740992.0}"#,
     ] {
-        let out = mem().args(["--store", &s, "add", "doc", "--payload", payload]).output().unwrap();
+        let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload", payload]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
     let resps = mcp_session(&s, &[

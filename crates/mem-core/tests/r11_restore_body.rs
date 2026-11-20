@@ -63,6 +63,7 @@ fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
         by: "test".into(),
         committer: None,
         session_id: None,
+        pause_hook: None,
     }
 }
 
@@ -73,7 +74,7 @@ fn add_memory(store: &Store, types: &TypeSet, title: &str, body: &[u8]) -> (Stri
             type_name: "memory".into(),
             payload: serde_json::json!({"title": title}),
             body: body.to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -172,8 +173,14 @@ fn history_source_rejects_after_backfill_registered_corruption() {
     let pristine = std::fs::read(store.abs(&rel)).unwrap();
     let corrupted = corrupt_body(&store, &rel);
     // reconcile：回填把损坏字节登记为最后事件（外部改动转正）。
+    // 播种的归属身份记录（直写、无事件）也进漂移，单独成组不计入本意断言。
+    let owner_id = seed_owner(&store, &types);
     let report = mem_core::event::reconcile_backfill(&store, "mem", None).unwrap();
-    assert_eq!(report.appended.len(), 1, "回填登记损坏字节");
+    assert_eq!(
+        report.appended.iter().filter(|e| e.id != owner_id).count(),
+        1,
+        "回填登记损坏字节"
+    );
     // history 必须**响亮拒绝**——不得把盘上（损坏）字节写成新版本冒充治愈。
     let fake = FakeHistory::with_version(&rel, "sha-1", &pristine);
     let expect = token::for_bytes(hit.record.envelope.version, &corrupted);
@@ -446,4 +453,32 @@ fn b1_fix_commit_failure_lands_in_retryable_pending() {
     assert_eq!(pending.len(), 1, "失败转可重试 pending：{pending:?}");
     let paths = &pending[0].1.paths;
     assert!(paths.contains(&rel) && paths.contains(&"events.jsonl".to_string()));
+}
+
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）；
+    // 本文件类型集未装 principal 声明，机制播种不可用。
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
 }

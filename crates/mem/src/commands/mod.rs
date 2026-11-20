@@ -305,11 +305,8 @@ fn index_row_to_json(r: &mem_index::IndexRow) -> serde_json::Value {
 }
 
 fn resolve_principal(store: &Store, id_or_slug: &str) -> MemResult<String> {
-    let hit = ops::get(store, id_or_slug)?;
-    if hit.record.envelope.r#type != "principal" {
-        return Err(MemError::BadArgument(format!("{id_or_slug} 不是 principal 记录")));
-    }
-    Ok(hit.record.envelope.id)
+    // 单源收口（方案 principal-binding 决策②）：解析逻辑在核心，CLI 只转发。
+    ops::resolve_principal_ref(store, id_or_slug)
 }
 
 fn out_json(v: &serde_json::Value) {
@@ -386,7 +383,7 @@ fn cmd_init(
         types: &types,
         by: "mem init".into(),
         committer: None,
-        session_id: None,
+        session_id: None, pause_hook: None,
     };
     // 自举载荷来自播种数据（红线1：类型字段含义在数据，不在代码）；
     // 机制只覆写唯一键推导必须知道的两个名字字段（slug/label）。
@@ -995,6 +992,8 @@ fn write_ctx<'a>(
         // 有 .git 才挂提交汇（无 git 形态合法，红线10）。
         committer: if store.root().join(".git").exists() { Some(&CliSink) } else { None },
         session_id,
+        // 可控暂停点（验收用）：生产前端恒 None（先例 event.rs PauseHook）。
+        pause_hook: None,
     }
 }
 
@@ -1029,9 +1028,6 @@ fn cmd_add(
 ) -> MemResult<()> {
     let payload_v: serde_json::Value = serde_json::from_str(payload)
         .map_err(|e| MemError::BadArgument(format!("--payload 不是合法 JSON：{e}")))?;
-    let principal_id = principal
-        .map(|p| resolve_principal(store, p))
-        .transpose()?;
     let ctx = write_ctx(store, types, session_id);
     let out = ops::add(
         &ctx,
@@ -1039,7 +1035,9 @@ fn cmd_add(
             type_name: type_name.to_string(),
             payload: payload_v,
             body: read_body(body)?,
-            principal: principal_id,
+            // raw 透传（方案 principal-binding 决策②：前端零逻辑）——短名/ID 解析
+            // 与两阶段校验单源在核心。
+            principal: principal.map(String::from),
         },
     )?;
     out_json(&serde_json::json!({
@@ -1326,6 +1324,13 @@ fn cmd_verify(store: &Store, types: &TypeSet, deep: bool) -> MemResult<()> {
             }
         }
     }
+    // 归属完整性审计（方案 principal-binding 决策⑦）：单源核心，引用边 ∪ 归属
+    // 字段域统一出断链注记（repair 按缺位形态分写）。
+    let dangling = {
+        let mut d = dangling;
+        d.extend(mem_core::ops::principal_binding_audit(store)?);
+        d
+    };
     // H3：--deep 对照事件日志（此前自比自检不出任何东西）。
     let mut digest_mismatches = Vec::new();
     if deep {

@@ -25,7 +25,9 @@ pub struct Envelope {
     /// RFC 3339 UTC（最近机制写时刻）。
     pub modified: String,
     pub version: u64,
-    /// 归属 principal 记录 ID；null = 未归属（首条 principal 的自举逃逸）。
+    /// 归属 principal 记录 ID；空 = 未归属——受管创建仅 principal 类型可省略
+    /// 归属（自举与注册豁免）；外部写入的未归属记录按格式规范合法可读
+    /// （方案 principal-binding §2.5，B1 契约）。
     pub principal: Option<String>,
     pub refs: Vec<Ref>,
     pub aliases: Vec<String>,

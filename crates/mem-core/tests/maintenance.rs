@@ -93,6 +93,7 @@ fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
         by: "t".into(),
         committer: None,
         session_id: None,
+                pause_hook: None,
     }
 }
 
@@ -109,7 +110,7 @@ fn agenda_scans_dangling_refs_and_duplicates() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "悬空引用源"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -128,7 +129,7 @@ fn agenda_scans_dangling_refs_and_duplicates() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "A"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -138,7 +139,7 @@ fn agenda_scans_dangling_refs_and_duplicates() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "B", "alias_dup": true}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -194,7 +195,7 @@ fn agenda_reports_undigested_evidence() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "证据"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -213,7 +214,7 @@ fn agenda_reports_undigested_evidence() {
             type_name: "lesson".into(),
             payload: serde_json::json!({"slug": "l1", "title": "原则"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -247,7 +248,7 @@ fn make_merge_plan(store: &Store, types: &TypeSet) -> (String, String, String) {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "原始"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -257,7 +258,7 @@ fn make_merge_plan(store: &Store, types: &TypeSet) -> (String, String, String) {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "原始（重复）"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -318,7 +319,7 @@ fn apply_delete_plan_respects_block_and_force() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "被删者"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -418,7 +419,7 @@ fn failed_multistep_plan_resumes_after_completed_delete_without_repeating_it() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title":"first"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -428,7 +429,7 @@ fn failed_multistep_plan_resumes_after_completed_delete_without_repeating_it() {
             type_name: "topic".into(),
             payload: serde_json::json!({"slug":"retry-topic","title":"retry"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -438,7 +439,7 @@ fn failed_multistep_plan_resumes_after_completed_delete_without_repeating_it() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title":"dependent","topic":topic.record.envelope.id}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -527,7 +528,7 @@ fn apply_recovers_delete_completed_before_progress_save() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title":"crash-gap-delete"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -650,7 +651,7 @@ fn fix_rebuilds_frontmatter_from_git_keeping_body_bytes() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "要坏的记录"}),
             body: "original body\r\n".as_bytes().to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -742,7 +743,7 @@ fn fix_without_git_requires_provided_envelope() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "no-git"}),
             body: b"b".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -835,7 +836,7 @@ fn fix_on_parseable_record_requires_expect_token() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "t"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -868,7 +869,7 @@ fn deep_audit_detects_disk_vs_event_log_mismatch() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "t"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -935,7 +936,7 @@ fn merge_canonical_referencing_dup_leaves_no_dangling_or_chain_hole() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "dup"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -945,7 +946,7 @@ fn merge_canonical_referencing_dup_leaves_no_dangling_or_chain_hole() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "canonical"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -989,7 +990,7 @@ fn merge_dup_referencing_canonical_is_clean() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "dup"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -999,7 +1000,7 @@ fn merge_dup_referencing_canonical_is_clean() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "canonical"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1032,7 +1033,7 @@ fn merge_repoints_third_party_and_keeps_chain_contiguous() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "dup"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1042,7 +1043,7 @@ fn merge_repoints_third_party_and_keeps_chain_contiguous() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "canonical"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1052,7 +1053,7 @@ fn merge_repoints_third_party_and_keeps_chain_contiguous() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "第三方"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1108,7 +1109,7 @@ fn merge_rewrites_referent_payload_xref_by_its_own_decl() {
                 type_name: "topic".into(),
                 payload: serde_json::json!({"slug": slug, "title": slug}),
                 body: b"".to_vec(),
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -1121,7 +1122,7 @@ fn merge_rewrites_referent_payload_xref_by_its_own_decl() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "M", "topic": d.record.envelope.id}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1191,7 +1192,7 @@ fn merge_canonical_own_xref_to_dup_is_nulled_consistently() {
             type_name: "topic".into(),
             payload: serde_json::json!({"slug": "dup-topic", "title": "dup"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1203,7 +1204,7 @@ fn merge_canonical_own_xref_to_dup_is_nulled_consistently() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "canonical", "topic": d.record.envelope.id}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1241,7 +1242,7 @@ fn concurrent_apply_reloads_plan_after_acquiring_barrier() {
             type_name: "topic".into(),
             payload: serde_json::json!({"slug":"apply-once","title":"apply once"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1298,7 +1299,7 @@ fn concurrent_delete_apply_does_not_replace_done_with_failed() {
             type_name: "topic".into(),
             payload: serde_json::json!({"slug":"delete-once","title":"delete once"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1354,4 +1355,31 @@ fn concurrent_delete_apply_does_not_replace_done_with_failed() {
         .filter(|e| e.id == record.record.envelope.id && e.op == Op::Delete)
         .count();
     assert_eq!(deletes, 1, "删除事件不能重复");
+}
+
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
 }

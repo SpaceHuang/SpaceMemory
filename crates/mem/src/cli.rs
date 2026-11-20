@@ -111,7 +111,7 @@ pub enum Cmd {
         payload: String,
         #[arg(long, help = "正文文件路径；'-' = stdin")]
         body: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "归属身份（短名或记录 ID）；缺省时从 --session 台账继承；两者皆无则拒绝（principal 类型豁免）")]
         principal: Option<String>,
         #[arg(long)]
         session: Option<String>,

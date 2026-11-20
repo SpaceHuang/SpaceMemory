@@ -50,7 +50,9 @@ fn png_like_bytes() -> Vec<u8> {
 fn add_memory_with_body(dir: &std::path::Path, title: &str, body_file: &std::path::Path) -> Value {
     let payload = format!(r#"{{"title":"{title}"}}"#);
     let out = mem()
-        .args(["--store", dir.to_str().unwrap(), "add", "memory", "--payload", &payload,
+        .args(["--store", dir.to_str().unwrap(), "add", "memory",
+"--principal",
+"codex_main", "--payload", &payload,
             "--body", body_file.to_str().unwrap()])
         .output()
         .unwrap();
@@ -252,7 +254,9 @@ fn acceptance5_find_excludes_binary_body_coincidence_both_executors() {
 
     // (ii) 载荷含 "abs"（title 含 abs）→ 仍命中（仅正文区排除边界）。
     let out = mem()
-        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"has-abs-name"}"#])
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"has-abs-name"}"#])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -407,7 +411,9 @@ fn gitattributes_enters_tree_with_managed_write() {
     let s = dir.to_str().unwrap();
     // 一次受管写入（CLI 有 .git 挂提交汇）→ .gitattributes 随批入树。
     let out = mem()
-        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"tree-mark"}"#])
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"tree-mark"}"#])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -676,7 +682,9 @@ fn acceptance3_refs_and_dangling_visible_after_force_delete() {
     //   为对照"载荷引用字段"语义，用 task.area（x-ref topic）同样成立；此处以
     //   project 字段示范主路径，另以 link 边示范兜底路径。
     let proj = j(&mem()
-        .args(["--store", s, "add", "project", "--payload",
+        .args(["--store", s, "add", "project",
+"--principal",
+"codex_main", "--payload",
             r#"{"slug":"quiz","title":"题库","status":"active"}"#])
         .output()
         .unwrap());
@@ -684,13 +692,17 @@ fn acceptance3_refs_and_dangling_visible_after_force_delete() {
     // "题目"记录挂图：载荷引用字段指向"图"记录（x-ref 镜像写法按类型声明；
     // memory 类型无 x-ref 字段——用 link 边为题目挂图，两条路径各验一例）。
     let _q1 = j(&mem()
-        .args(["--store", s, "add", "memory", "--payload",
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"title":"题目1（载荷引用字段路径示范——project x-ref）"}}"#)])
         .output()
         .unwrap());
     // 路径 2（兜底）：link 边直接加信封引用。
     let q2 = j(&mem()
-        .args(["--store", s, "add", "memory", "--payload",
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
             r#"{"title":"题目2（link 边挂图）"}"#])
         .output()
         .unwrap());
@@ -732,7 +744,9 @@ fn acceptance3_refs_and_dangling_visible_after_force_delete() {
     // 载荷引用字段路径：project 被 task.project 引用 → 删除同样被阻。
     // task 的 project 字段要求 uuid 形态 + 存在性（x-ref existence）。
     let task = mem()
-        .args(["--store", s, "add", "task", "--payload",
+        .args(["--store", s, "add", "task",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"slug":"t1","title":"题目A","status":"todo","project":"{proj_id}"}}"#)])
         .output()
         .unwrap();

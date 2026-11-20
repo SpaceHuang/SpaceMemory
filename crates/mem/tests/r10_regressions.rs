@@ -141,7 +141,9 @@ fn r10_cross_value_boundary_no_false_hit() {
     let s = dir.to_str().unwrap().to_string();
     mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
     // payload 值 "plain"（尾 in）+ 正文 "body"（头 bo）——拼接跨界 "inbo"/"nbo" 不得命中。
-    mem().args(["--store", &s, "add", "memory", "--payload",
+    mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"plain"}"#]).output().unwrap();
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])

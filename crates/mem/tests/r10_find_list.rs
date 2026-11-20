@@ -43,13 +43,19 @@ fn setup(dir: &std::path::Path) -> String {
     assert!(out.status.success(), "init：{}", String::from_utf8_lossy(&out.stderr));
     std::fs::create_dir_all(dir.join("types/doc")).unwrap();
     std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"Geometry","status":"Geometry","score":1}"#]).output().unwrap();
     assert!(out.status.success(), "add doc1：{}", String::from_utf8_lossy(&out.stderr));
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"plain","status":"Active","score":1.0}"#]).output().unwrap();
     assert!(out.status.success(), "add doc2：{}", String::from_utf8_lossy(&out.stderr));
-    let out = mem().args(["--store", &s, "add", "memory", "--payload",
+    let out = mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"other","status":"Geometry"}"#]).output().unwrap();
     assert!(out.status.success(), "add memory：{}", String::from_utf8_lossy(&out.stderr));
     s
@@ -67,7 +73,9 @@ fn cli_find_query_grammar_and_rejection() {
     // 正文域查询记录：正文 "alpha beta here"（经 --body 文件）。
     let body_file = dir.join("body.txt");
     std::fs::write(&body_file, "alpha beta here").unwrap();
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"pad2","status":"y"}"#, "--body", body_file.to_str().unwrap()])
         .output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -184,7 +192,9 @@ fn cli_find_paging_and_type_narrow_kept() {
     let dir = tmp.path().join("store");
     let s = setup(&dir);
     for i in 0..3 {
-        let out = mem().args(["--store", &s, "add", "doc", "--payload",
+        let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"title":"paging{i}","status":"p","score":{i}}}"#)])
             .output().unwrap();
         assert!(out.status.success());
@@ -231,10 +241,14 @@ fn cli_number_filter_exact_beyond_f64_safe_range() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = setup(&dir);
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"big-int","status":"x","score":9007199254740993}"#]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"big-float","status":"x","score":9007199254740992.0}"#]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let ids = |v: &Value| -> Vec<String> {

@@ -106,6 +106,7 @@ fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
         by: "w".into(),
         committer: None,
         session_id: None,
+                pause_hook: None,
     }
 }
 
@@ -116,7 +117,7 @@ fn add_principal(store: &Store, types: &TypeSet, slug: &str) -> String {
             type_name: "principal".into(),
             payload: serde_json::json!({"slug": slug, "label": slug}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap()
@@ -132,7 +133,7 @@ fn add_view(store: &Store, types: &TypeSet, slug: &str, filter: serde_json::Valu
             type_name: "view".into(),
             payload: serde_json::json!({"slug": slug, "title": slug, "filter": filter}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap()
@@ -146,7 +147,7 @@ fn add_task(store: &Store, types: &TypeSet, project: &str, slug: &str) -> String
         type_name: "task".into(),
         payload: serde_json::json!({"project": project, "slug": slug, "title": slug, "status": "todo"}),
         body: b"".to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     })
     .unwrap()
     .record
@@ -512,7 +513,7 @@ fn seed_for_view(store: &Store, types: &TypeSet) -> (String, String, String, Str
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "一条记忆"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap()
@@ -568,7 +569,7 @@ fn view_filter_by_principal_and_since() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "无主"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -682,7 +683,7 @@ fn undigested_evidence_query_per_product() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "证据1"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -694,7 +695,7 @@ fn undigested_evidence_query_per_product() {
             type_name: "lesson".into(),
             payload: serde_json::json!({"slug": "lesson-1", "title": "原则"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -722,7 +723,7 @@ fn undigested_evidence_query_per_product() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "证据2"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -781,7 +782,7 @@ fn trace_depth_truncation_is_flagged_not_silent() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug": slug, "title": slug}),
                 body: b"".to_vec(),
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -851,4 +852,31 @@ fn trace_depth_truncation_is_flagged_not_silent() {
     let (nodes2, truncated2) = (&outcome2.nodes, outcome2.truncated);
     assert_eq!(nodes2.len(), 2, "深度 4 应含 B 和 C：{nodes2:?}");
     assert!(!truncated2);
+}
+
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
 }

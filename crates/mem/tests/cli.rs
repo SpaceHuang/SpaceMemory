@@ -118,6 +118,8 @@ fn add_show_update_conflict_flow() {
     // add（project 目标不存在 → x-ref 拒收，R8.5）。
     let out = mem()
         .args(["--store", s, "add", "task",
+"--principal",
+"codex_main",
             "--payload", r#"{"project":"0198ghost-0000-7cd2-9e3f-000000000001","slug":"t1","title":"T","status":"todo"}"#])
         .output()
         .unwrap();
@@ -125,6 +127,8 @@ fn add_show_update_conflict_flow() {
     // 建 project 记录（principal 已由 init 自举；project 手工建）。
     let out_p = mem()
         .args(["--store", s, "add", "project",
+"--principal",
+"codex_main",
             "--payload", r#"{"slug":"proj","title":"Proj","status":"active"}"#])
         .output()
         .unwrap();
@@ -136,7 +140,9 @@ fn add_show_update_conflict_flow() {
         r#"{{"project":"{project_id}","slug":"login-api","title":"实现登录接口","status":"todo"}}"#
     );
     let out2 = mem()
-        .args(["--store", s, "add", "task", "--payload", &payload])
+        .args(["--store", s, "add", "task",
+"--principal",
+"codex_main", "--payload", &payload])
         .output()
         .unwrap();
     assert!(out2.status.success(), "{}", String::from_utf8_lossy(&out2.stderr));
@@ -190,7 +196,9 @@ fn verify_ok_and_history_hole_detection() {
     assert_eq!(pre_v["gitattributes_audit"].as_array().unwrap().len(), 1, "init 后窗口如实报告：{pre_v}");
     assert_eq!(pre_v["ok"], false, "窗口内不宣称完成：{pre_v}");
     let seal = mem()
-        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"seal"}"#])
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"seal"}"#])
         .output()
         .unwrap();
     assert!(seal.status.success(), "{}", String::from_utf8_lossy(&seal.stderr));
@@ -232,7 +240,9 @@ fn readonly_store_read_commands_work_writes_rejected() {
     }
     // 写命令结构化拒绝。
     let out = mem()
-        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"x"}"#])
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"x"}"#])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -247,19 +257,25 @@ fn trace_and_reconcile_roundtrip() {
     let s = dir.to_str().unwrap();
     // 两条记录 + link。
     let out_p = mem()
-        .args(["--store", s, "add", "project", "--payload", r#"{"slug":"proj","title":"P","status":"active"}"#])
+        .args(["--store", s, "add", "project",
+"--principal",
+"codex_main", "--payload", r#"{"slug":"proj","title":"P","status":"active"}"#])
         .output()
         .unwrap();
     let project_id = j(&out_p)["id"].as_str().unwrap().to_string();
     let out_t = mem()
-        .args(["--store", s, "add", "task", "--payload",
+        .args(["--store", s, "add", "task",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"project":"{project_id}","slug":"t-a","title":"A","status":"todo"}}"#)])
         .output()
         .unwrap();
     let task_id = j(&out_t)["id"].as_str().unwrap().to_string();
     let task_token = j(&out_t)["token"].as_str().unwrap().to_string();
     let out_m = mem()
-        .args(["--store", s, "add", "memory", "--payload", r#"{"title":"M"}"#])
+        .args(["--store", s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"M"}"#])
         .output()
         .unwrap();
     let mem_id = j(&out_m)["id"].as_str().unwrap().to_string();
@@ -283,4 +299,86 @@ fn trace_and_reconcile_roundtrip() {
     let out_r = mem().args(["--store", s, "reconcile"]).output().unwrap();
     let v_r = j(&out_r);
     assert_eq!(v_r["backfill_appended"], 0, "全稳定：无回填");
+}
+
+
+// ---------- 写路径归属绑定（方案 principal-binding §4.2 双端 e2e） ----------
+
+#[test]
+fn principal_binding_explicit_inherit_reject_three_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("store").to_str().unwrap().to_string();
+    init_store(std::path::Path::new(&s));
+    let gitattrs = std::path::Path::new(&s).join(".gitattributes");
+
+    // 显式态：--principal 短名 → 成功。
+    let out_e = mem()
+        .args(["--store", &s, "add", "memory", "--principal", "codex_main",
+               "--payload", r#"{"title":"显式"}"#])
+        .output()
+        .unwrap();
+    assert!(out_e.status.success(), "{}", String::from_utf8_lossy(&out_e.stderr));
+
+    // 继承态：session start → add 只带 --session → 归属继承。
+    let out_ss = mem()
+        .args(["--store", &s, "session", "start", "--principal", "codex_main"])
+        .output()
+        .unwrap();
+    assert!(out_ss.status.success(), "{}", String::from_utf8_lossy(&out_ss.stderr));
+    let sid = j(&out_ss)["session"].as_str().unwrap().to_string();
+    let out_i = mem()
+        .args(["--store", &s, "add", "memory", "--session", &sid,
+               "--payload", r#"{"title":"继承"}"#])
+        .output()
+        .unwrap();
+    assert!(out_i.status.success(), "{}", String::from_utf8_lossy(&out_i.stderr));
+    let rel_i = j(&out_i)["rel"].as_str().unwrap().to_string();
+    let content = std::fs::read_to_string(std::path::Path::new(&s).join(&rel_i)).unwrap();
+    assert!(
+        content.contains("\"principal\": \"") && !content.contains("\"principal\": null"),
+        "台账继承落信封（非空 uuid）：{content}"
+    );
+
+    // 拒绝态：无 --principal 无 --session → 响亮拒绝且全店文件树一致（含 .gitattributes 未被创建）。
+    // 反例前置：此刻移除 .gitattributes（显式/继承态的合法写路径已重建过它），
+    // 断言拒绝路径不重建。净零基线 = 拒绝调用之前的店态。
+    if gitattrs.exists() {
+        std::fs::remove_file(&gitattrs).unwrap();
+    }
+    let before = cli_truth_snapshot(std::path::Path::new(&s));
+    let out_r = mem()
+        .args(["--store", &s, "add", "memory", "--payload", r#"{"title":"拒绝"}"#])
+        .output()
+        .unwrap();
+    assert!(!out_r.status.success(), "无归属创建必须失败");
+    let err = String::from_utf8_lossy(&out_r.stderr);
+    assert!(err.contains("归属缺失"), "{err}");
+    let after = cli_truth_snapshot(std::path::Path::new(&s));
+    assert_eq!(before, after, "拒绝路径全店文件树一致");
+    assert!(!gitattrs.exists(), "写前核验不得先于预检");
+}
+
+fn cli_truth_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &std::path::Path, rel: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().to_string();
+            let p = e.path();
+            let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if p.is_dir() {
+                if r == ".git" || r == "index" || r.starts_with("index/") || r == "sessions" {
+                    continue;
+                }
+                walk(&p, &r, out);
+            } else {
+                if r.ends_with(".lock") || r == "sidecar-state.json" {
+                    continue;
+                }
+                out.insert(r, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, "", &mut out);
+    out
 }
