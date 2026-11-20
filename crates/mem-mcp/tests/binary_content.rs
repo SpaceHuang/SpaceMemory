@@ -65,6 +65,27 @@ fn init_store(dir: &std::path::Path) {
         }
     }
     walk(&root, dir);
+    // 播种归属身份（直写，外部写入者形态；方案 principal-binding 决策①：
+    // 受管创建需显式归属）。
+    let id = "0198f7a9-0000-7000-8000-0000000000a1";
+    let env = mem_core::envelope::Envelope {
+        id: id.into(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["codex_main".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "codex_main", "label": "codex_main"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let abs = dir.join("records/principal/codex_main.md");
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
 }
 
 fn call(root: &std::path::Path, id: i64, name: &str, args: Value) -> Value {
@@ -98,7 +119,7 @@ fn acceptance4_protocol_full_chain_b64_paging() {
 
     // 写入：base64 保真通道解码后按原始字节落盘（既有裁决 M4）。
     let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "payload": {"title": "protocol-image"},
+        "type": "memory", "principal": "codex_main", "payload": {"title": "protocol-image"},
         "body_b64": b64_encode(&src_bytes),
     }));
     assert_eq!(added["created"], true, "{added}");
@@ -141,7 +162,7 @@ fn mem_show_text_body_utf8_multipage_assembly() {
     init_store(&dir);
     let body_text = "协议档正文分页".repeat(10);
     let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "payload": {"title": "text"}, "body": body_text,
+        "type": "memory", "principal": "codex_main", "payload": {"title": "text"}, "body": body_text,
     }));
     let id = added["id"].as_str().unwrap().to_string();
     let mem_json = dir.join("mem.json");
@@ -174,7 +195,7 @@ fn mem_restore_body_file_source_and_echo() {
     init_store(&dir);
     let src_bytes = png_like_bytes();
     let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "payload": {"title": "restore"}, "body_b64": b64_encode(&src_bytes),
+        "type": "memory", "principal": "codex_main", "payload": {"title": "restore"}, "body_b64": b64_encode(&src_bytes),
     }));
     let id = added["id"].as_str().unwrap().to_string();
     let hit = call(&dir, 2, "mem_show", json!({"id": id}));

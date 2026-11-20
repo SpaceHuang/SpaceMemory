@@ -131,6 +131,7 @@ fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
         by: "0198f7b2(zcode_main)".into(),
         committer: None,
         session_id: None,
+        pause_hook: None,
     }
 }
 
@@ -150,7 +151,7 @@ fn add_creates_v1_at_derived_path_with_create_event() {
             type_name: "task".into(),
             payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "login-api", "todo"),
             body: "# 实现登录接口\n".as_bytes().to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -183,7 +184,7 @@ fn add_loser_gets_existing_record_and_token() {
         type_name: "task".into(),
         payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "login-api", "todo"),
         body: b"x".to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     };
     let w1 = ops::add(&c, args()).unwrap();
     let w2 = ops::add(&c, args()).unwrap();
@@ -200,13 +201,16 @@ fn add_loser_gets_existing_record_and_token() {
 
 #[test]
 fn concurrent_double_add_single_winner() {
-    let (_t, store, _types) = fresh_store();
+    let (_t, store, types) = fresh_store();
+    // 归属身份主线程播种一次（直写并发写同一文件会撞 Windows 共享冲突）。
+    let owner = seed_owner(&store, &types);
     let root = store.root().to_path_buf();
     let types_dir = root.join("types");
     let mut handles = Vec::new();
     for i in 0..8 {
         let root = root.clone();
         let types_dir = types_dir.clone();
+        let owner = owner.clone();
         handles.push(std::thread::spawn(move || {
             let s = Store::open(&root, OpenMode::Auto).unwrap();
             let ts = TypeSet::load_dir(&types_dir).unwrap();
@@ -216,6 +220,7 @@ fn concurrent_double_add_single_winner() {
                 by: format!("w{i}"),
                 committer: None,
                 session_id: None,
+                pause_hook: None,
             };
             ops::add(
                 &c,
@@ -223,7 +228,7 @@ fn concurrent_double_add_single_winner() {
                     type_name: "task".into(),
                     payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "race", "todo"),
                     body: b"x".to_vec(),
-                    principal: None,
+                    principal: Some(owner),
                 },
             )
             .unwrap()
@@ -248,7 +253,7 @@ fn add_strict_rejects_bad_payload_with_field_paths() {
             type_name: "task".into(),
             payload: serde_json::json!({"slug": "x", "status": "不存在的状态", "title": "t"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap_err();
@@ -277,7 +282,7 @@ fn add_lenient_tolerates_unknown_fields_with_warning() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "记忆", "surprise_field": 42}),
             body: "内容".as_bytes().to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -299,7 +304,7 @@ fn add_enforces_ref_existence_and_principal_existence() {
             type_name: "task".into(),
             payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000099", "t1", "todo"),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap_err();
@@ -311,7 +316,7 @@ fn add_enforces_ref_existence_and_principal_existence() {
             type_name: "principal".into(),
             payload: serde_json::json!({"slug": "codex_main", "label": "codex_main"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -354,7 +359,7 @@ fn add_task(store: &Store, types: &TypeSet, slug: &str) -> ops::Added {
             type_name: "task".into(),
             payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", slug, "todo"),
             body: b"v1 body".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap()
@@ -541,7 +546,7 @@ fn dag_cycle_rejected_for_xdag_type() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug": slug, "title": slug}),
                 body: b"".to_vec(),
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -597,7 +602,7 @@ fn update_payload_xref_rejects_self_two_node_and_longer_dag_cycles() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
                 body: vec![],
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -682,7 +687,7 @@ fn custom_derived_relation_is_enforced_for_payload_updates_and_verify_audits_ext
                 type_name: "course".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"based_on":null}),
                 body: vec![],
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -744,7 +749,7 @@ fn merge_rejects_reference_rewrite_that_would_create_dag_cycle_before_writes() {
                 type_name: "course".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"based_on":null}),
                 body: vec![],
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -817,7 +822,7 @@ fn concurrent_payload_updates_cannot_create_a_dag_cycle() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
                 body: vec![],
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -840,6 +845,7 @@ fn concurrent_payload_updates_cannot_create_a_dag_cycle() {
                 by: "race".into(),
                 committer: None,
                 session_id: None,
+                pause_hook: None,
             };
             start.wait();
             ops::update(
@@ -900,7 +906,7 @@ fn maintenance_update_rejects_dag_cycle_before_any_record_or_event_change() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
                 body: vec![],
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -960,7 +966,7 @@ fn fix_rejects_dag_cycle_without_changing_corrupt_record_or_event_log() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
                 body: b"preserve this body exactly\n".to_vec(),
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -1022,7 +1028,7 @@ fn fix_history_source_rejects_dag_cycle_without_mutating_corruption() {
                 type_name: "lesson".into(),
                 payload: serde_json::json!({"slug":slug,"title":slug,"derived_from":null}),
                 body: b"history body\n".to_vec(),
-                principal: None,
+                principal: Some(seed_owner(&store, &types)),
             },
         )
         .unwrap()
@@ -1081,7 +1087,7 @@ fn link_rejects_tombstone_source_and_target_without_mutation() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title":"source"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1091,7 +1097,7 @@ fn link_rejects_tombstone_source_and_target_without_mutation() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title":"target"}),
             body: vec![],
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1227,7 +1233,7 @@ fn r15_merge_never_overwrites_an_existing_different_tombstone() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "points to dup"}),
             body: b"dependent".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1282,6 +1288,7 @@ fn r15_merge_never_overwrites_an_existing_different_tombstone() {
 fn r16_add_revalidates_reference_after_waiting_for_shared_barrier() {
     let (_t, store, types) = fresh_store();
     let c = ctx(&store, &types);
+    let owner = seed_owner(&store, &types);
     let target_id = "0198f7a9-0000-7cd2-9e3f-000000000001".to_string();
     let target = ops::get(&store, &target_id).unwrap();
     let gate = mem_core::lock::barrier_exclusive(&store).unwrap();
@@ -1300,7 +1307,7 @@ fn r16_add_revalidates_reference_after_waiting_for_shared_barrier() {
                 type_name: "task".into(),
                 payload: task_payload(&id, "r16-reference-race", "todo"),
                 body: b"race".to_vec(),
-                principal: None,
+                principal: Some(owner),
             },
         )
     });
@@ -1408,7 +1415,7 @@ fn add_memory(store: &Store, types: &TypeSet, title: &str) -> ops::Added {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": title}),
             body: b"memory body".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap()
@@ -1427,7 +1434,7 @@ fn r17_add_rejects_symlinked_record_destination_before_side_effects() {
             type_name: "memory".into(),
             payload: serde_json::json!({"title": "outside-created"}),
             body: b"outside".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap_err();
@@ -1587,6 +1594,7 @@ fn commits_include_record_and_events_same_batch() {
         by: "w".into(),
         committer: Some(&sink),
         session_id: None,
+        pause_hook: None,
     };
     let out = ops::add(
         &c,
@@ -1594,7 +1602,7 @@ fn commits_include_record_and_events_same_batch() {
             type_name: "task".into(),
             payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-git", "todo"),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1618,6 +1626,7 @@ fn commit_failure_becomes_pending_not_rollback() {
         by: "w".into(),
         committer: Some(&sink),
         session_id: None,
+        pause_hook: None,
     };
     let out = ops::add(
         &c,
@@ -1625,7 +1634,7 @@ fn commit_failure_becomes_pending_not_rollback() {
             type_name: "task".into(),
             payload: task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "t-pending", "todo"),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         },
     )
     .unwrap();
@@ -1667,4 +1676,31 @@ fn scan_skips_corrupt_records_with_warning() {
         err.to_string().contains("frontmatter") || err.to_string().contains("损坏"),
         "{err}"
     );
+}
+
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
 }

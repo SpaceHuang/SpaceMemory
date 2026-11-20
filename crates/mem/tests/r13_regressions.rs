@@ -172,7 +172,9 @@ fn r13_mcp_diff_offset_resume_covers_all_groups() {
     // 4 组变更：init 自举 principal + 3 次 add。
     let mut added = Vec::new();
     for i in 0..3 {
-        let o = mem().args(["--store", &s, "add", "memory", "--payload",
+        let o = mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"title":"d{i}"}}"#)]).output().unwrap();
         added.push(j(&o)["id"].as_str().unwrap().to_string());
     }

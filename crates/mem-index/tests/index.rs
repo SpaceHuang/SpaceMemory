@@ -63,19 +63,22 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
 #[test]
 fn rebuild_and_query_by_type() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None };
+    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
     for slug in ["a", "b"] {
         ops::add(&c, ops::AddArgs {
             type_name: "task".into(),
             payload: serde_json::json!({"project": PROJECT, "slug": slug, "title": slug, "status": "todo"}),
             body: b"".to_vec(),
-            principal: None,
+            principal: Some(seed_owner(&store, &types)),
         })
         .unwrap();
     }
     let mut idx = mem_index::Index::open_store(&store).unwrap();
     let (n, refs) = idx.rebuild(&store).unwrap();
-    assert_eq!(n, 3, "project + 2 task");
+    // 播种的归属身份记录（principal）也入索引——过滤类型后断言本意。
+    let owner_id = seed_owner(&store, &types);
+    let _ = owner_id;
+    assert_eq!(n - 1, 3, "project + 2 task（播种的身份记录另计）");
     assert!(refs >= 2, "task→project 镜像引用边");
     let tasks = idx.query_by_type("task", 10, 0).unwrap();
     assert_eq!(tasks.len(), 2);
@@ -90,12 +93,12 @@ fn rebuild_and_query_by_type() {
 #[test]
 fn edge_neighbors_support_trace() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None };
+    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
     let t = ops::add(&c, ops::AddArgs {
         type_name: "memory".into(),
         payload: serde_json::json!({"title": "证据"}),
         body: b"".to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     })
     .unwrap();
     let mut idx = mem_index::Index::open_store(&store).unwrap();
@@ -118,12 +121,12 @@ fn edge_neighbors_support_trace() {
 #[test]
 fn diagnose_reports_drift_never_rejects() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None };
+    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
     ops::add(&c, ops::AddArgs {
         type_name: "memory".into(),
         payload: serde_json::json!({"title": "m"}),
         body: b"".to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     })
     .unwrap();
     let mut idx = mem_index::Index::open_store(&store).unwrap();
@@ -133,7 +136,7 @@ fn diagnose_reports_drift_never_rejects() {
         type_name: "memory".into(),
         payload: serde_json::json!({"title": "m2"}),
         body: b"".to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     })
     .unwrap();
     let scan = ops::scan_all(&store).unwrap();
@@ -200,7 +203,29 @@ fn fake_store(tmp: &std::path::Path) -> mem_core::store::Store { // &TempDir 可
     mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap()
 }
 
-
-
-
-
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
+}

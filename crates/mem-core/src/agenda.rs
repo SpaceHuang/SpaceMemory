@@ -444,6 +444,7 @@ pub fn apply(
                 by: "mem apply".into(),
                 committer,
                 session_id: None,
+                pause_hook: None,
             };
             match step {
                 PlanStep::Merge { dup, canonical } => {

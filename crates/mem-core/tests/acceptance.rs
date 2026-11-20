@@ -73,14 +73,14 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn add_task(store: &Store, types: &TypeSet, slug: &str, body: &str) -> String {
-    let c = ops::WriteContext { store, types, by: "t".into(), committer: None, session_id: None };
+    let c = ops::WriteContext { store, types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
     ops::add(&c, ops::AddArgs {
         type_name: "task".into(),
         payload: serde_json::json!({
             "project": PROJECT, "slug": slug, "title": slug, "status": "todo"
         }),
         body: body.as_bytes().to_vec(),
-        principal: None,
+        principal: Some(seed_owner(&store, &types)),
     })
     .unwrap()
     .record
@@ -233,7 +233,9 @@ fn assert_first_read_returns_new_value(scenario: Scenario, force_readonly: bool)
             by: "t".into(),
             committer: None,
             session_id: None,
+            pause_hook: None,
         };
+        // ReadOnly 在 check_writable（归属解析之前）即返回——归属传 None 即可。
         assert!(matches!(
             ops::add(&c, ops::AddArgs {
                 type_name: "memory".into(),
@@ -362,7 +364,13 @@ fn diff_two_rounds_with_external_git_commit() {
     // 第二轮：不重复入 B；A 里可见。
     let d2 = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
     assert!(d2.current_drift.items.is_empty(), "current_drift 不重复入 B");
-    assert_eq!(d2.changes_since.len(), 2, "按记录去重：seed 与 task 各一组");
+    // 播种的归属身份记录（principal）单独成组，不计入"seed 与 task 各一组"的本意断言。
+    let owner_id = seed_owner(&store, &types);
+    assert_eq!(
+        d2.changes_since.iter().filter(|g| g.id != owner_id).count(),
+        2,
+        "按记录去重：seed 与 task 各一组"
+    );
     let task_group = d2
         .changes_since
         .iter()
@@ -389,4 +397,31 @@ fn brief_never_creates_or_modifies_ledger() {
     // sessions/ 无任何台账。
     let (ledgers, _) = session::scan_ledgers(&store).unwrap();
     assert!(ledgers.is_empty(), "brief 纯读：台账只能由 session start / 写路径创建");
+}
+
+// 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。
+// 方案 principal-binding 决策①：受管创建需显式归属（principal 类型豁免）。
+fn seed_owner(store: &Store, types: &mem_schema::TypeSet) -> String {
+    let _ = types; // 直写不经类型声明（外部写入者形态，同 seed_project 先例；不产生事件）
+    let id = "0198f7a9-0000-7000-8000-0000000000a1".to_string();
+    let env = mem_core::envelope::Envelope {
+        id: id.clone(),
+        r#type: "principal".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        modified: "2026-11-19T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec!["test-owner".into()],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
+    };
+    let payload = serde_json::json!({"slug": "test-owner", "label": "测试归属"});
+    let bytes = mem_core::record::serialize_new(&env, &payload, b"");
+    let rel = "records/principal/test-owner.md";
+    let abs = store.abs(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(abs, bytes).unwrap();
+    id
 }

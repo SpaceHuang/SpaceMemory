@@ -107,7 +107,9 @@ fn init(dir: &std::path::Path) -> String {
 }
 
 fn add(s: &str, payload: &str) -> String {
-    let out = mem().args(["--store", s, "add", "doc", "--payload", payload]).output().unwrap();
+    let out = mem().args(["--store", s, "add", "doc",
+"--principal",
+"codex_main", "--payload", payload]).output().unwrap();
     assert!(out.status.success(), "add {payload}：{}", String::from_utf8_lossy(&out.stderr));
     j(&out)["id"].as_str().unwrap().to_string()
 }
@@ -160,7 +162,7 @@ fn r10_executor_and_frontend_equivalence_matrix() {
     let only_b = add(&s, r#"{"title":"beta","status":"x"}"#);
     let both = add(&s, r#"{"title":"alpha beta","status":"1"}"#);
     let _neither = add(&s, r#"{"title":"gamma","status":"x"}"#);
-    let out = mem().args(["--store", &s, "add", "alt", "--payload", r#"{"status":1}"#]).output().unwrap();
+    let out = mem().args(["--store", &s, "add", "alt", "--principal", "codex_main", "--payload", r#"{"status":1}"#]).output().unwrap();
     assert!(out.status.success());
     let alt1 = j(&out)["id"].as_str().unwrap().to_string();
 
@@ -276,7 +278,9 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
     let s = init(&dir);
     std::fs::create_dir_all(dir.join("types/doc")).unwrap();
     std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"target"}"#]).output().unwrap();
     assert!(out.status.success());
     let target = j(&out)["id"].as_str().unwrap().to_string();
@@ -311,7 +315,9 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
 
     // fix（修复 = 写入合法记录）→ 恢复参与检索（验收 10 收尾）。
     let fixed = format!(r#"{{"title":"target-fixed"}}"#);
-    let out = mem().args(["--store", &s, "add", "doc", "--payload", &fixed]).output().unwrap();
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload", &fixed]).output().unwrap();
     assert!(out.status.success());
     // 坏文件重写为合法记录（模拟 mem fix 的落盘结果——fix 命令本身已在 R6.3 覆盖）。
     let env_id = "01f9a000-0000-7000-8000-0000000000fx1";
@@ -342,7 +348,9 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     let s = init(&dir);
     std::fs::create_dir_all(dir.join("types/doc")).unwrap();
     std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
-    let out = mem().args(["--store", &s, "add", "doc", "--payload",
+    let out = mem().args(["--store", &s, "add", "doc",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"cap-target"}"#]).output().unwrap();
     assert!(out.status.success());
     for i in 0..201 {

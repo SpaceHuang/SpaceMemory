@@ -109,7 +109,9 @@ fn maintenance_race_second_write_not_confirmed_early() {
     let s = dir.to_str().unwrap().to_string();
     mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
     let out_t = mem()
-        .args(["--store", &s, "add", "memory", "--payload", r#"{"title":"race-target"}"#])
+        .args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload", r#"{"title":"race-target"}"#])
         .output()
         .unwrap();
     assert!(out_t.status.success());

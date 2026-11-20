@@ -16,6 +16,7 @@ use crate::event::{EventLog, Kind, Op};
 use crate::lock;
 use crate::paths;
 use crate::record::{self, Record};
+use crate::session;
 use crate::store::Store;
 use crate::token::{self, Token};
 use mem_schema::{TypeDecl, TypeSet};
@@ -52,6 +53,10 @@ pub struct WriteContext<'a> {
     pub committer: Option<&'a dyn CommitSink>,
     /// 会话台账 id（写路径 trail 兜底登记）。
     pub session_id: Option<&'a str>,
+    /// 可控暂停点（验收用：归属预检后暂停 → 并发写完成 → 恢复，先例
+    /// event.rs PauseHook）。生产前端恒 None；并发交错测试（方案
+    /// principal-binding §4.2 双分支反例）注入。
+    pub pause_hook: Option<crate::event::PauseHook>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,20 +343,125 @@ fn validate_payload_and_refs(
 }
 
 /// 唯一键路径独占创建（R3.3/D11）：输者返回既有记录及令牌。
+// ---------- 归属解析（写路径归属绑定，方案 principal-binding §2.1） ----------
+
+/// 归属参数解析（单源）：短名（slug）或记录 ID → principal 记录 ID。
+/// CLI 与 MCP 的同名重复实现收口于此（决策②：前端零逻辑）。
+/// 目标不存在时按既有"归属不存在"形态报（RefTargetMissing，防错报），不透传 MissingRecord。
+pub fn resolve_principal_ref(store: &Store, id_or_slug: &str) -> MemResult<String> {
+    let hit = get(store, id_or_slug).map_err(|e| match e {
+        MemError::MissingRecord { .. } => MemError::RefTargetMissing {
+            rel: "principal".into(),
+            target: format!("principal 记录不存在：{id_or_slug}（防错报，不防伪装）"),
+        },
+        other => other,
+    })?;
+    if hit.record.envelope.r#type != "principal" {
+        return Err(MemError::BadArgument(format!(
+            "{id_or_slug} 不是 principal 记录"
+        )));
+    }
+    Ok(hit.record.envelope.id)
+}
+
+/// principal 记录当前是否存在于 records/（锁外预检与锁内复核共用同一判定）。
+fn principal_exists_in_records(store: &Store, principal_id: &str) -> Option<String> {
+    let scan = match scan_all(store) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    scan.records
+        .iter()
+        .find(|r| r.record.envelope.r#type == "principal" && r.record.envelope.id == principal_id)
+        .map(|r| r.rel.clone())
+}
+
+/// 归属解析链第一段（决策①）：显式参数 > 会话台账 > 响亮拒绝。
+/// 返回 (归属 ID, 冲突告警)。台账缺失/损坏视为无台账（身份不从残缺现场猜出）。
+/// principal 类型豁免由调用方先行判断（决策④）。
+fn resolve_ownership(
+    ctx: &WriteContext,
+    explicit: &Option<String>,
+) -> MemResult<(Option<String>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let Some(explicit) = explicit.clone() else {
+        // 无显式归属 → 台账继承；无台账 → 响亮拒绝（错误给出路，M4 先例形态）。
+        let Some(sid) = ctx.session_id else {
+            return Err(MemError::BadArgument(
+                "归属缺失：必须显式提供 principal，或先 mem_session_start 建台账由其继承 \
+                （principal 类型豁免——身份/注册类记录可无归属）"
+                    .into(),
+            ));
+        };
+        let ledger = session::get(ctx.store, sid)?.ok_or_else(|| {
+            MemError::BadArgument(format!(
+                "归属缺失：台账 {sid} 不存在或已损坏——先 mem_session_start 建台账，\
+                 或显式提供 principal（principal 类型豁免）"
+            ))
+        })?;
+        return Ok((Some(ledger.principal), warnings));
+    };
+    let resolved = resolve_principal_ref(ctx.store, &explicit)?;
+    // 显式与台账不一致：显式胜出 + 中性事实告警（决策③；跨归属共享内容属合法常态）。
+    if let Some(sid) = ctx.session_id {
+        if let Ok(Some(ledger)) = session::get(ctx.store, sid) {
+            if ledger.principal != resolved {
+                warnings.push(format!(
+                    "显式 principal 与台账 principal 不同（{} vs {}）",
+                    resolved, ledger.principal
+                ));
+            }
+        }
+    }
+    Ok((Some(resolved), warnings))
+}
+
 pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     ctx.store.check_writable()?;
-    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
     let decl = ctx
         .types
         .get(&args.type_name)
         .ok_or_else(|| MemError::UnknownType(args.type_name.clone()))?;
+    // 归属两阶段校验·第一阶段（锁外预检，方案 §2.1）：解析链 + 存在性预检。
+    // 位置在最前段——gitattrs 写前核验与任何锁文件创建之前（锁外拒绝 = 全店逐字节一致，决策⑥）。
+    // 豁免：principal 类型（自举与注册；显式提供时仍校验，决策④）。
+    let (resolved_principal, warnings) = if args.type_name == "principal" {
+        match &args.principal {
+            None => (None, Vec::new()),
+            Some(p) => {
+                let (r, w) = resolve_ownership(ctx, &Some(p.clone()))?;
+                (r, w)
+            }
+        }
+    } else {
+        resolve_ownership(ctx, &args.principal)?
+    };
+    if let Some(pid) = &resolved_principal {
+        if principal_exists_in_records(ctx.store, pid).is_none() {
+            return Err(MemError::RefTargetMissing {
+                rel: "principal".into(),
+                target: format!(
+                    "principal 记录不存在：{pid}（防错报，不防伪装）"
+                ),
+            });
+        }
+    }
+    if let Some(hook) = &ctx.pause_hook {
+        hook("principal_precheck");
+    }
     // 引用存在性与发布必须在同一屏障内；新增 x-dag 节点也与全图修改串行。
     let _barrier = if decl.dag() {
         lock::barrier_exclusive(ctx.store)?
     } else {
         lock::barrier_shared(ctx.store)?
     };
-    let warnings = validate_payload_and_refs(ctx.store, decl, &args.payload, &args.principal)?;
+    // 归属存在性由两阶段校验承担（§2.1）——此处不传归属，避免暂停点之后的
+    // 重复扫描与不一致文案（决策⑥：预检文案只属于锁外拒绝路径）。
+    let no_principal: Option<String> = None;
+    let warnings = validate_payload_and_refs(ctx.store, decl, &args.payload, &no_principal)?
+        .into_iter()
+        .chain(warnings)
+        .collect();
     let comps = key_components(decl, &args.payload)?;
     let id = new_uuid_v7();
     let rel = paths::derive_record_rel(&args.type_name, &comps, &id)?;
@@ -363,7 +473,7 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         created: now.clone(),
         modified: now,
         version: 1,
-        principal: args.principal.clone(),
+        principal: resolved_principal.clone(),
         refs: mirror_refs(decl, &args.payload, &[]),
         aliases: {
             let mut a = Vec::new();
@@ -380,6 +490,49 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
     let bytes = record::serialize_new(&envelope, &args.payload, &args.body);
 
     let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
+    // 归属两阶段校验·第二阶段（锁内复核，方案 §2.1 决策⑥）：预检通过后、任何写盘
+    // 之前，持归属 principal 的记录锁（锁序：新记录锁 → principal 锁 → 事件序列锁，
+    // 单向无环）重新确认身份仍在 records/——与删除在 principal 锁上串行，悬空归属
+    // 在受管并发下结构性排除。锁文件豁免于真相层净零断言（决策⑥）。
+    let principal_rel = match &resolved_principal {
+        Some(pid) => match principal_exists_in_records(ctx.store, pid) {
+            Some(rel) => Some((pid.clone(), rel)),
+            None => {
+                return Err(MemError::RefTargetMissing {
+                    rel: "principal".into(),
+                    target: format!("创建期间归属身份已被删除：{pid}（可恢复后重试，或改用其他身份）"),
+                });
+            }
+        },
+        None => None,
+    };
+    // 同路径自锁防御：显式指定自身为归属（重复创建同一 principal）时，归属锁与
+    // 新记录锁指向同一路径——记录锁不可重入，二次获取会等待 30 秒超时而非走
+    // 输者协议。同路径即复用已持有的记录锁完成复核。
+    let same_path = principal_rel
+        .as_ref()
+        .map_or(false, |(_, prel)| prel == &rel);
+    let _principal_lock = if same_path {
+        None
+    } else {
+        match &principal_rel {
+            Some((_, rel)) => {
+                Some(lock::record_lock(ctx.store, rel, std::time::Duration::from_secs(30))?)
+            }
+            None => None,
+        }
+    };
+    if let Some((pid, _)) = &principal_rel {
+        if principal_exists_in_records(ctx.store, pid).is_none() {
+            return Err(MemError::RefTargetMissing {
+                rel: "principal".into(),
+                target: format!("创建期间归属身份已被删除：{pid}（可恢复后重试，或改用其他身份）"),
+            });
+        }
+    }
+    // BD5 ②③：受管写前核验——位于锁内复核之后、记录文件创建之前，保证锁内
+    // 复核拒绝路径不留下 .gitattributes（决策⑥：锁内拒绝真相层净零）。
+    crate::gitattrs::ensure_for_write(ctx.store)?;
     // 唯一性强制点：路径原子独占（不在索引，红线8）。
     let target = ctx.store.abs(&rel);
     if target.is_file() {
@@ -800,6 +953,73 @@ fn dag_merge_precheck(
 
 // ---------- delete / restore ----------
 
+/// 归属依赖者：信封归属字段指向该 id 的现存记录（方案 principal-binding 决策⑦）。
+/// 归属字段不在 refs 集合内，独立扫描——两个域的统一审计职责在 verify（决策⑦）。
+fn ownership_dependents(store: &Store, id: &str) -> MemResult<Vec<(String, String)>> {
+    let scan = scan_all(store)?;
+    Ok(scan
+        .records
+        .iter()
+        .filter(|r| r.record.envelope.principal.as_deref() == Some(id))
+        .map(|r| (r.record.envelope.id.clone(), r.rel.clone()))
+        .collect())
+}
+
+/// 删除依赖阻止/告警判定（引用边 ∪ 归属字段；默认阻止，force 显式越过）。
+/// 锁外预检与锁内复核共用同一判定——告警计数以锁内复核为准（决策⑦）。
+fn delete_dependency_guard(
+    dependents: &[(String, String)],
+    owned: &[(String, String)],
+    target_id: &str,
+    force: bool,
+    warnings: &mut Vec<String>,
+) -> MemResult<()> {
+    if !force {
+        if !dependents.is_empty() || !owned.is_empty() {
+            let mut parts = Vec::new();
+            if !dependents.is_empty() {
+                parts.push(format!(
+                    "{} 条引用（{:?}）",
+                    dependents.len(),
+                    dependents
+                        .iter()
+                        .map(|(id, rel)| format!("{id}:{rel}"))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if !owned.is_empty() {
+                parts.push(format!(
+                    "{} 条归属（{:?}）",
+                    owned.len(),
+                    owned
+                        .iter()
+                        .map(|(id, rel)| format!("{id}:{rel}"))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            return Err(MemError::BadArgument(format!(
+                "删除被依赖阻止：{} 指向 {}——先处理依赖或使用 force（受管 tombstone 可恢复）",
+                parts.join("、"),
+                target_id
+            )));
+        }
+        return Ok(());
+    }
+    if !dependents.is_empty() {
+        warnings.push(format!(
+            "force 删除：{} 条引用悬空（断链注记由 verify/agenda 报告）",
+            dependents.len()
+        ));
+    }
+    if !owned.is_empty() {
+        warnings.push(format!(
+            "force 删除：{} 条记录归属悬空（断链注记由 verify 报告）",
+            owned.len()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Deleted {
     pub rel: String, // attic 路径
@@ -833,29 +1053,28 @@ pub fn delete_locked(
     if cur.rel.starts_with("attic/") {
         return Err(MemError::BadArgument("已是 tombstone".into()));
     }
-    // 反向引用（R3.4/R9.2：依赖者显式警示，不静默悬空）。
+    // 删除依赖（R3.4/R9.2 引用边 ∪ 归属字段，方案 principal-binding 决策⑦）：
+    // 锁外预检（快速失败）。
     let dependents = reverse_refs(ctx.store, &cur.record.envelope.id)?;
+    let owned = ownership_dependents(ctx.store, &cur.record.envelope.id)?;
     let mut warnings = Vec::new();
-    if !dependents.is_empty() {
-        if !force {
-            return Err(MemError::BadArgument(format!(
-                "删除被引用阻止：{} 条引用指向 {}（{:?}）——先处理依赖或使用 force（受管 tombstone 可恢复）",
-                dependents.len(),
-                cur.record.envelope.id,
-                dependents
-                    .iter()
-                    .map(|(id, rel)| format!("{id}:{rel}"))
-                    .collect::<Vec<_>>()
-            )));
-        }
-        warnings.push(format!(
-            "force 删除：{} 条引用悬空（断链注记由 verify/agenda 报告）",
-            dependents.len()
-        ));
-    }
+    delete_dependency_guard(&dependents, &owned, &cur.record.envelope.id, force, &mut warnings)?;
     let attic_rel = paths::attic_rel(&cur.rel)?;
     paths::validate_store_record_path(ctx.store, &attic_rel)?;
     let _rec = lock::record_lock(ctx.store, &cur.rel, std::time::Duration::from_secs(30))?;
+    // 依赖锁内复核（决策⑦）："删除预检通过 → add 创建归属记录 → 删除取锁执行"的
+    // 窗口在此堵住——同判定再算一遍，告警计数以锁内复核为准。
+    let dependents_in_lock = reverse_refs(ctx.store, &cur.record.envelope.id)?;
+    let owned_in_lock = ownership_dependents(ctx.store, &cur.record.envelope.id)?;
+    let mut warnings_in_lock = Vec::new();
+    delete_dependency_guard(
+        &dependents_in_lock,
+        &owned_in_lock,
+        &cur.record.envelope.id,
+        force,
+        &mut warnings_in_lock,
+    )?;
+    warnings = warnings_in_lock;
     let (fresh, bytes) = read_fresh(ctx.store, &cur.rel)?;
     let current = token::for_bytes(fresh.envelope.version, &bytes);
     token::cas_check(expect, &current)?;
@@ -1409,6 +1628,7 @@ pub fn fix_record(
                     by: "mem fix".into(),
                     committer,
                     session_id: None,
+                    pause_hook: None,
                 },
                 &env.id,
                 &env.r#type,
@@ -1808,6 +2028,68 @@ pub fn mirror_consistency_audit(
                 Some(_) => {}
             }
         }
+    }
+    Ok(out)
+}
+
+/// 归属完整性审计（方案 principal-binding 决策⑦，评审 B7）。
+///
+/// 非空 `envelope.principal` 的记录，其目标必须仍为 records/ 中现存的 principal
+/// 记录；断链按既有断链注记形态报告三要素（来源记录 from、目标身份 target、
+/// 修复入口 repair）。修复入口按缺位形态分写（终审定稿措辞）：目标在隔离区
+/// （受管删除的 tombstone）→ "恢复身份记录"；目标缺失（外部删除造成的 absent，
+/// 无受管 tombstone）→ 如实报告并给历史/备份恢复指引——恢复通道只对隔离区
+/// tombstone 必然可用，不笼统承诺同一入口。
+///
+/// 与镜像审计的关系：执行层统一扫描引用镜像与归属两个字段域（不把归属隐式
+/// 复制进 envelope.refs——信封字段与公开格式零变更，B1 契约）。agenda 不在
+/// 本审计的扫描范围（决策⑦）。
+pub fn principal_binding_audit(store: &Store) -> MemResult<Vec<serde_json::Value>> {
+    let scan = scan_all(store)?;
+    let principal_ids: std::collections::HashSet<_> = scan
+        .records
+        .iter()
+        .filter(|r| r.record.envelope.r#type == "principal")
+        .map(|r| r.record.envelope.id.clone())
+        .collect();
+    // 隔离区中的身份 id（受管 tombstone；坏文件跳过——坏条目审计另行覆盖）。
+    let mut attic_ids = std::collections::HashSet::new();
+    let attic_dir = store.abs("attic/principal");
+    if attic_dir.is_dir() {
+        for entry in std::fs::read_dir(&attic_dir).map_err(|e| MemError::io("attic/principal", e))? {
+            let path = match entry {
+                Ok(e) => e.path(),
+                Err(e) => return Err(MemError::io("attic/principal", e)),
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(rec) = Record::from_bytes(&bytes) {
+                    attic_ids.insert(rec.envelope.id.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in &scan.records {
+        let Some(p) = r.record.envelope.principal.as_deref() else {
+            continue;
+        };
+        if principal_ids.contains(p) {
+            continue;
+        }
+        let repair = if attic_ids.contains(p) {
+            format!("身份已被删除进隔离区——恢复身份记录（mem restore {p}）")
+        } else {
+            "身份缺失（外部删除，无受管 tombstone）——如实报告缺失；可从历史/备份恢复身份后重建归属".to_string()
+        };
+        out.push(serde_json::json!({
+            "from": r.record.envelope.id,
+            "rel": "principal",
+            "target": p,
+            "repair": repair,
+        }));
     }
     Ok(out)
 }

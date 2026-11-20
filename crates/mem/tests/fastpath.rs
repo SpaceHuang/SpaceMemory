@@ -47,13 +47,17 @@ fn fastpath_end_to_end_via_production_binary() {
     mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
     // 造两条记录（principal 已自举；再补 project + task）。
     let out_p = mem()
-        .args(["--store", &s, "add", "project", "--payload",
+        .args(["--store", &s, "add", "project",
+"--principal",
+"codex_main", "--payload",
             r#"{"slug":"proj","title":"P","status":"active"}"#])
         .output()
         .unwrap();
     assert!(out_p.status.success());
     let out_t = mem()
-        .args(["--store", &s, "add", "task", "--payload",
+        .args(["--store", &s, "add", "task",
+"--principal",
+"codex_main", "--payload",
             &format!(
                 r#"{{"project":"{}","slug":"t1","title":"T","status":"todo"}}"#,
                 j(&out_p)["id"].as_str().unwrap()
@@ -277,23 +281,35 @@ fn r4_regressions_view_index_paging() {
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
     mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
-    let out_p1 = mem().args(["--store", &s, "add", "project", "--payload",
+    let out_p1 = mem().args(["--store", &s, "add", "project",
+"--principal",
+"codex_main", "--payload",
         r#"{"slug":"p1","title":"P1","status":"active"}"#]).output().unwrap();
     let p1 = j(&out_p1)["id"].as_str().unwrap().to_string();
-    let out_p2 = mem().args(["--store", &s, "add", "project", "--payload",
+    let out_p2 = mem().args(["--store", &s, "add", "project",
+"--principal",
+"codex_main", "--payload",
         r#"{"slug":"p2","title":"P2","status":"active"}"#]).output().unwrap();
     let p2 = j(&out_p2)["id"].as_str().unwrap().to_string();
-    let out_t1 = mem().args(["--store", &s, "add", "task", "--payload",
+    let out_t1 = mem().args(["--store", &s, "add", "task",
+"--principal",
+"codex_main", "--payload",
         &format!(r#"{{"project":"{p1}","slug":"t-one","title":"Tone","status":"todo"}}"#)]).output().unwrap();
     let t1 = j(&out_t1)["id"].as_str().unwrap().to_string();
-    mem().args(["--store", &s, "add", "task", "--payload",
+    mem().args(["--store", &s, "add", "task",
+"--principal",
+"codex_main", "--payload",
         &format!(r#"{{"project":"{p2}","slug":"t-two","title":"Ttwo","status":"todo"}}"#)]).output().unwrap();
     // 视图：types=["task"] + refs=[project=P1]（复合过滤——只能直读）。
-    let out_v = mem().args(["--store", &s, "add", "view", "--payload",
+    let out_v = mem().args(["--store", &s, "add", "view",
+"--principal",
+"codex_main", "--payload",
         &format!(r#"{{"slug":"p1-tasks","title":"V","filter":{{"types":["task"],"refs":[{{"rel":"project","target":"{p1}"}}]}}}}"#)]).output().unwrap();
     let vid = j(&out_v)["id"].as_str().unwrap().to_string();
     // 空类型视图（合法输入——r4 B1 曾使其 panic）。
-    let out_ve = mem().args(["--store", &s, "add", "view", "--payload",
+    let out_ve = mem().args(["--store", &s, "add", "view",
+"--principal",
+"codex_main", "--payload",
         r#"{"slug":"empty-types","title":"VE","filter":{"types":[]}}"#]).output().unwrap();
     let vid_empty = j(&out_ve)["id"].as_str().unwrap().to_string();
 
@@ -336,9 +352,13 @@ fn r4_regressions_view_index_paging() {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().expect("sidecar 重启");
     // 写一条 memory（变更触发收敛维护）。
-    mem().args(["--store", &s, "add", "memory", "--payload",
+    mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"shared-alpha"}"#]).output().unwrap();
-    mem().args(["--store", &s, "add", "memory", "--payload",
+    mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"shared-beta"}"#]).output().unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 60, 100),
         "维护收敛后索引应回来");
@@ -372,7 +392,9 @@ fn r7_regressions_find_equivalence_trace_resume_brief_budget() {
     // 四条 memory：含 % 字面、Ärger（非 ASCII 大写）、两条 shared-*（分页用）。
     for (i, title) in ["plain", "Ärger", "shared-alpha", "shared-beta"].iter().enumerate() {
         let payload = serde_json::json!({"title": title, "n": i});
-        mem().args(["--store", &s, "add", "memory", "--payload", &payload.to_string()])
+        mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload", &payload.to_string()])
             .output().unwrap();
     }
     // trace 链 A→B→C（lesson x-dag 类型）。
@@ -383,7 +405,9 @@ fn r7_regressions_find_equivalence_trace_resume_brief_budget() {
             types_dir.join("schema.json"),
             r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","x-grade":"strict","x-unique-key":["slug"],"x-dag":true,"properties":{"slug":{"type":"string"},"title":{"type":"string"}},"required":["slug","title"]}"#,
         ).unwrap();
-        mem().args(["--store", &s, "add", "lesson", "--payload",
+        mem().args(["--store", &s, "add", "lesson",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"slug":"{}","title":"{}"}}"#, slug, slug)]).output().unwrap()
     };
     let la = mk_lesson("tr-a");
@@ -510,11 +534,15 @@ fn r8_regressions_hit_surface_budget_floor_trace_budget() {
     assert!(out_init.status.success(), "init 失败: {} / {}",
         String::from_utf8_lossy(&out_init.stdout), String::from_utf8_lossy(&out_init.stderr));
     // 两条 memory：标题含大写非 ASCII（Ärger）与普通（plain）；正文含 NFD 形式内容。
-    let o1 = mem().args(["--store", &s, "add", "memory", "--payload",
+    let o1 = mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"Ärger"}"#]).output().unwrap();
     assert!(o1.status.success(), "add Ärger 失败: {} / {}",
         String::from_utf8_lossy(&o1.stdout), String::from_utf8_lossy(&o1.stderr));
-    let o2 = mem().args(["--store", &s, "add", "memory", "--payload",
+    let o2 = mem().args(["--store", &s, "add", "memory",
+"--principal",
+"codex_main", "--payload",
         r#"{"title":"plain"}"#]).output().unwrap();
     assert!(o2.status.success(), "add plain 失败: {} / {}",
         String::from_utf8_lossy(&o2.stdout), String::from_utf8_lossy(&o2.stderr));
@@ -613,7 +641,9 @@ fn r8_regressions_hit_surface_budget_floor_trace_budget() {
     // 链方向：A --derived_from--> B --derived_from--> C（up 沿 refs 找目标）。
     // link 源 = 第一个参数（源记录加边，目标不写）。
     let mk = |slug: &str| {
-        let o = mem().args(["--store", &s, "add", "lesson", "--payload",
+        let o = mem().args(["--store", &s, "add", "lesson",
+"--principal",
+"codex_main", "--payload",
             &format!(r#"{{"slug":"{}","title":"{}"}}"#, slug, slug)]).output().unwrap();
         let v = j(&o);
         (v["id"].as_str().unwrap().to_string(), v["token"].as_str().unwrap().to_string())
@@ -662,13 +692,19 @@ fn r11_regressions_case_insensitive_prefix_cross_mode_paging() {
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
     mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
-    let out_p = mem().args(["--store", &s, "add", "project", "--payload",
+    let out_p = mem().args(["--store", &s, "add", "project",
+"--principal",
+"codex_main", "--payload",
         r#"{"slug":"proj","title":"P","status":"active"}"#]).output().unwrap();
     let p_id = j(&out_p)["id"].as_str().unwrap().to_string();
-    let out_t1 = mem().args(["--store", &s, "add", "task", "--payload",
+    let out_t1 = mem().args(["--store", &s, "add", "task",
+"--principal",
+"codex_main", "--payload",
         &format!(r#"{{"project":"{p_id}","slug":"alpha-one","title":"Alpha One","status":"todo"}}"#)]).output().unwrap();
     let t1 = j(&out_t1)["id"].as_str().unwrap().to_string();
-    let out_t2 = mem().args(["--store", &s, "add", "task", "--payload",
+    let out_t2 = mem().args(["--store", &s, "add", "task",
+"--principal",
+"codex_main", "--payload",
         &format!(r#"{{"project":"{p_id}","slug":"alpha-two","title":"Alpha Two","status":"todo"}}"#)]).output().unwrap();
     let t2 = j(&out_t2)["id"].as_str().unwrap().to_string();
 
