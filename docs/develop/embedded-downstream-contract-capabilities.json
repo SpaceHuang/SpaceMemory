@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "product_version": "1.0.0",
+  "formats": {
+    "read_write": ["spacememory/2"],
+    "read_only": ["1"]
+  },
+  "features": {
+    "supported": ["event.restore_body/v1"],
+    "read_compatible": []
+  },
+  "stable_rust_api": "embedded-downstream-contract-api.md",
+  "change_log": "embedded-downstream-contract-changelog.md",
+  "mcp_tools_source": "../../crates/mem-mcp/src/tools.rs",
+  "validated_coexistence": [],
+  "release_evidence": {
+    "status": "candidate-only",
+    "reason": "No stable contract release, protected tag, or historical binary matrix has been verified."
+  }
+}

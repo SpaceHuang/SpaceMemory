@@ -6,4 +6,6 @@
 2. [type-declaration.md](type-declaration.md) —— 类型声明两件套格式规范（D19：JSON Schema 2020-12 + x-* 词汇表 + 键字符集规则）+ task 试金石契约
 3. [conventions-source.md](conventions-source.md) —— 约定文档单一事实源结构（含角色段、多级下发，R7.4）
 
+共店兼容与防护格式的实现增量见[嵌入式下游契约技术方案](../develop/embedded-downstream-contract-design.md)；该文档不替代本规范对记录与事件格式的权威定义。
+
 规范定稿后进入评审；实现与规范冲突时，以规范评审结论为准。

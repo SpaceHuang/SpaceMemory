@@ -4,6 +4,7 @@
 - 上游：`docs/requirement/agent-memory-requirements.md` v1.2、`docs/develop/agent-memory-design.md`（D3/D5/D11/D12/D13/D17/D18/D19，红线 6/10/18/19/20/22/24/26/27）
 - 本文是**公开规范**（D8）：存储格式的单一事实源。实现与本规范冲突时，以规范评审结论为准。
 - 记号：`记录状态三元组` = `(location ∈ {records, attic, absent}, version, digest)`；`修订令牌` = `v<版本>@<完整 SHA-256 十六进制>`。
+- 共店防护增量（2026-11-22）：防护基础格式使用字符串 `spacememory/2`，并在 `mem.json` 写入 `required_features` 字符串数组；旧数字格式 `1` 仅可显式只读打开，迁移经停机 `mem migrate --backup-identity <备份身份>` 执行。配置原子替换是唯一完成点：磁盘仍为源格式表示可核对备份后重试，目标格式表示进入迁后核验。当前首个按需特性 `event.restore_body/v1` 在正文恢复前登记；迁移旧格式时，若经校验的历史事件含 `restore_body`，迁移自动补入该标记。首发支持能力和迁移/回退细节见[下游契约技术方案](../develop/embedded-downstream-contract-design.md)。
 
 ---
 
@@ -286,13 +287,14 @@ frontmatter 损坏的记录：`mem fix <id|路径>` 交互重建——git 历史
 
 ## 9. 版本与演化
 
-- 本规范版本号：`format_version = 1`。向后兼容的扩展（新增可选字段/新 op）升 minor 版本记录于本文件修订表；
+- 本文文档版本号见修订表；示例配置的 `format_version` 是店数据目录基础格式标识，二者不是同一个版本字段。向后兼容扩展按规范修订记录；
 - 类型声明格式规范见 [type-declaration.md](type-declaration.md)；约定事实源见 [conventions-source.md](conventions-source.md)。
 
 ### 修订表
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| v1.1.0 | 2026-11-22 | 共店防护增量：字符串基础格式 `spacememory/2`、`required_features` 集合、旧数字格式只读与停机迁移指针；迁移细节归档于下游契约技术方案 |
 | v1.0 | 2026-11-05 | 初版：D18/D19 落规范；收口开放问题40（`init.template_dir`）、问题25（默认预算）、问题37（默认空闲阈值） |
 | v1.0.2 | 2026-11-05 | §5 检查点发布收敛纪律（实施评审 r4 B3/B2）：维护→新鲜查询→收敛才发布；index_epoch 代际核对；读路径只读打开索引不建库 |
 | v1.0.1 | 2026-11-05 | §4.2 撕裂尾行措辞修正（实施评审 B1）："补 
