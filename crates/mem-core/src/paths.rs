@@ -77,7 +77,7 @@ pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
 
 /// 校验 store 根目录中的机制锁文件；只允许列明的固定文件名。
 pub fn validate_store_root_lock(store: &Store, rel: &str) -> MemResult<()> {
-    if !matches!(rel, "barrier.lock" | "events.lock" | "serve.lock") {
+    if !matches!(rel, "barrier.lock" | "events.lock" | "serve.lock" | "migration.lock") {
         return Err(MemError::BadArgument(format!("机制锁路径非法：{rel}")));
     }
     let root = std::fs::canonicalize(store.root())

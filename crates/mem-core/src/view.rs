@@ -119,6 +119,7 @@ pub fn execute_from(store: &Store, view_id: &str, limit: usize, offset: usize) -
 
 /// 按过滤器执行（brief/list 的底层入口）。
 pub fn execute_filter(store: &Store, filter: &ViewFilter, limit: usize, offset: usize) -> MemResult<ViewResult> {
+    store.read_compatible_missing_features()?;
     let scan = ops::scan_all(store)?;
     let mut matched: Vec<Scanned> = scan
         .records
@@ -141,9 +142,11 @@ pub fn execute_filter(store: &Store, filter: &ViewFilter, limit: usize, offset: 
         .map(|s| ListItem { rel: s.rel, envelope: s.record.envelope, token: s.token })
         .collect();
     let remaining = total.saturating_sub(offset + page.len());
-    Ok(ViewResult {
+    let result = ViewResult {
         truncated: remaining > 0,
         resume_hint: if remaining > 0 { Some(ResumeHint { offset: offset + page.len() }) } else { None },
         items: page,
-    })
+    };
+    store.read_compatible_missing_features()?;
+    Ok(result)
 }

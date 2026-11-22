@@ -73,7 +73,7 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn add_task(store: &Store, types: &TypeSet, slug: &str, body: &str) -> String {
-    let c = ops::WriteContext { store, types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
+    let c = ops::WriteContext::new(store, types, "t").with_committer(None).with_session_id(None);
     ops::add(&c, ops::AddArgs {
         type_name: "task".into(),
         payload: serde_json::json!({
@@ -197,6 +197,7 @@ fn assert_first_read_returns_new_value(scenario: Scenario, force_readonly: bool)
     let id = add_task(&store, &types, "fresh-target", "old-body");
     // 模拟"索引检查点 + 订阅都还在"的世界（证明式协议的世界观），然后 sidecar 停止。
     let cp = Checkpoint {
+        format_version: store.config().format_version.clone(),
         ts: mem_core::clock::now_rfc3339(),
         entries: freshness::stat_snapshot(&store),
         index_epoch: 0,
@@ -227,14 +228,7 @@ fn assert_first_read_returns_new_value(scenario: Scenario, force_readonly: bool)
     assert!(list.items.iter().any(|i| i.envelope.id == id), "list 直读可见");
     if force_readonly {
         // 只读档：写类操作结构化拒绝（§3.4 跨档行）。
-        let c = ops::WriteContext {
-            store: &store_ref,
-            types: &types,
-            by: "t".into(),
-            committer: None,
-            session_id: None,
-            pause_hook: None,
-        };
+        let c = ops::WriteContext::new(&store_ref, &types, "t").with_committer(None).with_session_id(None);
         // ReadOnly 在 check_writable（归属解析之前）即返回——归属传 None 即可。
         assert!(matches!(
             ops::add(&c, ops::AddArgs {
@@ -285,7 +279,7 @@ fn freshness_proof_requires_both_conditions() {
     let m = freshness::consult(&store, None, None);
     assert!(m.is_direct());
     // 有检查点 + 有订阅 + stat 一致 + 无未消化 → 快路径。
-    let cp = Checkpoint { ts: mem_core::clock::now_rfc3339(), entries: freshness::stat_snapshot(&store), index_epoch: 0 };
+    let cp = Checkpoint { format_version: store.config().format_version.clone(), ts: mem_core::clock::now_rfc3339(), entries: freshness::stat_snapshot(&store), index_epoch: 0 };
     struct OkSub;
     impl Subscription for OkSub {
         fn undigested_changes_since(&self, _ts: &str) -> Option<u64> {
@@ -297,6 +291,20 @@ fn freshness_proof_requires_both_conditions() {
     }
     let m = freshness::consult(&store, Some(&cp), Some(&OkSub));
     assert_eq!(m, ReadMode::Indexed { via_subscription: "usn".into() });
+    let cp_path = freshness::checkpoint_path(&store);
+    freshness::save_checkpoint_test(&store, &cp).unwrap();
+    let checkpoint_bytes = std::fs::read(&cp_path).unwrap();
+    let record_stats = freshness::stat_snapshot(&store);
+    let record_bytes: Vec<_> = record_stats.keys().map(|rel| (rel.clone(), std::fs::read(store.abs(rel)).unwrap())).collect();
+    let mut legacy_checkpoint = cp.clone();
+    legacy_checkpoint.format_version = "1".into();
+    let mode = freshness::consult(&store, Some(&legacy_checkpoint), Some(&OkSub));
+    assert!(mode.is_direct(), "新增必需特性后旧检查点不得服务索引读取: {mode:?}");
+    assert_eq!(freshness::stat_snapshot(&store), record_stats, "模拟迁移不得改变记录 stat");
+    for (rel, bytes) in record_bytes {
+        assert_eq!(std::fs::read(store.abs(rel)).unwrap(), bytes, "读取不得改写记录");
+    }
+    assert_eq!(std::fs::read(&cp_path).unwrap(), checkpoint_bytes, "读取不得清理或改写旧 checkpoint");
     // 订阅报告未消化变更 → 直读（索引落后）。
     struct LagSub;
     impl Subscription for LagSub {

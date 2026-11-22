@@ -83,14 +83,7 @@ fn write_principal(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet, session_id: Option<&'a str>) -> WriteContext<'a> {
-    WriteContext {
-        store,
-        types,
-        by: "t".into(),
-        committer: None,
-        session_id,
-        pause_hook: None,
-    }
+    WriteContext::new(store, types, "t").with_committer(None).with_session_id(session_id)
 }
 
 fn add_memory(
@@ -316,15 +309,8 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
             tx.send(()).unwrap();
             rx.lock().unwrap().recv().unwrap();
         });
-        let c = WriteContext {
-            store: &s2,
-            types: &t2,
-            by: "add".into(),
-            committer: None,
-            session_id: Some(&add_session),
-            pause_hook: Some(hook),
-        };
-        ops::add(
+        let c = WriteContext::new(&s2, &t2, "add").with_committer(None).with_session_id(Some(&add_session));
+        ops::add_with_pause_hook_test(
             &c,
             AddArgs {
                 type_name: "memory".into(),
@@ -332,6 +318,7 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
                 body: b"".to_vec(),
                 principal: None,
             },
+            hook,
         )
     });
 
@@ -346,14 +333,7 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
     std::thread::spawn(move || {
         let s2 = Store::open(&del_root, OpenMode::Auto).unwrap();
         let t2 = TypeSet::load_dir(&del_types).unwrap();
-        let c = WriteContext {
-            store: &s2,
-            types: &t2,
-            by: "del".into(),
-            committer: None,
-            session_id: None,
-            pause_hook: None,
-        };
+        let c = WriteContext::new(&s2, &t2, "del").with_committer(None).with_session_id(None);
         ops::delete_record(&c, &del_owner, &del_tok, false).unwrap();
     })
     .join()

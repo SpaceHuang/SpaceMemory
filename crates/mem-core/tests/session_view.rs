@@ -100,14 +100,7 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext {
-        store,
-        types,
-        by: "w".into(),
-        committer: None,
-        session_id: None,
-                pause_hook: None,
-    }
+    WriteContext::new(store, types, "w").with_committer(None).with_session_id(None)
 }
 
 fn add_principal(store: &Store, types: &TypeSet, slug: &str) -> String {
@@ -158,26 +151,39 @@ fn add_task(store: &Store, types: &TypeSet, project: &str, slug: &str) -> String
 // ---------- 台账：显式建立 / 幂等键 / 接手（D13 / 红线25） ----------
 
 #[test]
-fn start_creates_ledger_with_watermark_and_is_idempotent() {
+fn scanning_missing_session_directory_is_read_only() {
     let (_t, store, _types) = fresh_store();
-    // 先写一条记录，让事件日志有水位。
-    let log = EventLog::new(&store);
-    log.append_simple(
-        "x",
-        "records/x.md",
-        mem_core::event::Op::Create,
-        None,
-        Some(1),
-        None,
-        Some("d"),
-        "t",
+    let sessions = store.abs("sessions");
+    std::fs::remove_dir_all(&sessions).unwrap();
+
+    let (ledgers, warnings) = session::scan_ledgers(&store).unwrap();
+
+    assert!(ledgers.is_empty());
+    assert!(warnings.is_empty());
+    assert!(!sessions.exists(), "只读台账扫描不得创建 sessions 目录");
+}
+
+#[test]
+fn start_creates_ledger_with_watermark_and_is_idempotent() {
+    let (_t, store, types) = fresh_store();
+    // 用正式写入口创建 principal，使事件水位来自真实记录/事件事务。
+    let principal = ops::add(
+        &WriteContext::new(&store, &types, "test"),
+        AddArgs {
+            type_name: "principal".into(),
+            payload: serde_json::json!({"slug": "session-watermark", "label": "session test"}),
+            body: Vec::new(),
+            principal: None,
+        },
     )
-    .unwrap();
-    let principal = "0198p";
+    .unwrap()
+    .record
+    .envelope
+    .id;
     let o1 = session::start(
         &store,
         StartArgs {
-            principal: principal.into(),
+            principal: principal.clone(),
             view: Some("view-backend".into()),
             task_ref: Some("task-1".into()),
             handoff: HandoffSpec::None,
@@ -185,14 +191,14 @@ fn start_creates_ledger_with_watermark_and_is_idempotent() {
         },
     )
     .unwrap();
-    assert_eq!(o1.ledger.watermark, 1, "水位 = 建立时事件序号");
+    assert_eq!(o1.ledger.watermark, 1, "水位 = 正式 principal 写入的事件序号");
     assert_eq!(o1.ledger.status, session::Status::Active);
     assert!(o1.resumed_from.is_none());
     // 幂等键 = principal + view + task_ref：同键 start 返回既有台账。
     let o2 = session::start(
         &store,
         StartArgs {
-            principal: principal.into(),
+            principal: principal.clone(),
             view: Some("view-backend".into()),
             task_ref: Some("task-1".into()),
             handoff: HandoffSpec::None,
@@ -497,6 +503,40 @@ fn write_path_fallback_creates_ledger_and_registers_trail() {
         updated.trail
     );
     // 纯读 brief 不在此测试（CLI 层）；台账创建触发器没有一个是读命令。
+}
+
+#[test]
+fn existing_session_handle_rejects_session_writes_after_disk_features_change() {
+    let (_t, store, _types) = fresh_store();
+    let args = StartArgs {
+        principal: "session-feature-owner".into(),
+        view: None,
+        task_ref: Some("before-change".into()),
+        handoff: HandoffSpec::None,
+        idle_secs: 86_400,
+    };
+    let started = session::start(&store, args.clone()).unwrap();
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["session.future/v1"]);
+    std::fs::write(store.abs("mem.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let before_sessions = dir_snapshot(&store.abs("sessions"));
+    let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
+
+    let start_error = session::start(&store, StartArgs { task_ref: Some("after-change".into()), ..args }).unwrap_err();
+    let flush_error = session::flush(&store, &started.ledger.id, vec!["read-id".into()], None).unwrap_err();
+    let close_error = session::close(&store, &started.ledger.id).unwrap_err();
+    for err in [start_error, flush_error, close_error] {
+        assert!(matches!(err, mem_core::error::MemError::MissingFeatures(_)), "{err}");
+    }
+    assert_eq!(dir_snapshot(&store.abs("sessions")), before_sessions);
+    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+}
+
+fn dir_snapshot(path: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    std::fs::read_dir(path).unwrap().map(|entry| {
+        let path = entry.unwrap().path();
+        (path.file_name().unwrap().into(), std::fs::read(&path).unwrap())
+    }).collect()
 }
 
 // ---------- 视图：声明式查询模板（D10，只依赖信封 R8.4） ----------

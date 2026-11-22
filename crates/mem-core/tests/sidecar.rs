@@ -103,7 +103,7 @@ fn maintenance_rebuilds_checkpoint_on_change() {
     // 追加变更（写例程之外的直接事件）→ 维护循环检测 → 检查点时间戳前进。
     let cp1 = mem_core::freshness::load_checkpoint(&store).unwrap();
     mem_core::event::EventLog::new(&store)
-        .append_simple("x", "records/x.md", mem_core::event::Op::Create, None, Some(1), None, Some("d"), "t")
+        .append_test_event("x", "records/x.md", mem_core::event::Op::Create, None, Some(1), None, Some("d"), "t")
         .unwrap();
     std::fs::write(
         store.abs("records/x.md"),

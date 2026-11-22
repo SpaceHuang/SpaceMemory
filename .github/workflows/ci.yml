@@ -22,6 +22,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace
+      # 下游稳定 API 探针不是 workspace target；显式编译两个消费者示例，
+      # 防止公开签名在普通库/测试通过时发生不兼容漂移。
+      - run: cargo check -p mem-core --example embedded_contract
+      - run: cargo check -p mem-index --example embedded_index_contract
+      - run: cargo check --release -p mem-core --example embedded_contract
+      - run: cargo check --release -p mem-index --example embedded_index_contract
 
   release-windows:
     # Windows 包内包含 mem.exe 与 builtin-types/ 同级目录。

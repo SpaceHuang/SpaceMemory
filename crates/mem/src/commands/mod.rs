@@ -40,11 +40,26 @@ fn run(cli: &Cli) -> MemResult<i32> {
             cmd_init(path, template_dir.as_deref(), principal)?;
             Ok(0)
         }
+        Cmd::Migrate { backup_identity } => {
+            let root = store_root(cli);
+            let report = Store::migrate_format_v1(&root, backup_identity)?;
+            out_json(&serde_json::json!({
+                "status": match report.status {
+                    mem_core::store::MigrationStatus::Migrated => "migrated",
+                    mem_core::store::MigrationStatus::AlreadyMigrated => "already_migrated",
+                    _ => "unknown",
+                },
+                "backup_identity": report.backup_identity,
+                "format_version": "spacememory/2",
+            }));
+            Ok(0)
+        }
         cmd => {
             let store = open_store(cli)?;
             let types = load_types(&store)?;
             match cmd {
                 Cmd::Init { .. } => unreachable!(),
+                Cmd::Migrate { .. } => unreachable!(),
                 Cmd::Brief { view, principal, since, offset } => {
                     cmd_brief(&store, view.as_deref(), principal.as_deref(), *since, *offset)?;
                     Ok(0)
@@ -335,9 +350,11 @@ fn cmd_init(
     template_dir: Option<&str>,
     principal_label: &str,
 ) -> MemResult<()> {
-    Store::create(path)?;
+    let init_permit = Store::acquire_init_lock(path)?;
+    let quarantined_init = Store::begin_cli_init(path, &init_permit)?;
+    Store::create_under_init_lock(path, &init_permit)?;
     // BD5 ①：行尾规则随 init 播种（幂等；git add -A 暂存后随首次受管提交入树）。
-    mem_core::gitattrs::seed_at_root(path)?;
+    mem_core::gitattrs::seed_at_root(path, &init_permit)?;
     // 播种类型两件套（混合分发：外部优先、内嵌兜底，开放问题40）。
     // r14 发布准备：查找逻辑单源下沉 mem_assets::resolve_seed_files——
     // 模板覆盖 > exe 旁 builtin-types/ > Homebrew share 布局 > 内嵌字节
@@ -376,15 +393,9 @@ fn cmd_init(
             .output();
     }
     // 自举首条 principal（经类型声明引入，红线12/13）。
-    let store = Store::open(path, OpenMode::Auto)?;
+    let store = Store::open_under_init_lock(path, OpenMode::Auto, &init_permit)?;
     let types = load_types(&store)?;
-    let ctx = WriteContext {
-        store: &store,
-        types: &types,
-        by: "mem init".into(),
-        committer: None,
-        session_id: None, pause_hook: None,
-    };
+    let ctx = WriteContext::new(&store, &types, "mem init").with_committer(None).with_session_id(None);
     // 自举载荷来自播种数据（红线1：类型字段含义在数据，不在代码）；
     // 机制只覆写唯一键推导必须知道的两个名字字段（slug/label）。
     let mut payload: serde_json::Value = serde_json::from_slice(
@@ -408,6 +419,7 @@ fn cmd_init(
         &ctx,
         ops::AddArgs { type_name: "principal".into(), payload, body: Vec::new(), principal: None },
     )?;
+    Store::finish_cli_init(path, &init_permit)?;
     out_json(&serde_json::json!({
         "ok": true,
         "store": path.display().to_string(),
@@ -416,6 +428,7 @@ fn cmd_init(
         "asset_source": asset_source,
         "template_dir": template_dir_used,
         "git_initialized": git_ok,
+        "quarantined_incomplete_init": quarantined_init.map(|p| p.display().to_string()),
     }));
     Ok(())
 }
@@ -608,31 +621,32 @@ fn cmd_session_flush(store: &Store, session_id: &str, trail: Vec<String>) -> Mem
 // ---------- reconcile ----------
 
 fn cmd_reconcile(store: &Store, deep: bool) -> MemResult<()> {
-    let report = mem_core::event::reconcile_backfill(store, "mem", None)?;
-    // commit-pending 重试（可重试资源；不分配序号）。
-    let mut retried = 0usize;
-    let pending = ops::list_pending_commits(store)?;
-    if !pending.is_empty() {
-        let sink = sink_for(store);
-        for (path, pc) in &pending {
-            if sink.commit(&pc.paths).is_ok() {
-                let _ = std::fs::remove_file(path);
-                retried += 1;
+    let permit = store.acquire_index_maintenance()?;
+    let sink = sink_for(store);
+    let (report, retried, index_rebuilt) = mem_core::sidecar::reconcile_under_maintenance(
+        store,
+        &permit,
+        Some(&|store, permit| {
+            let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
+            let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
+            idx.set_body_texts_under_maintenance(permit)?;
+            Ok(mem_core::freshness::MaintainOutcome {
+                index_epoch: idx.epoch()?,
+                scan_entries,
+            })
+        }),
+        || {
+            let mut retried = 0;
+            for (path, pc) in ops::list_pending_commits(store)? {
+                if sink.commit(&pc.paths).is_ok() {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| MemError::io(path.clone(), e))?;
+                    retried += 1;
+                }
             }
-        }
-    }
-    // r4 H2/B3：索引刷新（rebuild + FTS）但**不发布检查点**——reconcile 进程
-    // 无订阅证据可查，无收敛证据不得签发证明（旧实现无条件推进检查点，会把旧
-    // 索引"提前确认"）。检查点仅由 sidecar 的统一收敛原语发布。
-    let mut index_rebuilt = false;
-    if store.writable() {
-        if let Ok(mut idx) = mem_index::Index::open_store(store) {
-            // r11 优化：FTS 虚表移除——find 子串检索由两执行器共用的 LIKE 承担。
-            if idx.rebuild_with_entries(store).is_ok() && idx.set_body_texts(store).is_ok() {
-                index_rebuilt = true;
-            }
-        }
-    }
+            Ok(retried)
+        },
+    )?;
     // --deep：全量内容摘要核对（维护审计）。
     let mut deep_report = serde_json::Value::Null;
     if deep {
@@ -985,16 +999,7 @@ fn write_ctx<'a>(
         .flatten()
         .map(|l| l.principal)
         .unwrap_or_default();
-    WriteContext {
-        store,
-        types,
-        by: format!("{principal_label}(cli)"),
-        // 有 .git 才挂提交汇（无 git 形态合法，红线10）。
-        committer: if store.root().join(".git").exists() { Some(&CliSink) } else { None },
-        session_id,
-        // 可控暂停点（验收用）：生产前端恒 None（先例 event.rs PauseHook）。
-        pause_hook: None,
-    }
+    WriteContext::new(store, types, format!("{principal_label}(cli)")).with_committer(if store.root().join(".git").exists() { Some(&CliSink) } else { None }).with_session_id(session_id)
 }
 
 /// CLI 写命令的提交汇（经 open_store 时登记的 CURRENT_STORE 定位店根）。
@@ -1176,14 +1181,7 @@ fn cmd_bind(store: &Store, view: &str) -> MemResult<()> {
     if v.record.envelope.r#type != "view" {
         return Err(MemError::BadArgument(format!("{view} 不是 view 记录")));
     }
-    let mem_json = store.abs("mem.json");
-    let mut cfg_v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&mem_json).map_err(|e| MemError::io(mem_json.display().to_string(), e))?)
-            .map_err(|e| MemError::Corrupt { path: "mem.json".into(), reason: e.to_string() })?;
-    cfg_v["default_view"] = serde_json::Value::String(v.record.envelope.id.clone());
-    let bytes = serde_json::to_vec_pretty(&cfg_v).unwrap();
-    mem_core::platform::atomic_write(&mem_json, &bytes)
-        .map_err(|e| MemError::io(mem_json.display().to_string(), e))?;
+    store.set_config_value("default_view", serde_json::Value::String(v.record.envelope.id.clone()))?;
     out_json(&serde_json::json!({ "default_view": v.record.envelope.id }));
     Ok(())
 }

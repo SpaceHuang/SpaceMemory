@@ -12,6 +12,7 @@ use mem_schema::Violation;
 use crate::token::Token;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MemError {
     #[error("IO 错误（{path}）：{source}")]
     Io {
@@ -68,6 +69,21 @@ pub enum MemError {
 
     #[error("存储只读：写类操作拒绝（只读档五读命令全部可用，§3.4）")]
     ReadOnly,
+
+    #[error("不支持的数据格式 {found}；当前支持 {supported:?}")]
+    UnsupportedFormat { found: String, supported: Vec<String> },
+
+    #[error("数据目录须先迁移：当前格式 {current}，目标格式 {target}")]
+    RequiresMigration { current: String, target: String },
+
+    #[error("迁移状态不可安全处理：{0}")]
+    MigrationState(String),
+
+    #[error("功能特性标识无效：{0}")]
+    InvalidFeature(String),
+
+    #[error("受管写入缺少必需机制特性：{0:?}")]
+    MissingFeatures(Vec<String>),
 
     #[error("git 提交失败（可重试资源，事件已生效）：{0}")]
     Git(String),

@@ -10,12 +10,14 @@ use mem_core::store::Store;
 
 /// 物化后刷新检查点（sidecar/reconcile 调用；读路径禁用）。
 pub fn refresh(store: &Store) -> MemResult<Checkpoint> {
+    let _permit = store.acquire_index_maintenance()?;
     let cp = Checkpoint {
+        format_version: store.config().format_version.clone(),
         ts: mem_core::clock::now_rfc3339(),
         entries: freshness::stat_snapshot(store),
         index_epoch: 0, // 由收敛原语覆盖为真实代际；此路径仅为兼容保留
     };
-    freshness::save_checkpoint(store, &cp)
+    freshness::save_checkpoint(store, &cp, &_permit)
         .map_err(|e| MemError::Corrupt { path: "index/checkpoint.json".into(), reason: e.to_string() })?;
     Ok(cp)
 }

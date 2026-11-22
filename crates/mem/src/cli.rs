@@ -53,6 +53,11 @@ pub enum Cmd {
         #[arg(long)]
         deep: bool,
     },
+    /// 显式停机迁移旧格式；调用前须完成服务停止与店外完整备份。
+    Migrate {
+        #[arg(long)]
+        backup_identity: String,
+    },
     /// 过滤定位（LIMIT+续读；返回完整令牌；--filter 载荷字段过滤可重复合取，R10）
     List {
         #[arg(long)]

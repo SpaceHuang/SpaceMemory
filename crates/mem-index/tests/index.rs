@@ -63,7 +63,7 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
 #[test]
 fn rebuild_and_query_by_type() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
+    let c = WriteContext::new(&store, &types, "t").with_committer(None).with_session_id(None);
     for slug in ["a", "b"] {
         ops::add(&c, ops::AddArgs {
             type_name: "task".into(),
@@ -91,9 +91,27 @@ fn rebuild_and_query_by_type() {
 }
 
 #[test]
+fn direct_rebuild_rejects_missing_required_feature_without_touching_index() {
+    let (_t, store, _) = fresh_store();
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
+    idx.rebuild(&store).unwrap();
+    let index_path = store.abs("index/index.sqlite");
+    let before = std::fs::read(&index_path).unwrap();
+
+    let config_path = store.abs("mem.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["record.future/v1"]);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let error = idx.rebuild(&store).unwrap_err();
+    assert!(matches!(error, mem_core::error::MemError::MissingFeatures(features) if features == vec!["record.future/v1"]));
+    assert_eq!(std::fs::read(index_path).unwrap(), before, "不兼容的 rebuild 不得改写派生索引");
+}
+
+#[test]
 fn edge_neighbors_support_trace() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
+    let c = WriteContext::new(&store, &types, "t").with_committer(None).with_session_id(None);
     let t = ops::add(&c, ops::AddArgs {
         type_name: "memory".into(),
         payload: serde_json::json!({"title": "证据"}),
@@ -121,7 +139,7 @@ fn edge_neighbors_support_trace() {
 #[test]
 fn diagnose_reports_drift_never_rejects() {
     let (_t, store, types) = fresh_store();
-    let c = WriteContext { store: &store, types: &types, by: "t".into(), committer: None, session_id: None, pause_hook: None };
+    let c = WriteContext::new(&store, &types, "t").with_committer(None).with_session_id(None);
     ops::add(&c, ops::AddArgs {
         type_name: "memory".into(),
         payload: serde_json::json!({"title": "m"}),
@@ -155,12 +173,11 @@ fn readonly_open_never_creates_and_epoch_advances() {
     // r4 B2：读路径 open_readonly——文件缺失 → Err，且**不创建文件**；
     // rebuild 递增 epoch（检查点同代核对依据）。
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("index/index.sqlite");
-    let _err = mem_index::Index::open_readonly(&path).err().expect("缺失必须 Err");
-    assert!(!path.exists(), "open_readonly 不得创建索引文件");
-
     let store = fake_store(tmp.path());
-    let mut idx = mem_index::Index::open(&path).unwrap();
+    let path = store.abs("index/index.sqlite");
+    let _err = mem_index::Index::open_store_readonly(&store).err().expect("缺失必须 Err");
+    assert!(!path.exists(), "open_readonly 不得创建索引文件");
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
     idx.rebuild(&store).unwrap();
     drop(idx);
     let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(path.parent().unwrap()).unwrap()
@@ -171,9 +188,10 @@ fn readonly_open_never_creates_and_epoch_advances() {
     assert!(!path.with_extension("sqlite-wal").exists());
     assert!(!path.with_extension("sqlite-shm").exists());
     let (tx, rx) = std::sync::mpsc::channel();
-    let writer_path = path.clone();
+    let writer_root = store.root().to_path_buf();
     let writer = std::thread::spawn(move || {
-        let _idx = mem_index::Index::open(&writer_path).unwrap();
+        let writer_store = mem_core::store::Store::open(&writer_root, mem_core::store::OpenMode::Auto).unwrap();
+        let _idx = mem_index::Index::open_store(&writer_store).unwrap();
         tx.send(()).unwrap();
     });
     assert!(rx.recv_timeout(std::time::Duration::from_millis(80)).is_err(), "只读快照存活时维护写入须等待");
@@ -184,7 +202,7 @@ fn readonly_open_never_creates_and_epoch_advances() {
         .map(|e| { let p = e.unwrap().path(); (p.file_name().unwrap().to_os_string(), std::fs::read(p).unwrap()) })
         .collect();
     assert_eq!(before, after, "只读打开期间索引目录文件与内容不变");
-    let mut idx = mem_index::Index::open(&path).unwrap();
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
     idx.rebuild(&store).unwrap();
     drop(idx);
     let ro2 = mem_index::Index::open_readonly(&path).unwrap();
@@ -198,7 +216,7 @@ fn fake_store(tmp: &std::path::Path) -> mem_core::store::Store { // &TempDir 可
     let _ = std::fs::create_dir_all(root.join("records"));
     let _ = std::fs::write(
         root.join("mem.json"),
-        r#"{"format_version":1,"created":"2026-11-05T00:00:00Z"}"#,
+        r#"{"format_version":"spacememory/2","required_features":[],"created":"2026-11-05T00:00:00Z"}"#,
     );
     mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap()
 }

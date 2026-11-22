@@ -43,6 +43,7 @@ pub struct DriftScan {
 
 /// 漂移扫描（内存、只读安全；枚举域 = 当前记录集合 ∪ 日志历史集合）。
 pub fn scan_current_drift(store: &Store, limit: usize) -> MemResult<DriftScan> {
+    store.read_compatible_missing_features()?;
     let log = EventLog::new(store).read_log()?;
     let candidates = event::enumerate_candidates(store, &log)?;
     let readonly_note = if store.writable() {
@@ -124,6 +125,7 @@ pub fn scan_current_drift(store: &Store, limit: usize) -> MemResult<DriftScan> {
     // M10：先全量收集再截断——恰好等于 limit 不误报 truncated（与 diff_since 对齐）。
     let truncated = items.len() > limit;
     items.truncate(limit);
+    store.read_compatible_missing_features()?;
     Ok(DriftScan { items, truncated })
 }
 
@@ -151,6 +153,7 @@ pub fn diff_since(
     changes_limit: usize,
     drift_limit: usize,
 ) -> MemResult<DiffResult> {
+    store.read_compatible_missing_features()?;
     let events = EventLog::new(store).read_log()?.events;
     let mut groups: std::collections::BTreeMap<String, Vec<Event>> = Default::default();
     let mut changes_truncated = false;
@@ -171,5 +174,6 @@ pub fn diff_since(
         })
         .collect();
     let current_drift = scan_current_drift(store, drift_limit)?;
+    store.read_compatible_missing_features()?;
     Ok(DiffResult { changes_since, changes_truncated, current_drift })
 }

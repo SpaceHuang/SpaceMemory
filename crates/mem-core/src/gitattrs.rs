@@ -27,7 +27,8 @@ fn has_git(store: &Store) -> bool {
 
 /// init 播种（四件套之①）：店根写入默认内容。幂等——已存在则不动（不吞用户
 /// 自带文件；其冲突状态由 [`ensure_for_write`] 在受管写入时结构化处置）。
-pub fn seed_at_root(root: &std::path::Path) -> MemResult<()> {
+pub fn seed_at_root(root: &std::path::Path, permit: &crate::store::InitPermit) -> MemResult<()> {
+    permit.check_root(root)?;
     let path = root.join(GITATTRIBUTES_REL);
     if path.exists() {
         return Ok(());
@@ -43,7 +44,7 @@ pub fn seed_at_root(root: &std::path::Path) -> MemResult<()> {
 ///   ops::commit_same_batch 统一携带，pending 批次同）；
 /// - 工作区内容 ≠ 默认 → 结构化拒绝（恢复默认内容即解锁；读路径不受影响）；
 /// - 内容相符 → Ok(false)。
-pub fn ensure_for_write(store: &Store) -> MemResult<bool> {
+pub(crate) fn ensure_for_write(store: &Store) -> MemResult<bool> {
     if !has_git(store) {
         return Ok(false);
     }
@@ -144,10 +145,11 @@ mod tests {
     #[test]
     fn seed_at_root_is_idempotent_and_never_overwrites() {
         let tmp = tempfile::tempdir().unwrap();
-        seed_at_root(tmp.path()).unwrap();
+        let permit = crate::store::Store::acquire_init_lock(tmp.path()).unwrap();
+        seed_at_root(tmp.path(), &permit).unwrap();
         // 用户自带文件不被覆盖（冲突处置交给写例程的结构化拒绝）。
         std::fs::write(tmp.path().join(GITATTRIBUTES_REL), b"custom\n").unwrap();
-        seed_at_root(tmp.path()).unwrap();
+        seed_at_root(tmp.path(), &permit).unwrap();
         assert_eq!(std::fs::read(tmp.path().join(GITATTRIBUTES_REL)).unwrap(), b"custom\n");
     }
 }

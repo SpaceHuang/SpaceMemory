@@ -71,19 +71,107 @@ fn initialize_and_tools_list() {
 }
 
 #[test]
+fn documented_candidate_mcp_tool_names_match_runtime_table() {
+    let api_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/develop/embedded-downstream-contract-api.md");
+    let api = std::fs::read_to_string(api_path).unwrap();
+    let table = api
+        .split("| 已验证工具名 | 用途 |")
+        .nth(1)
+        .expect("候选 API 文档须包含 MCP 工具名表");
+    let documented: std::collections::BTreeSet<String> = table
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'))
+        .skip(1) // 跳过表头分隔线。
+        .filter_map(|line| line.split('|').nth(1))
+        .flat_map(|cell| cell.split('`').skip(1).step_by(2))
+        .flat_map(|names| names.split(", "))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let runtime: std::collections::BTreeSet<String> = mem_mcp::tools::tool_definitions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(documented, runtime, "候选 MCP 工具表必须与运行时工具表完全一致");
+}
+
+#[test]
+fn reconcile_refuses_missing_feature_without_persisting_anything() {
+    let (_t, root) = fresh_store();
+    let store = mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap();
+    let idx_path = root.join("index/index.sqlite");
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
+    idx.rebuild(&store).unwrap();
+    drop(idx);
+    let before_index = std::fs::read(&idx_path).unwrap();
+    let before_events = std::fs::read(root.join("events/log.jsonl")).unwrap_or_default();
+    let before_pending = directory_snapshot(&root.join(".pending-commits"));
+    let before_checkpoint = std::fs::read(root.join("index/checkpoint.json")).ok();
+    let mut cfg: Value = serde_json::from_slice(&std::fs::read(root.join("mem.json")).unwrap()).unwrap();
+    cfg["required_features"] = json!(["record.future/v1"]);
+    std::fs::write(root.join("mem.json"), serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+
+    let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "mem_reconcile", "arguments": {} } });
+    let response = mem_mcp::handle_request(&root, &req).unwrap();
+    assert!(response["error"]["message"].as_str().unwrap().contains("record.future/v1"));
+    assert_eq!(std::fs::read(idx_path).unwrap(), before_index);
+    assert_eq!(std::fs::read(root.join("events/log.jsonl")).unwrap_or_default(), before_events);
+    assert_eq!(directory_snapshot(&root.join(".pending-commits")), before_pending);
+    assert_eq!(std::fs::read(root.join("index/checkpoint.json")).ok(), before_checkpoint);
+}
+
+#[test]
+fn reconcile_retries_pending_git_commit_inside_maintenance() {
+    let (_tmp, root) = fresh_store();
+    let init = std::process::Command::new("git").args(["-C", root.to_str().unwrap(), "init"])
+        .output().unwrap();
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    for (key, value) in [("user.name", "SpaceMemory Test"), ("user.email", "test@example.invalid")] {
+        let configured = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "config", key, value]).output().unwrap();
+        assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    }
+    let pending_dir = root.join(".pending-commits");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    let pending_path = pending_dir.join("retry.json");
+    std::fs::write(&pending_path, serde_json::to_vec(&json!({
+        "paths": ["events.jsonl"], "ts": "2026-11-22T00:00:00Z", "error": "simulated"
+    })).unwrap()).unwrap();
+
+    let response = call(&root, "tools/call", json!({
+        "name": "mem_reconcile", "arguments": {}
+    }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(!pending_path.exists(), "成功汇总后 pending 条目应被清理");
+    let committed = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "show", "HEAD:events.jsonl"]).output().unwrap();
+    assert!(committed.status.success(), "events.jsonl 应随 pending 被汇入 Git: {}", String::from_utf8_lossy(&committed.stderr));
+}
+
+fn directory_snapshot(path: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if file.is_file() {
+                out.insert(file.strip_prefix(path).unwrap().to_path_buf(), std::fs::read(file).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[test]
 fn session_and_record_flow_via_tools() {
     let (_t, root) = fresh_store();
     // 自举 principal（MCP 通道要求显式 principal；先手工播种一条）。
     let types = mem_schema::TypeSet::load_dir(&root.join("types")).unwrap();
     let store = mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap();
-    let ctx = mem_core::ops::WriteContext {
-        store: &store,
-        types: &types,
-        by: "seed".into(),
-        committer: None,
-        session_id: None,
-        pause_hook: None,
-    };
+    let ctx = mem_core::ops::WriteContext::new(&store, &types, "seed").with_committer(None).with_session_id(None);
     mem_core::ops::add(&ctx, mem_core::ops::AddArgs {
         type_name: "principal".into(),
         payload: json!({"slug": "codex_main", "label": "codex_main"}),
@@ -134,14 +222,7 @@ fn diff_and_verify_tools() {
     let (_t, root) = fresh_store();
     let types = mem_schema::TypeSet::load_dir(&root.join("types")).unwrap();
     let store = mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap();
-    let ctx = mem_core::ops::WriteContext {
-        store: &store,
-        types: &types,
-        by: "seed".into(),
-        committer: None,
-        session_id: None,
-        pause_hook: None,
-    };
+    let ctx = mem_core::ops::WriteContext::new(&store, &types, "seed").with_committer(None).with_session_id(None);
     mem_core::ops::add(&ctx, mem_core::ops::AddArgs {
         type_name: "memory".into(),
         payload: json!({"title": "m"}),

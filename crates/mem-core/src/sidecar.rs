@@ -120,7 +120,7 @@ pub fn serve(store: &Store, idle: Duration, stop: impl Fn() -> bool) -> MemResul
 /// 维护回调（B3 接线）：sidecar 检测到变更时调用——mem bin 注入 mem-index 物化器。
 /// 返回本次物化的结果（代际 + **与索引同一次扫描**的 stat 集，r5 B3）——检查点
 /// entries 采自该集合，物化与检查点恒同代。语义：回调**先于**检查点发布。
-pub type Maintainer<'a> = &'a dyn Fn(&Store) -> MemResult<crate::freshness::MaintainOutcome>;
+pub type Maintainer<'a> = &'a dyn Fn(&Store, &crate::store::IndexMaintenancePermit<'_>) -> MemResult<crate::freshness::MaintainOutcome>;
 
 pub fn serve_with_maintainer(
     store: &Store,
@@ -296,8 +296,34 @@ fn run_maintenance(
     maintainer: Option<Maintainer<'_>>,
     sub: Option<&mut Subscription>,
 ) -> MemResult<(bool, bool)> {
+    let barrier = crate::lock::barrier_exclusive(store)?;
+    store.check_compatible_for_write()?;
+    let permit = store.index_maintenance_from_guard(barrier)?;
+    run_maintenance_under_permit(store, &permit, maintainer, sub)
+}
+
+/// 同一独占维护许可内完成回填、pending 汇总、索引与收敛检查点。
+pub fn reconcile_under_maintenance(
+    store: &Store,
+    permit: &crate::store::IndexMaintenancePermit<'_>,
+    maintainer: Option<Maintainer<'_>>,
+    retry_pending: impl FnOnce() -> MemResult<usize>,
+) -> MemResult<(crate::event::BackfillReport, usize, bool)> {
+    permit.check_compatible()?;
+    let report = crate::event::reconcile_backfill_locked(store, "mem", None)?;
+    let retried = retry_pending()?;
+    let (rebuilt, converged) = run_maintenance_under_permit(store, permit, maintainer, None)?;
+    Ok((report, retried, rebuilt && converged))
+}
+
+fn run_maintenance_under_permit(
+    store: &Store,
+    permit: &crate::store::IndexMaintenancePermit<'_>,
+    maintainer: Option<Maintainer<'_>>,
+    sub: Option<&mut Subscription>,
+) -> MemResult<(bool, bool)> {
     let has_sub = sub.is_some();
-    let noop: Maintainer<'static> = &|_s| {
+    let noop: Maintainer<'static> = &|_s, _permit| {
         Ok(crate::freshness::MaintainOutcome {
             index_epoch: 0,
             scan_entries: Default::default(),
@@ -310,7 +336,8 @@ fn run_maintenance(
         if has_sub { Some(&mut fresh_fn) } else { None };
     let published = crate::freshness::publish_converged_checkpoint(
         store,
-        &|s: &Store| m(s),
+        &permit,
+        &|s: &Store, p| m(s, p),
         fresh,
     )?;
     Ok((maintainer.is_some(), published.is_some()))

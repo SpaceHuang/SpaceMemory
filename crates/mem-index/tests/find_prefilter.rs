@@ -69,11 +69,13 @@ fn materialize(store: &Store) -> MemResult<(u64, BTreeMap<String, (u128, u64)>)>
 
 fn publish(store: &Store, epoch: u64, entries: BTreeMap<String, (u128, u64)>) {
     let cp = Checkpoint {
+        format_version: store.config().format_version.clone(),
         ts: "2026-11-10T00:00:00.000Z".into(),
         entries,
         index_epoch: epoch,
     };
-    freshness::save_checkpoint(store, &cp).unwrap();
+    let permit = store.acquire_index_maintenance().unwrap();
+    freshness::save_checkpoint(store, &cp, &permit).unwrap();
 }
 
 fn hello0() -> Hello {

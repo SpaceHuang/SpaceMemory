@@ -119,6 +119,13 @@ pub fn current_state(store: &Store, record_rel: &str) -> MemResult<StateTriple> 
 }
 
 pub fn current_state_for_id(store: &Store, record_rel: &str, id: Option<&str>) -> MemResult<StateTriple> {
+    store.read_compatible_missing_features()?;
+    let result = current_state_for_id_unchecked(store, record_rel, id);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn current_state_for_id_unchecked(store: &Store, record_rel: &str, id: Option<&str>) -> MemResult<StateTriple> {
     let rec_abs = store.abs(record_rel);
     if rec_abs.is_file() {
         let bytes = std::fs::read(&rec_abs).map_err(|e| MemError::io(rec_abs.display().to_string(), e))?;
@@ -169,6 +176,7 @@ pub fn triple_from_event(ev: &Event) -> StateTriple {
 // ---------- 日志读取 ----------
 
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ReadLog {
     pub events: Vec<Event>,
     /// 末行 JSON 不可解析（崩溃撕裂/手改坏行）：读取时忽略并告警；追加例程先把
@@ -196,6 +204,13 @@ impl<'a> EventLog<'a> {
 
     /// 全量读取（撕裂尾行截断 + 告警；中部坏行 = 结构损坏，响亮错误）。
     pub fn read_log(&self) -> MemResult<ReadLog> {
+        self.store.read_compatible_missing_features()?;
+        let result = self.read_log_unchecked_read_compatibility();
+        self.store.read_compatible_missing_features()?;
+        result
+    }
+
+    fn read_log_unchecked_read_compatibility(&self) -> MemResult<ReadLog> {
         let p = self.path();
         let bytes = match std::fs::read(&p) {
             Ok(b) => b,
@@ -261,7 +276,7 @@ impl<'a> EventLog<'a> {
 
     /// 普通写事件追加（序列锁内分配序号；撕裂尾行先补行界）。
     #[allow(clippy::too_many_arguments)]
-    pub fn append_simple(
+    pub(crate) fn append_simple(
         &self,
         id: &str,
         path: &str,
@@ -288,7 +303,7 @@ impl<'a> EventLog<'a> {
 
     /// 任意事件追加（kind 显式；回填用）。
     #[allow(clippy::too_many_arguments)]
-    pub fn append_raw(
+    pub(crate) fn append_raw(
         &self,
         id: &str,
         path: &str,
@@ -343,6 +358,23 @@ impl<'a> EventLog<'a> {
             Ok(ev)
         })?
     }
+
+    /// 仅供 debug 测试构造历史事件用；不进入 release 发布构建。
+    #[doc(hidden)]
+    #[cfg(all(debug_assertions, not(test)))]
+    pub fn append_test_event(
+        &self,
+        id: &str,
+        path: &str,
+        op: Op,
+        old_v: Option<u64>,
+        new_v: Option<u64>,
+        old_digest: Option<&str>,
+        new_digest: Option<&str>,
+        by: &str,
+    ) -> MemResult<Event> {
+        self.append_simple(id, path, op, old_v, new_v, old_digest, new_digest, by)
+    }
 }
 
 /// 撕裂尾行修复：把文件截断到**最后一个完整合法行界**（`good_bytes`）再由调用方
@@ -364,6 +396,13 @@ fn repair_torn_tail(p: &std::path::Path, read: &ReadLog) -> MemResult<()> {
 
 /// 递归枚举 store 子目录下全部 .md 文件（records/ 或 attic/）。
 pub fn enumerate_md(store: &Store, prefix: &str) -> MemResult<Vec<String>> {
+    store.read_compatible_missing_features()?;
+    let result = enumerate_md_unchecked(store, prefix);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn enumerate_md_unchecked(store: &Store, prefix: &str) -> MemResult<Vec<String>> {
     let mut out = Vec::new();
     let base = store.abs(prefix);
     if std::fs::symlink_metadata(&base).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -405,6 +444,13 @@ pub struct Candidate {
 }
 
 pub fn enumerate_candidates(store: &Store, log: &ReadLog) -> MemResult<Vec<Candidate>> {
+    store.read_compatible_missing_features()?;
+    let result = enumerate_candidates_unchecked(store, log);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn enumerate_candidates_unchecked(store: &Store, log: &ReadLog) -> MemResult<Vec<Candidate>> {
     // id → (当前路径, 最后事件 path)
     let mut by_id: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
         Default::default();
@@ -452,6 +498,7 @@ pub fn enumerate_candidates(store: &Store, log: &ReadLog) -> MemResult<Vec<Candi
         };
         out.push(Candidate { id, current_path: cur, lock_rel });
     }
+    store.read_compatible_missing_features()?;
     Ok(out)
 }
 
@@ -476,17 +523,41 @@ pub fn reconcile_backfill(
 ) -> MemResult<BackfillReport> {
     store.check_writable()?;
     crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：写例程核验
+    let _barrier = lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
+    reconcile_backfill_locked(store, by, pause_hook)
+}
+
+/// [`reconcile_backfill`] 的门闩内变体；调用者持有适当的共享或独占许可。
+pub(crate) fn reconcile_backfill_locked(
+    store: &Store,
+    by: &str,
+    pause_hook: Option<PauseHook>,
+) -> MemResult<BackfillReport> {
     let mut report = BackfillReport::default();
     let log = EventLog::new(store).read_log()?;
     let candidates = enumerate_candidates(store, &log)?;
-    for c in candidates {
+    if candidates.is_empty() && log.torn_tail {
+        lock::with_sequence_lock(store, || {
+            let latest = EventLog::new(store).read_log()?;
+            if latest.torn_tail {
+                repair_torn_tail(&store.abs("events.jsonl"), &latest)?;
+            }
+            Ok(())
+        })??;
+        return Ok(report);
+    }
+    let candidate_count = candidates.len();
+    for (index, c) in candidates.into_iter().enumerate() {
         // 共享门闩 + 记录锁（缺失记录同规范路径锁）。
-        let _barrier = lock::barrier_shared(store)?;
         let _rec_lock = lock::record_lock(store, &c.lock_rel, std::time::Duration::from_secs(30))?;
         if let Some(hook) = &pause_hook {
             hook(&c.id);
         }
-        let appended = with_sequence_recheck(store, &c, by, &mut report.warnings)?;
+        let appended = with_sequence_recheck(
+            store, &c, by, &mut report.warnings,
+            log.torn_tail && index + 1 == candidate_count,
+        )?;
         match appended {
             Some(ev) => report.appended.push(ev),
             None => report.skipped_stable += 1,
@@ -503,6 +574,7 @@ fn with_sequence_recheck(
     c: &Candidate,
     by: &str,
     warnings: &mut Vec<String>,
+    repair_tail_if_stable: bool,
 ) -> MemResult<Option<Event>> {
     lock::with_sequence_lock(store, || {
         let log = EventLog::new(store).read_log()?;
@@ -524,6 +596,9 @@ fn with_sequence_recheck(
             Some(l) => *l == cur && last_path.as_deref() == cur_path.as_deref(),
         };
         if equal {
+            if repair_tail_if_stable && log.torn_tail {
+                repair_torn_tail(&store.abs("events.jsonl"), &log)?;
+            }
             return Ok(None); // 稳定态（含 absent==absent）
         }
         let ev = match cur.location {
@@ -577,12 +652,19 @@ fn with_sequence_recheck(
             .map_err(|e| MemError::io(p.display().to_string(), e))?;
         f.write_all(&line).map_err(|e| MemError::io(p.display().to_string(), e))?;
         f.sync_all().map_err(|e| MemError::io(p.display().to_string(), e))?;
-        Ok(Some(ev))
+    Ok(Some(ev))
     })?
 }
 
 /// 返回指定身份当前所在路径；同路径被新 ID 复用时不会把新记录归给旧身份。
 pub fn current_path_for_id(store: &Store, record_rel: &str, id: &str) -> MemResult<Option<String>> {
+    store.read_compatible_missing_features()?;
+    let result = current_path_for_id_unchecked(store, record_rel, id);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn current_path_for_id_unchecked(store: &Store, record_rel: &str, id: &str) -> MemResult<Option<String>> {
     let rec_abs = store.abs(record_rel);
     if rec_abs.is_file() {
         if let Ok(bytes) = std::fs::read(&rec_abs) {

@@ -88,6 +88,23 @@ pub fn open_proved(store: &Store, hello: Option<&Hello>) -> Proved {
             index: None,
         };
     }
+    match store.read_compatible_missing_features() {
+        Err(error) => {
+            return Proved {
+                mode: ReadMode::Direct { reason: format!("返回读取前数据特性复核失败：{error}") },
+                index: None,
+            }
+        }
+        Ok(missing) if !missing.is_empty() => {
+            return Proved {
+                mode: ReadMode::Direct {
+                    reason: format!("读取期间出现只读兼容特性 {missing:?}，放弃索引快路径"),
+                },
+                index: None,
+            }
+        }
+        Ok(_) => {}
+    }
     Proved { mode, index: Some(ProvedIndex::new(index)) }
 }
 

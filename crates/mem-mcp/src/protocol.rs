@@ -443,19 +443,38 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             }))
         }
         "mem_reconcile" => {
-            let report = mem_core::event::reconcile_backfill(&store, "mem", None)?;
-            // r4 H2/B3：索引刷新走统一收敛原语；MCP 进程无订阅证据 → 检查点
-            // **不发布**（此前无条件推进检查点会把旧索引"提前确认"，扩大误信窗口）。
-            // sidecar 在场时由其 tick/握手路径收敛发布。
-            let mut idx = mem_index::Index::open_store(&store)?;
-            idx.rebuild(&store)?;
-            idx.set_body_texts(&store)?;
-            let _ = idx.epoch();
+            let permit = store.acquire_index_maintenance()?;
+            let (report, retried, index_rebuilt) = mem_core::sidecar::reconcile_under_maintenance(
+                &store,
+                &permit,
+                Some(&|store, permit| {
+                    let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
+                    let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
+                    idx.set_body_texts_under_maintenance(permit)?;
+                    Ok(mem_core::freshness::MaintainOutcome {
+                        index_epoch: idx.epoch()?,
+                        scan_entries,
+                    })
+                }),
+                || {
+                    let sink = GitProcess::new(store.root());
+                    let mut retried = 0;
+                    for (path, pending) in ops::list_pending_commits(&store)? {
+                        if ops::CommitSink::commit(&sink, &pending.paths).is_ok() {
+                            std::fs::remove_file(&path)
+                                .map_err(|e| MemError::io(path.clone(), e))?;
+                            retried += 1;
+                        }
+                    }
+                    Ok(retried)
+                },
+            )?;
             Ok(json!({
                 "backfill_appended": report.appended.len(),
+                "pending_commits_retried": retried,
                 "skipped_stable": report.skipped_stable,
                 "warnings": report.warnings,
-                "index_rebuilt": true,
+                "index_rebuilt": index_rebuilt,
                 "checkpoint_saved": false,
                 "checkpoint_note": "检查点仅由 sidecar 收敛原语发布（r4 H2）",
             }))
@@ -585,15 +604,7 @@ fn make_ctx<'a>(
         .and_then(|sid| session::get(store, sid).ok().flatten())
         .map(|l| l.principal)
         .unwrap_or_default();
-    WriteContext {
-        store,
-        types,
-        by: format!("{principal_label}(mcp)"),
-        committer: if store.root().join(".git").exists() { Some(&CommitViaCurrent) } else { None },
-        session_id,
-        // 可控暂停点（验收用）：生产前端恒 None（先例 event.rs PauseHook）。
-        pause_hook: None,
-    }
+    WriteContext::new(store, types, format!("{principal_label}(mcp)")).with_committer(if store.root().join(".git").exists() { Some(&CommitViaCurrent) } else { None }).with_session_id(session_id)
 }
 
 struct CommitViaCurrent;

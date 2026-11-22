@@ -432,6 +432,8 @@ pub struct FindParams<'a> {
 
 /// 执行器单源入口（两前端同源调用，§2.1 调用链）。
 pub fn execute(params: FindParams) -> MemResult<FindOutcome> {
+    let store = params.store;
+    store.read_compatible_missing_features()?;
     let cap = params.store.config().budgets.list_limit_max as usize;
     let pq = params.query.map(parse_query).transpose()?;
     let view_types: Vec<String> = params
@@ -442,21 +444,27 @@ pub fn execute(params: FindParams) -> MemResult<FindOutcome> {
     let resolved = resolve_filters(params.types, &cands, params.filters)?;
 
     // indexed 尝试（分流依据唯一：是否拿到已证明句柄——§2.1）。视图路径 v1 恒直读。
-    if params.view.is_none() {
+    let result = if params.view.is_none() {
         if let Some(pf) = params.prefilter {
             match try_indexed(&params, pf, pq.as_ref(), &resolved, cap) {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => Ok(outcome),
                 Err(reason) => {
                     // 放弃本次 indexed 应答、回退 direct 全量应答——reason 携带真实
                     // 错误；不得把失败转为空命中或空告警（红线8/决策⑦）。
                     let fallback_mode = ReadMode::Direct { reason };
-                    return run_direct(params, pq.as_ref(), &resolved, fallback_mode);
+                    run_direct(params, pq.as_ref(), &resolved, fallback_mode)
                 }
             }
+        } else {
+            let mode = params.mode.clone();
+            run_direct(params, pq.as_ref(), &resolved, mode)
         }
-    }
-    let mode = params.mode.clone();
-    run_direct(params, pq.as_ref(), &resolved, mode)
+    } else {
+        let mode = params.mode.clone();
+        run_direct(params, pq.as_ref(), &resolved, mode)
+    };
+    store.read_compatible_missing_features()?;
+    result
 }
 
 /// indexed 路径（§2.1 4a）：粗筛超集 → 逐候选回读真相层 → 同一精筛 → 命中序分页；

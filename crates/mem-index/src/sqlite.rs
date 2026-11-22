@@ -124,7 +124,7 @@ impl Index {
     /// r11 优化：records_fts 虚表已移除——find 子串检索由两执行器共用的
     /// LIKE 语义承担（r7/r10 对齐后命中契约一致），FTS5 token 检索属
     /// 规模增长后的升级坡道（判断 3）。
-    pub fn open(path: &Path) -> MemResult<Index> {
+    pub(crate) fn open(path: &Path) -> MemResult<Index> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
         }
@@ -234,7 +234,29 @@ impl Index {
     /// 打开店索引（维护路径，index/index.sqlite）。
     pub fn open_store(store: &Store) -> MemResult<Index> {
         let path = validate_store_index_paths(store)?;
-        Self::open(&path)
+        let permit = store.acquire_index_maintenance()?;
+        Self::open_store_validated_under_maintenance(store, &permit, &path)
+    }
+
+    /// 在调用方已持有整店独占维护许可时打开索引，避免锁重入。
+    pub fn open_store_under_maintenance(
+        store: &Store,
+        permit: &mem_core::store::IndexMaintenancePermit<'_>,
+    ) -> MemResult<Index> {
+        permit.check_store(store)?;
+        permit.check_compatible()?;
+        let path = validate_store_index_paths(store)?;
+        Self::open_store_validated_under_maintenance(store, permit, &path)
+    }
+
+    fn open_store_validated_under_maintenance(
+        store: &Store,
+        permit: &mem_core::store::IndexMaintenancePermit<'_>,
+        path: &Path,
+    ) -> MemResult<Index> {
+        permit.check_store(store)?;
+        permit.check_compatible()?;
+        Self::open(path)
     }
 
     /// 打开店索引（读路径，只读；缺失/不完整 → Err → 调用方直读）。
@@ -264,7 +286,10 @@ impl Index {
     /// 全量替换式物化（v1：中小规模，简单压倒增量；索引可丢弃，重建成本低）。
     /// 返回 (记录数, 边数)。
     pub fn rebuild(&mut self, store: &Store) -> MemResult<(usize, usize)> {
-        let (n, r, _) = self.rebuild_with_entries(store)?;
+        store.check_writable()?;
+        let _barrier = mem_core::lock::barrier_shared(store)?;
+        store.check_compatible_for_write()?;
+        let (n, r, _) = self.rebuild_with_entries_locked(store)?;
         Ok((n, r))
     }
 
@@ -283,13 +308,56 @@ impl Index {
         usize,
         std::collections::BTreeMap<String, (u128, u64)>,
     )> {
-        self.rebuild_with_entries_with_hook(store, None)
+        store.check_writable()?;
+        let _barrier = mem_core::lock::barrier_shared(store)?;
+        store.check_compatible_for_write()?;
+        self.rebuild_with_entries_locked(store)
+    }
+
+    /// 在调用方传入店级独占维护许可时执行物化，避免维护锁被重入。
+    pub fn rebuild_with_entries_under_maintenance(
+        &mut self,
+        permit: &mem_core::store::IndexMaintenancePermit<'_>,
+    ) -> MemResult<(
+        usize,
+        usize,
+        std::collections::BTreeMap<String, (u128, u64)>,
+    )> {
+        permit.check_compatible()?;
+        let store = permit.store();
+        self.rebuild_with_entries_locked(store)
+    }
+
+    fn rebuild_with_entries_locked(
+        &mut self,
+        store: &Store,
+    ) -> MemResult<(
+        usize,
+        usize,
+        std::collections::BTreeMap<String, (u128, u64)>,
+    )> {
+        self.rebuild_with_entries_with_hook_locked(store, None)
     }
 
     /// [`rebuild_with_entries`] 的可注入变体（实施评审 B2 护栏测试专用）：钩子在
     /// 扫描完成后、事务与 stat 集采集前执行——生产路径恒 None（经上者进入）。
     /// 注入窗口 = 评审 B2 的 T0–T2 时序窗口（扫描后新落盘文件）。
     pub fn rebuild_with_entries_with_hook(
+        &mut self,
+        store: &Store,
+        after_scan: Option<&dyn Fn()>,
+    ) -> MemResult<(
+        usize,
+        usize,
+        std::collections::BTreeMap<String, (u128, u64)>,
+    )> {
+        store.check_writable()?;
+        let _barrier = mem_core::lock::barrier_shared(store)?;
+        store.check_compatible_for_write()?;
+        self.rebuild_with_entries_with_hook_locked(store, after_scan)
+    }
+
+    fn rebuild_with_entries_with_hook_locked(
         &mut self,
         store: &Store,
         after_scan: Option<&dyn Fn()>,
@@ -440,6 +508,13 @@ impl Index {
 
     /// r5 B7：物化时同步 FTS 文本素材列（正文 + 别名；sync_fts 组装 text 时读取）。
     pub fn set_body_texts(&mut self, store: &Store) -> MemResult<()> {
+        store.check_writable()?;
+        let _barrier = mem_core::lock::barrier_shared(store)?;
+        store.check_compatible_for_write()?;
+        self.set_body_texts_locked(store)
+    }
+
+    pub(crate) fn set_body_texts_locked(&mut self, store: &Store) -> MemResult<()> {
         // r7：fold 列预折叠（与 mem_core::paths::fold 语义一致——NFC + 小写），
         // 查询用 fold 模式精确 LIKE，非 ASCII 大小写折叠不依赖 SQLite LIKE。
         let scan = ops::scan_all(store)?;
@@ -480,6 +555,15 @@ impl Index {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
         Ok(())
+    }
+
+    /// 与 `rebuild_with_entries_under_maintenance` 配对的持锁素材更新入口。
+    pub fn set_body_texts_under_maintenance(
+        &mut self,
+        permit: &mem_core::store::IndexMaintenancePermit<'_>,
+    ) -> MemResult<()> {
+        permit.check_compatible()?;
+        self.set_body_texts_locked(permit.store())
     }
 
     fn insert_ref(&self, r: &RefRow) -> MemResult<()> {

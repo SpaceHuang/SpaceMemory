@@ -69,10 +69,10 @@ fn append_assigns_sequential_seq_and_roundtrips() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
     let e1 = log
-        .append_simple("0198a", "records/task/p/a.md", Op::Create, None, Some(1), None, Some("d1"), "tester")
+        .append_test_event("0198a", "records/task/p/a.md", Op::Create, None, Some(1), None, Some("d1"), "tester")
         .unwrap();
     let e2 = log
-        .append_simple("0198a", "records/task/p/a.md", Op::Update, Some(1), Some(2), Some("d1"), Some("d2"), "tester")
+        .append_test_event("0198a", "records/task/p/a.md", Op::Update, Some(1), Some(2), Some("d1"), Some("d2"), "tester")
         .unwrap();
     assert_eq!(e1.seq, 1);
     assert_eq!(e2.seq, 2, "序号 = 行序，全库串行分配");
@@ -87,7 +87,7 @@ fn append_assigns_sequential_seq_and_roundtrips() {
 fn torn_tail_is_truncated_and_reported() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_simple("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
     // 模拟崩溃撕裂：追加半行 JSON（无换行）。
     {
         use std::io::Write;
@@ -98,7 +98,7 @@ fn torn_tail_is_truncated_and_reported() {
     assert_eq!(read.events.len(), 1, "坏行忽略");
     assert!(read.torn_tail, "撕裂尾行必须显式报告");
     // 追加例程先补行界再写：新事件 seq=2，坏行被截断。
-    let e = log.append_simple("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    let e = log.append_test_event("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
     assert_eq!(e.seq, 2);
     let read2 = log.read_log().unwrap();
     assert_eq!(read2.events.len(), 2);
@@ -158,8 +158,8 @@ fn backfill_middle_version_hole_reported_not_faked() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
     // v1 create，然后伪造 v3 update（v2 缺失——版本链断裂）。
-    log.append_simple("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d1"), "t").unwrap();
-    log.append_simple("0198a", "records/x.md", Op::Update, Some(3), Some(3), Some("d3"), Some("d3"), "t").unwrap();
+    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d1"), "t").unwrap();
+    log.append_test_event("0198a", "records/x.md", Op::Update, Some(3), Some(3), Some("d3"), Some("d3"), "t").unwrap();
     // 回填无动作（last==cur 稳定——文件与 v3 一致即可；此处文件不存在 → absent≠records → 会 backfill。
     // 为聚焦链审计，手写文件与 v3 状态一致）。
     hand_write(&store, "records/x.md", "0198a", "task", 3, "v3 body");
@@ -260,7 +260,7 @@ fn delete_then_recreate_yields_backfill_not_external_delete() {
     std::fs::create_dir_all(store.abs("attic/task/p")).unwrap();
     std::fs::rename(store.abs(rel), store.abs(attic_rel)).unwrap();
     event::EventLog::new(&store)
-        .append_simple("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
+        .append_test_event("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
         .unwrap();
     // 重新创建（人手把文件拷回 records/ 同路径）。
     hand_write(&store, rel, "0198a", "task", 1, "recreated");
@@ -320,7 +320,7 @@ fn paused_backfill_does_not_append_stale_event_after_update() {
     hand_write(&store, rel, "0198a", "task", 3, "v3-by-update");
     let d3 = digest_of(&store, rel).unwrap();
     event::EventLog::new(&store)
-        .append_simple("0198a", rel, Op::Update, Some(2), Some(3), Some(&d2), Some(&d3), "updater")
+        .append_test_event("0198a", rel, Op::Update, Some(2), Some(3), Some(&d2), Some(&d3), "updater")
         .unwrap();
     tx.send(()).unwrap();
     let report = h.join().unwrap();
@@ -369,7 +369,7 @@ fn backfill_restore_interleave_no_misordered_events() {
     std::fs::create_dir_all(store.abs("attic/task/p")).unwrap();
     std::fs::rename(store.abs(rel), store.abs(attic_rel)).unwrap();
     event::EventLog::new(&store)
-        .append_simple("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
+        .append_test_event("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
         .unwrap();
     // 回填A 启动（会看到漂移：attic 有文件但最后事件是 delete？——delete 事件后状态=attic，
     // cur=attic → last==cur 稳定！要制造漂移：把 attic 文件改一下（保版本手改 tombstone）。
@@ -392,7 +392,7 @@ fn backfill_restore_interleave_no_misordered_events() {
     // 暂停期间：restore 完成——attic 文件移回 records + restore 事件（摘要真实）。
     std::fs::rename(store.abs(attic_rel), store.abs(rel)).unwrap();
     event::EventLog::new(&store)
-        .append_simple("0198a", rel, Op::Restore, Some(1), Some(1), Some(&d1), Some(&d1), "restorer")
+        .append_test_event("0198a", rel, Op::Restore, Some(1), Some(1), Some(&d1), Some(&d1), "restorer")
         .unwrap();
     tx.send(()).unwrap();
     let ra = ha.join().unwrap();
@@ -419,7 +419,7 @@ fn torn_tail_with_newline_repaired_on_append_path() {
     // 而非截断到最后换行（那样坏行保留、追加后成中部坏行）。
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_simple("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();
@@ -429,7 +429,7 @@ fn torn_tail_with_newline_repaired_on_append_path() {
     let read = log.read_log().unwrap();
     assert!(read.torn_tail);
     // 追加后：坏行被移除，日志完全可用。
-    let e = log.append_simple("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    let e = log.append_test_event("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
     assert_eq!(e.seq, 2);
     let read2 = log.read_log().unwrap();
     assert!(!read2.torn_tail);
@@ -471,7 +471,7 @@ fn mid_file_bad_line_stays_loud_not_silently_repaired() {
     // 中部坏行 = 结构损坏（响亮错误），不被自动修复吞掉——修复只针对**尾行**。
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_simple("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();

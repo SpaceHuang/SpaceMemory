@@ -79,20 +79,15 @@ fn ledger_rel(store: &Store, id: &str) -> MemResult<String> {
     Ok(rel)
 }
 
-// M6b 归档裁决（v1.2 评审）：scan_ledgers 对缺失 sessions/ 目录做 mkdir——写的是
-// 运行时目录骨架（锁文件/台账的宿主），非真相层数据；红线18 管辖"真相与派生缓存"
-// 的内容写。避免它需要把目录保障挪进 session start（写路径）——brief 扫描空目录
-// 返回空即可，此处保留 mkdir 仅为让"无台账"与"店未建"错误可区分，且发生在
-// sessions/（台账域）内，语义安全。
-
 /// 扫描台账（坏条目跳过 + 告警，R6.2）。
 pub fn scan_ledgers(store: &Store) -> MemResult<(Vec<Ledger>, Vec<String>)> {
+    store.read_compatible_missing_features()?;
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     let dir = ledgers_dir(store);
     crate::paths::validate_store_relative_path(store, "sessions")?;
     if !dir.is_dir() {
-        std::fs::create_dir_all(&dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
+        store.read_compatible_missing_features()?;
         return Ok((out, warnings));
     }
     for e in std::fs::read_dir(&dir).map_err(|e| MemError::io(dir.display().to_string(), e))? {
@@ -123,10 +118,18 @@ pub fn scan_ledgers(store: &Store) -> MemResult<(Vec<Ledger>, Vec<String>)> {
         }
     }
     out.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
+    store.read_compatible_missing_features()?;
     Ok((out, warnings))
 }
 
 pub fn get(store: &Store, session_id: &str) -> MemResult<Option<Ledger>> {
+    store.read_compatible_missing_features()?;
+    let result = get_unchecked_read_compatibility(store, session_id);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn get_unchecked_read_compatibility(store: &Store, session_id: &str) -> MemResult<Option<Ledger>> {
     let rel = ledger_rel(store, session_id)?;
     let p = store.abs(&rel);
     if !p.is_file() {
@@ -201,6 +204,8 @@ fn is_resumable(l: &Ledger, idle_secs: u64, now_epoch: u64) -> bool {
 /// 显式建立/接手（红线25）。幂等：同键活跃台账 → 返回既有。
 pub fn start(store: &Store, args: StartArgs) -> MemResult<StartOutcome> {
     store.check_writable()?;
+    let _barrier = lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
     // 幂等键锁（锁文件独立于台账存在；键哈希防路径注入）。
     let key = format!(
         "{}|{}|{}",
@@ -358,7 +363,7 @@ pub fn ensure_for_write(
 }
 
 /// 写通道登记（写路径顺带；幂等去重）。
-pub fn register_trail(store: &Store, session_id: &str, record_id: &str) -> MemResult<()> {
+pub(crate) fn register_trail(store: &Store, session_id: &str, record_id: &str) -> MemResult<()> {
     let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     let Some(mut ledger) = get(store, session_id)? else {
@@ -379,6 +384,8 @@ pub fn flush(
     committer: Option<&dyn crate::ops::CommitSink>,
 ) -> MemResult<Ledger> {
     store.check_writable()?;
+    let _barrier = lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
     let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     let mut ledger = get(store, session_id)?.ok_or_else(|| MemError::MissingRecord {
@@ -405,6 +412,8 @@ pub fn flush(
 /// 显式关闭。
 pub fn close(store: &Store, session_id: &str) -> MemResult<Ledger> {
     store.check_writable()?;
+    let _barrier = lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
     let rel = ledger_rel(store, session_id)?;
     let _l = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     let mut ledger =

@@ -74,6 +74,24 @@ pub struct BarrierGuard {
     inproc: BarrierSlot,
 }
 
+/// 独占门闩的能力型包装；共享门闩无法转换为此类型。
+pub struct ExclusiveBarrierGuard {
+    #[allow(dead_code)] // RAII only; owning the inner guard keeps exclusive locks held.
+    _guard: BarrierGuard,
+}
+
+/// 只用于需要按运行时条件选择共享/独占门闩、但不消费其能力的持锁点。
+pub enum AnyBarrierGuard {
+    Shared(BarrierGuard),
+    Exclusive(ExclusiveBarrierGuard),
+}
+
+impl std::fmt::Debug for ExclusiveBarrierGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExclusiveBarrierGuard").finish_non_exhaustive()
+    }
+}
+
 #[allow(dead_code)] // 同上：两变体仅承载 guard 所有权
 enum BarrierSlot {
     Read(RwLockReadGuard<'static, ()>),
@@ -107,16 +125,16 @@ pub fn barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
 }
 
 /// 维护/merge/apply：独占门闩（阻塞直到所有共享持有者退出）。
-pub fn barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
+pub fn barrier_exclusive(store: &Store) -> MemResult<ExclusiveBarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = BarrierSlot::Write(barrier_rw(store.root()).write().unwrap());
     let file = platform::LockFile::acquire_exclusive(&barrier_path(store))
         .map_err(|e| MemError::io(barrier_path(store).display().to_string(), e))?;
-    Ok(BarrierGuard { file: Some(file), inproc })
+    Ok(ExclusiveBarrierGuard { _guard: BarrierGuard { file: Some(file), inproc } })
 }
 
 /// 非阻塞尝试（测试与快失败场景）。
-pub fn try_barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
+pub fn try_barrier_exclusive(store: &Store) -> MemResult<ExclusiveBarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
     let inproc = match barrier_rw(store.root()).try_write() {
         Ok(g) => BarrierSlot::Write(g),
@@ -127,7 +145,7 @@ pub fn try_barrier_exclusive(store: &Store) -> MemResult<BarrierGuard> {
     let file = platform::LockFile::try_acquire_exclusive(&barrier_path(store)).map_err(|_| {
         MemError::LockTimeout { lock_path: "barrier.lock".into(), holder: None }
     })?;
-    Ok(BarrierGuard { file: Some(file), inproc })
+    Ok(ExclusiveBarrierGuard { _guard: BarrierGuard { file: Some(file), inproc } })
 }
 
 /// 非阻塞尝试共享。

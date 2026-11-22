@@ -45,6 +45,7 @@ pub trait BodyHistory: Send + Sync {
 }
 
 /// 写路径上下文。
+#[non_exhaustive]
 pub struct WriteContext<'a> {
     pub store: &'a Store,
     pub types: &'a TypeSet,
@@ -53,13 +54,33 @@ pub struct WriteContext<'a> {
     pub committer: Option<&'a dyn CommitSink>,
     /// 会话台账 id（写路径 trail 兜底登记）。
     pub session_id: Option<&'a str>,
-    /// 可控暂停点（验收用：归属预检后暂停 → 并发写完成 → 恢复，先例
-    /// event.rs PauseHook）。生产前端恒 None；并发交错测试（方案
-    /// principal-binding §4.2 双分支反例）注入。
-    pub pause_hook: Option<crate::event::PauseHook>,
+}
+
+impl<'a> WriteContext<'a> {
+    /// 建立下游受管写上下文；附加 Git 汇总和会话轨迹使用 builder 方法。
+    pub fn new(store: &'a Store, types: &'a TypeSet, by: impl Into<String>) -> Self {
+        Self {
+            store,
+            types,
+            by: by.into(),
+            committer: None,
+            session_id: None,
+        }
+    }
+
+    pub fn with_committer(mut self, committer: Option<&'a dyn CommitSink>) -> Self {
+        self.committer = committer;
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
+        self.session_id = session_id;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Scanned {
     pub rel: String,
     pub record: Record,
@@ -67,6 +88,7 @@ pub struct Scanned {
 }
 
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ScanResult {
     pub records: Vec<Scanned>,
     /// 结构化坏记录（rel, 告警行）——同一次扫描的坏条目与不可读文件（R10.3 决策⑦）。
@@ -85,6 +107,14 @@ impl ScanResult {
 
 /// 直读扫描 records/（读路径零写盘；R6.2：坏条目跳过 + 告警）。
 pub fn scan_all(store: &Store) -> MemResult<ScanResult> {
+    scan_all_with_hook(store, None)
+}
+
+fn scan_all_with_hook(
+    store: &Store,
+    after_record: Option<&dyn Fn(&Scanned)>,
+) -> MemResult<ScanResult> {
+    store.read_compatible_missing_features()?;
     let mut out = ScanResult::default();
     for rel in crate::event::enumerate_md(store, "records")? {
         let bytes = match std::fs::read(store.abs(&rel)) {
@@ -95,19 +125,42 @@ pub fn scan_all(store: &Store) -> MemResult<ScanResult> {
             }
         };
         match Record::from_bytes(&bytes) {
-            Ok(rec) => out.records.push(Scanned {
-                rel,
-                token: token::for_bytes(rec.envelope.version, &bytes),
-                record: rec,
-            }),
+            Ok(rec) => {
+                out.records.push(Scanned {
+                    rel,
+                    token: token::for_bytes(rec.envelope.version, &bytes),
+                    record: rec,
+                });
+                if let (Some(hook), Some(scanned)) = (after_record, out.records.last()) {
+                    hook(scanned);
+                }
+            }
             Err(e) => out.push_bad(rel.clone(), format!("跳过坏条目 {rel}：{e}")),
         }
     }
+    store.read_compatible_missing_features()?;
     Ok(out)
+}
+
+/// 仅供 debug 集成测试在逐文件扫描的可控交错点执行并发写；不进入 release 构建。
+#[doc(hidden)]
+#[cfg(all(debug_assertions, not(test)))]
+pub fn scan_all_with_hook_test(
+    store: &Store,
+    after_record: impl Fn(&Scanned),
+) -> MemResult<ScanResult> {
+    scan_all_with_hook(store, Some(&after_record))
 }
 
 /// 按 id / 别名 / 路径 解析记录（读路径；存在性含 attic 的读取通道）。
 pub fn get(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
+    store.read_compatible_missing_features()?;
+    let result = get_unchecked_read_compatibility(store, id_or_path);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn get_unchecked_read_compatibility(store: &Store, id_or_path: &str) -> MemResult<Scanned> {
     if id_or_path.starts_with("records/") || id_or_path.starts_with("attic/") {
         paths::validate_store_record_path(store, id_or_path)?;
         // r4 H1：**单次读取**同时派生 Record 与 Token——两次磁盘读取会把"版本 A
@@ -200,6 +253,7 @@ pub struct AddArgs {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Added {
     pub rel: String,
     pub record: Record,
@@ -417,6 +471,25 @@ fn resolve_ownership(
 }
 
 pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
+    add_inner(ctx, args, None)
+}
+
+/// 仅供 debug 集成测试注入受控交错；暂停钩子不属于下游写上下文。
+#[doc(hidden)]
+#[cfg(all(debug_assertions, not(test)))]
+pub fn add_with_pause_hook_test(
+    ctx: &WriteContext,
+    args: AddArgs,
+    hook: crate::event::PauseHook,
+) -> MemResult<Added> {
+    add_inner(ctx, args, Some(hook.as_ref()))
+}
+
+fn add_inner(
+    ctx: &WriteContext,
+    args: AddArgs,
+    pause_hook: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> MemResult<Added> {
     ctx.store.check_writable()?;
     let decl = ctx
         .types
@@ -440,21 +513,20 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         if principal_exists_in_records(ctx.store, pid).is_none() {
             return Err(MemError::RefTargetMissing {
                 rel: "principal".into(),
-                target: format!(
-                    "principal 记录不存在：{pid}（防错报，不防伪装）"
-                ),
+                target: format!("principal 记录不存在：{pid}（防错报，不防伪装）"),
             });
         }
     }
-    if let Some(hook) = &ctx.pause_hook {
+    if let Some(hook) = pause_hook {
         hook("principal_precheck");
     }
     // 引用存在性与发布必须在同一屏障内；新增 x-dag 节点也与全图修改串行。
     let _barrier = if decl.dag() {
-        lock::barrier_exclusive(ctx.store)?
+        lock::AnyBarrierGuard::Exclusive(lock::barrier_exclusive(ctx.store)?)
     } else {
-        lock::barrier_shared(ctx.store)?
+        lock::AnyBarrierGuard::Shared(lock::barrier_shared(ctx.store)?)
     };
+    ctx.store.check_compatible_for_write()?;
     // 归属存在性由两阶段校验承担（§2.1）——此处不传归属，避免暂停点之后的
     // 重复扫描与不一致文案（决策⑥：预检文案只属于锁外拒绝路径）。
     let no_principal: Option<String> = None;
@@ -500,7 +572,9 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
             None => {
                 return Err(MemError::RefTargetMissing {
                     rel: "principal".into(),
-                    target: format!("创建期间归属身份已被删除：{pid}（可恢复后重试，或改用其他身份）"),
+                    target: format!(
+                        "创建期间归属身份已被删除：{pid}（可恢复后重试，或改用其他身份）"
+                    ),
                 });
             }
         },
@@ -516,9 +590,11 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         None
     } else {
         match &principal_rel {
-            Some((_, rel)) => {
-                Some(lock::record_lock(ctx.store, rel, std::time::Duration::from_secs(30))?)
-            }
+            Some((_, rel)) => Some(lock::record_lock(
+                ctx.store,
+                rel,
+                std::time::Duration::from_secs(30),
+            )?),
             None => None,
         }
     };
@@ -560,6 +636,9 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         }
         return Err(MemError::io(target.display().to_string(), e));
     }
+    if let Some(hook) = pause_hook {
+        hook("record_published");
+    }
     // 占位内容正确（create_new 已写入完整字节）；追加事件。
     let log = EventLog::new(ctx.store);
     log.append_simple(
@@ -572,6 +651,9 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
         Some(&token::sha256_hex(&bytes)),
         &ctx.by,
     )?;
+    if let Some(hook) = pause_hook {
+        hook("event_appended");
+    }
     commit_same_batch(ctx, &[rel.clone()], 1)?;
     register_trail(ctx, &id);
     Ok(Added {
@@ -586,6 +668,7 @@ pub fn add(ctx: &WriteContext, args: AddArgs) -> MemResult<Added> {
 // ---------- update ----------
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Updated {
     pub rel: String,
     pub record: Record,
@@ -613,16 +696,17 @@ pub fn update(
         .get(&cur.record.envelope.r#type)
         .ok_or_else(|| MemError::UnknownType(cur.record.envelope.r#type.clone()))?;
     let _barrier = if decl.dag() {
-        lock::barrier_exclusive(ctx.store)?
+        lock::AnyBarrierGuard::Exclusive(lock::barrier_exclusive(ctx.store)?)
     } else {
-        lock::barrier_shared(ctx.store)?
+        lock::AnyBarrierGuard::Shared(lock::barrier_shared(ctx.store)?)
     };
+    ctx.store.check_compatible_for_write()?;
     update_locked(ctx, id_or_path, expect, payload, body)
 }
 
 /// [`update`] 的门闩内变体（调用方已持门闩——维护例程/apply 的计划级独占用；
 /// 自身仍取记录锁与序列锁，锁序不变）。
-pub fn update_locked(
+pub(crate) fn update_locked(
     ctx: &WriteContext,
     id_or_path: &str,
     expect: &Token,
@@ -717,10 +801,11 @@ pub fn link(
         .get(&initial_a.record.envelope.r#type)
         .is_some_and(|d| d.dag() && d.derived_rel() == rel);
     let _barrier = if is_dag_edge {
-        lock::barrier_exclusive(ctx.store)?
+        lock::AnyBarrierGuard::Exclusive(lock::barrier_exclusive(ctx.store)?)
     } else {
-        lock::barrier_shared(ctx.store)?
+        lock::AnyBarrierGuard::Shared(lock::barrier_shared(ctx.store)?)
     };
+    ctx.store.check_compatible_for_write()?;
     // 在屏障内重解析，删除/恢复不能在验证与发布之间改变端点所在位置。
     let a = get(ctx.store, a_id)?;
     let b = get(ctx.store, b_id)?;
@@ -1021,6 +1106,7 @@ fn delete_dependency_guard(
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Deleted {
     pub rel: String, // attic 路径
     pub token: Token,
@@ -1038,11 +1124,12 @@ pub fn delete_record(
     ctx.store.check_writable()?;
     // 反向引用检查必须与所有引用写入互斥，否则检查后可并发新增悬空引用。
     let _barrier = lock::barrier_exclusive(ctx.store)?;
+    ctx.store.check_compatible_for_write()?;
     delete_locked(ctx, id_or_path, expect, force)
 }
 
 /// [`delete_record`] 的门闩内变体（调用方已持门闩——apply 计划级独占用）。
-pub fn delete_locked(
+pub(crate) fn delete_locked(
     ctx: &WriteContext,
     id_or_path: &str,
     expect: &Token,
@@ -1058,7 +1145,13 @@ pub fn delete_locked(
     let dependents = reverse_refs(ctx.store, &cur.record.envelope.id)?;
     let owned = ownership_dependents(ctx.store, &cur.record.envelope.id)?;
     let mut warnings = Vec::new();
-    delete_dependency_guard(&dependents, &owned, &cur.record.envelope.id, force, &mut warnings)?;
+    delete_dependency_guard(
+        &dependents,
+        &owned,
+        &cur.record.envelope.id,
+        force,
+        &mut warnings,
+    )?;
     let attic_rel = paths::attic_rel(&cur.rel)?;
     paths::validate_store_record_path(ctx.store, &attic_rel)?;
     let _rec = lock::record_lock(ctx.store, &cur.rel, std::time::Duration::from_secs(30))?;
@@ -1105,7 +1198,20 @@ pub fn delete_locked(
     })
 }
 
+/// 仅供核心库集成测试在已持有门闩的时序点执行。
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn delete_locked_test(
+    ctx: &WriteContext,
+    id_or_path: &str,
+    expect: &Token,
+    force: bool,
+) -> MemResult<Deleted> {
+    delete_locked(ctx, id_or_path, expect, force)
+}
+
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Restored {
     pub rel: String,
     pub token: Token,
@@ -1124,15 +1230,16 @@ pub fn restore_record(
         .get(&tomb.record.envelope.r#type)
         .is_some_and(|d| d.dag());
     let _barrier = if is_dag {
-        lock::barrier_exclusive(ctx.store)?
+        lock::AnyBarrierGuard::Exclusive(lock::barrier_exclusive(ctx.store)?)
     } else {
-        lock::barrier_shared(ctx.store)?
+        lock::AnyBarrierGuard::Shared(lock::barrier_shared(ctx.store)?)
     };
+    ctx.store.check_compatible_for_write()?;
     restore_locked(ctx, id_or_path, expect)
 }
 
 /// [`restore_record`] 的门闩内变体（调用方已持门闩——apply 计划级独占用）。
-pub fn restore_locked(
+pub(crate) fn restore_locked(
     ctx: &WriteContext,
     id_or_path: &str,
     expect: Option<&Token>,
@@ -1210,7 +1317,7 @@ pub fn reverse_refs(store: &Store, id: &str) -> MemResult<Vec<(String, String)>>
 /// commit-pending（不分配序号、不回滚真相层）。通用写路径（[`commit_same_batch`]
 /// 的调用方）与 fix（实施评审 B1：修复版本必须入史，否则随后 restore-body
 /// history 的锚摘要不在 git 历史中——复合修复链断裂）共用本纪律。
-pub fn commit_batch(
+pub(crate) fn commit_batch(
     store: &Store,
     committer: Option<&dyn CommitSink>,
     record_paths: &[String],
@@ -1274,6 +1381,13 @@ pub struct PendingCommit {
 }
 
 pub fn list_pending_commits(store: &Store) -> MemResult<Vec<(String, PendingCommit)>> {
+    store.read_compatible_missing_features()?;
+    let result = list_pending_commits_unchecked(store);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn list_pending_commits_unchecked(store: &Store) -> MemResult<Vec<(String, PendingCommit)>> {
     let dir = store.abs(".pending-commits");
     let mut out = Vec::new();
     if !dir.is_dir() {
@@ -1307,11 +1421,12 @@ pub fn merge(
 ) -> MemResult<Merged> {
     ctx.store.check_writable()?;
     let _barrier = lock::barrier_exclusive(ctx.store)?;
+    ctx.store.check_compatible_for_write()?;
     merge_locked(ctx, dup_id, canonical_id, expect_dup, expect_canonical)
 }
 
 /// [`merge`] 的门闩内变体（调用方已持独占门闩——apply 的计划级独占用）。
-pub fn merge_locked(
+pub(crate) fn merge_locked(
     ctx: &WriteContext,
     dup_id: &str,
     canonical_id: &str,
@@ -1574,6 +1689,7 @@ pub fn fix_record(
     // fix 可能重新引入类型声明中的派生边；整个读—校验—写过程使用图级独占屏障，
     // 不在共享锁下检查后再升级，以免与其他 DAG 写入共同发布成环。
     let _barrier = lock::barrier_exclusive(store)?;
+    store.check_compatible_for_write()?;
     let _rec = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     // H1：锁内读——并发窗口内的 update 成果不会被 fix 的旧字节覆盖。
     let bytes = std::fs::read(store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;
@@ -1622,14 +1738,7 @@ pub fn fix_record(
         }
         if decl.dag() {
             dag_candidate_precheck(
-                &WriteContext {
-                    store,
-                    types,
-                    by: "mem fix".into(),
-                    committer,
-                    session_id: None,
-                    pause_hook: None,
-                },
+                &WriteContext::new(store, types, "mem fix").with_committer(committer),
                 &env.id,
                 &env.r#type,
                 &env.refs,
@@ -1685,6 +1794,7 @@ fn token_of_bytes(bytes: &[u8]) -> Token {
 
 /// 恢复来源三形（§3.6）。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RestoreSource {
     /// `git:<版本>`——指定历史版本的正文区（来源可信性由调用方显式承担）。
     Git { rev: String },
@@ -1695,6 +1805,7 @@ pub enum RestoreSource {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RestoredBody {
     pub rel: String,
     pub record: Record,
@@ -1730,8 +1841,39 @@ pub fn restore_body(
     source: &RestoreSource,
     history: Option<&dyn BodyHistory>,
 ) -> MemResult<RestoredBody> {
+    restore_body_inner(ctx, id_or_path, expect, source, history, None)
+}
+
+/// 仅供 debug 集成测试注入特性登记与依赖写之间的进程交错。
+#[doc(hidden)]
+#[cfg(all(debug_assertions, not(test)))]
+pub fn restore_body_with_pause_hook_test(
+    ctx: &WriteContext,
+    id_or_path: &str,
+    expect: &Token,
+    source: &RestoreSource,
+    history: Option<&dyn BodyHistory>,
+    hook: crate::event::PauseHook,
+) -> MemResult<RestoredBody> {
+    restore_body_inner(
+        ctx,
+        id_or_path,
+        expect,
+        source,
+        history,
+        Some(hook.as_ref()),
+    )
+}
+
+fn restore_body_inner(
+    ctx: &WriteContext,
+    id_or_path: &str,
+    expect: &Token,
+    source: &RestoreSource,
+    history: Option<&dyn BodyHistory>,
+    pause_hook: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> MemResult<RestoredBody> {
     ctx.store.check_writable()?;
-    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
     let hit = get(ctx.store, id_or_path)?;
     if !hit.rel.starts_with("records/") {
         return Err(MemError::BadArgument(format!(
@@ -1740,7 +1882,10 @@ pub fn restore_body(
         )));
     }
     let rel = hit.rel.clone();
-    let _barrier = lock::barrier_shared(ctx.store)?;
+    // restore_body 引入事件语义；在独占门闩内先登记，再在同一边界中写记录和事件。
+    // 不能先取共享门闩再升级，否则与其他写者交错时会违反锁序或自锁。
+    let barrier = lock::barrier_exclusive(ctx.store)?;
+    ctx.store.check_compatible_for_write()?;
     let _rec = lock::record_lock(ctx.store, &rel, std::time::Duration::from_secs(30))?;
     // 锁内重读 + CAS（红线19：经确认的内容写仍是读改写）。
     let fresh_bytes =
@@ -1772,8 +1917,17 @@ pub fn restore_body(
     }
     echo["body_sha256_source"] = serde_json::json!(source_digest);
     echo["body_sha256_written"] = serde_json::json!(written_digest);
+    ctx.store
+        .register_required_features_under_exclusive(&["event.restore_body/v1"], &barrier)?;
+    if let Some(hook) = pause_hook {
+        hook("feature_registered");
+    }
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：受管写前核验
     crate::platform::atomic_write(&ctx.store.abs(&rel), &out_bytes)
         .map_err(|e| MemError::io(rel.clone(), e))?;
+    if let Some(hook) = pause_hook {
+        hook("record_published");
+    }
     let new_token = token::for_bytes(env.version, &out_bytes);
     let log = EventLog::new(ctx.store);
     log.append_simple(
@@ -1786,6 +1940,9 @@ pub fn restore_body(
         Some(&new_token.digest),
         &ctx.by,
     )?;
+    if let Some(hook) = pause_hook {
+        hook("event_appended");
+    }
     commit_same_batch(ctx, &[rel.clone()], 0)?;
     register_trail(ctx, &env.id);
     Ok(RestoredBody {
@@ -2056,7 +2213,9 @@ pub fn principal_binding_audit(store: &Store) -> MemResult<Vec<serde_json::Value
     let mut attic_ids = std::collections::HashSet::new();
     let attic_dir = store.abs("attic/principal");
     if attic_dir.is_dir() {
-        for entry in std::fs::read_dir(&attic_dir).map_err(|e| MemError::io("attic/principal", e))? {
+        for entry in
+            std::fs::read_dir(&attic_dir).map_err(|e| MemError::io("attic/principal", e))?
+        {
             let path = match entry {
                 Ok(e) => e.path(),
                 Err(e) => return Err(MemError::io("attic/principal", e)),
@@ -2082,7 +2241,8 @@ pub fn principal_binding_audit(store: &Store) -> MemResult<Vec<serde_json::Value
         let repair = if attic_ids.contains(p) {
             format!("身份已被删除进隔离区——恢复身份记录（mem restore {p}）")
         } else {
-            "身份缺失（外部删除，无受管 tombstone）——如实报告缺失；可从历史/备份恢复身份后重建归属".to_string()
+            "身份缺失（外部删除，无受管 tombstone）——如实报告缺失；可从历史/备份恢复身份后重建归属"
+                .to_string()
         };
         out.push(serde_json::json!({
             "from": r.record.envelope.id,

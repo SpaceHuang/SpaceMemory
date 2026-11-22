@@ -49,6 +49,30 @@ fn init_creates_store_and_bootstraps_principal() {
 }
 
 #[test]
+fn init_quarantines_and_preserves_an_interrupted_previous_attempt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+    let path = store.to_str().unwrap();
+    let first = mem().args(["--store", path, "init", path, "--principal", "first-owner"]).output().unwrap();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+
+    let marker = store.join(".init-in-progress");
+    std::fs::write(&marker, b"interrupted").unwrap();
+    let sentinel = store.join("records/keep-during-recovery.bin");
+    std::fs::write(&sentinel, b"preserve incomplete store for diagnosis").unwrap();
+
+    let recovered = mem().args(["--store", path, "init", path, "--principal", "second-owner"]).output().unwrap();
+    assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stderr));
+    let recovered_json: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    let quarantine = recovered_json["quarantined_incomplete_init"].as_str().unwrap();
+    assert_eq!(std::fs::read(std::path::Path::new(quarantine).join("records/keep-during-recovery.bin")).unwrap(),
+        b"preserve incomplete store for diagnosis");
+    assert!(!marker.exists(), "新店发布前须清理中断标记");
+    let verify = mem().args(["--store", path, "verify"]).output().unwrap();
+    assert!(verify.status.success(), "新店应完整可用: {}", String::from_utf8_lossy(&verify.stderr));
+}
+
+#[test]
 fn session_start_idempotent_and_flush() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
@@ -299,6 +323,68 @@ fn trace_and_reconcile_roundtrip() {
     let out_r = mem().args(["--store", s, "reconcile"]).output().unwrap();
     let v_r = j(&out_r);
     assert_eq!(v_r["backfill_appended"], 0, "全稳定：无回填");
+}
+
+#[test]
+fn cli_reconcile_refuses_missing_feature_without_persisting_index_or_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    init_store(&dir);
+    let store = mem_core::store::Store::open(&dir, mem_core::store::OpenMode::Auto).unwrap();
+    let mut idx = mem_index::Index::open_store(&store).unwrap();
+    idx.rebuild(&store).unwrap();
+    drop(idx);
+    let index_path = dir.join("index/index.sqlite");
+    let before_index = std::fs::read(&index_path).unwrap();
+    let event_path = dir.join("events.jsonl");
+    let before_events = std::fs::read(&event_path).unwrap();
+    let pending_dir = dir.join(".pending-commits");
+    std::fs::write(pending_dir.join("reconcile.json"), br#"{"paths":["events.jsonl"],"ts":"2026-11-22T00:00:00Z","error":"fixture"}"#).unwrap();
+    let before_pending = snapshot_files(&pending_dir);
+    let checkpoint = dir.join("index/checkpoint.json");
+    std::fs::write(&checkpoint, b"checkpoint fixture").unwrap();
+    let before_index_tree = snapshot_files(&dir.join("index"));
+    let config_path = dir.join("mem.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["record.future/v1"]);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let output = mem().args(["--store", dir.to_str().unwrap(), "reconcile"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("record.future/v1"));
+    assert_eq!(std::fs::read(index_path).unwrap(), before_index);
+    assert_eq!(std::fs::read(event_path).unwrap(), before_events);
+    assert_eq!(snapshot_files(&pending_dir), before_pending);
+    assert_eq!(snapshot_files(&dir.join("index")), before_index_tree);
+}
+
+fn snapshot_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    std::fs::read_dir(dir).unwrap().map(|entry| {
+        let path = entry.unwrap().path();
+        (path.file_name().unwrap().into(), std::fs::read(&path).unwrap())
+    }).collect()
+}
+
+#[test]
+fn cli_migrate_legacy_store_reports_backup_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    mem_core::store::Store::create(&dir).unwrap();
+    let config_path = dir.join("mem.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["format_version"] = serde_json::json!(1);
+    config.as_object_mut().unwrap().remove("required_features");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let first = mem().args(["--store", dir.to_str().unwrap(), "migrate", "--backup-identity", "backup-2026-11-22"]).output().unwrap();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let first_json = j(&first);
+    assert_eq!(first_json["status"], "migrated");
+    assert_eq!(first_json["backup_identity"], "backup-2026-11-22");
+
+    let second = mem().args(["--store", dir.to_str().unwrap(), "migrate", "--backup-identity", "backup-2026-11-22"]).output().unwrap();
+    assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+    assert_eq!(j(&second)["status"], "already_migrated");
 }
 
 

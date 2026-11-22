@@ -34,6 +34,78 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
     (tmp, store, types)
 }
 
+#[test]
+fn restore_body_registers_required_feature_before_publishing_dependent_event() {
+    let (tmp, store, types) = fresh_store();
+    let (id, token) = add_memory(&store, &types, "feature-registration", b"before");
+    let hit = ops::get(&store, &id).unwrap();
+    let source_path = tmp.path().join("restore-source.md");
+    let original =
+        mem_core::record::Record::from_bytes(&std::fs::read(store.abs(&hit.rel)).unwrap()).unwrap();
+    let source =
+        mem_core::record::serialize_new(&original.envelope, &original.payload, b"restored bytes");
+    std::fs::write(&source_path, source).unwrap();
+    let out = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &token,
+        &RestoreSource::File { path: source_path },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(out.record.body, b"restored bytes");
+    assert_eq!(
+        store.config().required_features,
+        vec!["event.restore_body/v1"]
+    );
+    let log = EventLog::new(&store).read_log().unwrap();
+    assert_eq!(log.events.last().unwrap().op, Op::RestoreBody);
+}
+
+#[test]
+fn migration_marks_legacy_store_that_already_contains_restore_body_events() {
+    let (tmp, store, types) = fresh_store();
+    let (id, token) = add_memory(&store, &types, "legacy-feature-history", b"before");
+    let hit = ops::get(&store, &id).unwrap();
+    let source_path = tmp.path().join("legacy-restore-source.md");
+    let original =
+        mem_core::record::Record::from_bytes(&std::fs::read(store.abs(&hit.rel)).unwrap()).unwrap();
+    let source = mem_core::record::serialize_new(
+        &original.envelope,
+        &original.payload,
+        b"legacy restored bytes",
+    );
+    std::fs::write(&source_path, source).unwrap();
+    ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &token,
+        &RestoreSource::File { path: source_path },
+        None,
+    )
+    .unwrap();
+    mem_core::event::reconcile_backfill(&store, "test", None).unwrap();
+    let drift = ops::deep_digest_audit(&store).unwrap();
+    assert!(drift.is_empty(), "legacy fixture must be stable: {drift:?}");
+
+    let config_path = store.abs("mem.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    raw["format_version"] = serde_json::json!(1);
+    raw.as_object_mut().unwrap().remove("required_features");
+    std::fs::write(&config_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    Store::migrate_format_v1(store.root(), "legacy-copy").unwrap();
+
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(
+        migrated["required_features"],
+        serde_json::json!(["event.restore_body/v1"])
+    );
+}
+
 /// 无 .git 形态（红线10：`.git` 是附属物；git 缺席的店合法）。
 fn fresh_store_nogit() -> (tempfile::TempDir, Store, TypeSet) {
     let tmp = tempfile::tempdir().unwrap();
@@ -57,14 +129,9 @@ fn fresh_store_nogit() -> (tempfile::TempDir, Store, TypeSet) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext {
-        store,
-        types,
-        by: "test".into(),
-        committer: None,
-        session_id: None,
-        pause_hook: None,
-    }
+    WriteContext::new(store, types, "test")
+        .with_committer(None)
+        .with_session_id(None)
 }
 
 fn add_memory(store: &Store, types: &TypeSet, title: &str, body: &[u8]) -> (String, Token) {
@@ -100,8 +167,12 @@ struct FakeHistory {
 
 impl FakeHistory {
     fn with_version(rel: &str, rev: &str, bytes: &[u8]) -> Self {
-        let mut h = Self { files: HashMap::new(), versions: HashMap::new() };
-        h.files.insert((rel.to_string(), rev.to_string()), bytes.to_vec());
+        let mut h = Self {
+            files: HashMap::new(),
+            versions: HashMap::new(),
+        };
+        h.files
+            .insert((rel.to_string(), rev.to_string()), bytes.to_vec());
         h.versions.insert(rel.to_string(), vec![rev.to_string()]);
         h
     }
@@ -131,20 +202,32 @@ fn history_source_restores_bytes_in_window() {
     let corrupted = corrupt_body(&store, &rel);
     // 发现半边：verify --deep 报漂移（既有审计，追认为验收承诺）。
     let audit = ops::deep_digest_audit(&store).unwrap();
-    assert!(audit.iter().any(|l| l.contains(&rel)), "deep 审计报出漂移：{audit:?}");
+    assert!(
+        audit.iter().any(|l| l.contains(&rel)),
+        "deep 审计报出漂移：{audit:?}"
+    );
 
     // 恢复：history 自动锚定（窗口内：漂移仍在 ∧ 最后事件为机制写入登记）。
     let fake = FakeHistory::with_version(&rel, "sha-1", &pristine_bytes);
     let expect = token::for_bytes(hit.record.envelope.version, &corrupted);
-    let out = ops::restore_body(&ctx(&store, &types), &id, &expect, &RestoreSource::History, Some(&fake))
-        .expect("窗口内 history 锚定成功");
+    let out = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &expect,
+        &RestoreSource::History,
+        Some(&fake),
+    )
+    .expect("窗口内 history 锚定成功");
     // 正文 == 所选来源（哈希相等）。
     assert_eq!(out.record.body, orig_body, "恢复后正文 == 来源正文区");
     assert_eq!(out.token.version, 2, "版本 +1");
     // 信封/载荷原样保留。
     assert_eq!(out.record.envelope.id, id);
     assert_eq!(out.record.envelope.r#type, "memory");
-    assert_eq!(out.record.payload, serde_json::json!({"title": "restore-me"}));
+    assert_eq!(
+        out.record.payload,
+        serde_json::json!({"title": "restore-me"})
+    );
     // 事件留痕：op=restore_body，前后全文摘要。
     let last = EventLog::new(&store).last_event_for(&id).unwrap().unwrap();
     assert_eq!(last.op, Op::RestoreBody);
@@ -154,11 +237,20 @@ fn history_source_restores_bytes_in_window() {
     assert_eq!(out.source_echo["form"], "history");
     assert_eq!(out.source_echo["anchor"], anchor);
     assert_eq!(out.source_echo["commit"], "sha-1");
-    assert_eq!(out.source_echo["body_sha256_source"], token::sha256_hex(orig_body));
-    assert_eq!(out.source_echo["body_sha256_written"], token::sha256_hex(orig_body));
+    assert_eq!(
+        out.source_echo["body_sha256_source"],
+        token::sha256_hex(orig_body)
+    );
+    assert_eq!(
+        out.source_echo["body_sha256_written"],
+        token::sha256_hex(orig_body)
+    );
     // 复跑 --deep：该记录不再漂移。
     let audit2 = ops::deep_digest_audit(&store).unwrap();
-    assert!(!audit2.iter().any(|l| l.contains(&rel)), "恢复后深档审计收敛：{audit2:?}");
+    assert!(
+        !audit2.iter().any(|l| l.contains(&rel)),
+        "恢复后深档审计收敛：{audit2:?}"
+    );
     let _ = tmp;
 }
 
@@ -184,14 +276,27 @@ fn history_source_rejects_after_backfill_registered_corruption() {
     // history 必须**响亮拒绝**——不得把盘上（损坏）字节写成新版本冒充治愈。
     let fake = FakeHistory::with_version(&rel, "sha-1", &pristine);
     let expect = token::for_bytes(hit.record.envelope.version, &corrupted);
-    let err = ops::restore_body(&ctx(&store, &types), &id, &expect, &RestoreSource::History, Some(&fake))
-        .unwrap_err();
+    let err = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &expect,
+        &RestoreSource::History,
+        Some(&fake),
+    )
+    .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("拒绝"), "响亮拒绝：{msg}");
     // 指引含最后**机制写入**登记摘要（Create 事件的登记摘要）。
-    assert!(msg.contains(&token::sha256_hex(&pristine)), "指引含最后机制写入登记摘要：{msg}");
+    assert!(
+        msg.contains(&token::sha256_hex(&pristine)),
+        "指引含最后机制写入登记摘要：{msg}"
+    );
     // 未落任何新版本（盘上字节未变）。
-    assert_eq!(std::fs::read(store.abs(&rel)).unwrap(), corrupted, "窗口外拒绝不写盘");
+    assert_eq!(
+        std::fs::read(store.abs(&rel)).unwrap(),
+        corrupted,
+        "窗口外拒绝不写盘"
+    );
     let _ = tmp;
 }
 
@@ -218,9 +323,18 @@ fn history_source_rejects_when_drift_converged_by_legit_update() {
     .unwrap();
     let fake = FakeHistory::with_version(&rel, "sha-1", &pristine);
     let hit = ops::get(&store, &id).unwrap();
-    let err = ops::restore_body(&ctx(&store, &types), &id, &hit.token, &RestoreSource::History, Some(&fake))
-        .unwrap_err();
-    assert!(err.to_string().contains("拒绝"), "漂移已收敛 → 响亮拒绝：{err}");
+    let err = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &hit.token,
+        &RestoreSource::History,
+        Some(&fake),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("拒绝"),
+        "漂移已收敛 → 响亮拒绝：{err}"
+    );
     let _ = tmp;
 }
 
@@ -240,7 +354,9 @@ fn git_version_source_restores_explicitly() {
         &ctx(&store, &types),
         &id,
         &expect,
-        &RestoreSource::Git { rev: "abc123".into() },
+        &RestoreSource::Git {
+            rev: "abc123".into(),
+        },
         Some(&fake),
     )
     .unwrap();
@@ -276,7 +392,9 @@ fn file_source_restores_from_outside_backup_and_rejects_store_paths() {
         &ctx(&store, &types),
         &id,
         &expect,
-        &RestoreSource::File { path: backup.clone() },
+        &RestoreSource::File {
+            path: backup.clone(),
+        },
         None,
     )
     .unwrap();
@@ -339,15 +457,31 @@ fn anchor_not_found_loud_failure_distinguishes_causes() {
     // 历史在但**无匹配版本**（字节摘要 ≠ 锚）。
     let fake = FakeHistory::with_version(&rel, "sha-1", b"totally different bytes");
     let expect = token::for_bytes(1, &corrupted);
-    let err = ops::restore_body(&ctx(&store, &types), &id, &expect, &RestoreSource::History, Some(&fake))
-        .unwrap_err();
+    let err = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &expect,
+        &RestoreSource::History,
+        Some(&fake),
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("未在 git 历史中找到"), "{err}");
     // commit-pending 在场 → 成因指明"等待收敛后重试"。
     let pdir = store.abs(".pending-commits");
     std::fs::create_dir_all(&pdir).unwrap();
-    std::fs::write(pdir.join("1.json"), b"{\"paths\":[],\"ts\":\"t\",\"error\":\"e\"}").unwrap();
-    let err2 = ops::restore_body(&ctx(&store, &types), &id, &expect, &RestoreSource::History, Some(&fake))
-        .unwrap_err();
+    std::fs::write(
+        pdir.join("1.json"),
+        b"{\"paths\":[],\"ts\":\"t\",\"error\":\"e\"}",
+    )
+    .unwrap();
+    let err2 = ops::restore_body(
+        &ctx(&store, &types),
+        &id,
+        &expect,
+        &RestoreSource::History,
+        Some(&fake),
+    )
+    .unwrap_err();
     assert!(err2.to_string().contains("commit-pending"), "{err2}");
 }
 
@@ -359,17 +493,26 @@ fn cas_conflict_rejected_and_file_untouched() {
     let (id, _tok) = add_memory(&store, &types, "cas", b"body v1");
     let rel = ops::get(&store, &id).unwrap().rel.clone();
     let before = std::fs::read(store.abs(&rel)).unwrap();
-    let wrong = Token { version: 1, digest: "0".repeat(64) };
+    let wrong = Token {
+        version: 1,
+        digest: "0".repeat(64),
+    };
     let err = ops::restore_body(
         &ctx(&store, &types),
         &id,
         &wrong,
-        &RestoreSource::File { path: tmp.path().join("nope.md") },
+        &RestoreSource::File {
+            path: tmp.path().join("nope.md"),
+        },
         None,
     )
     .unwrap_err();
     assert!(matches!(err, MemError::Conflict { .. }), "{err}");
-    assert_eq!(std::fs::read(store.abs(&rel)).unwrap(), before, "CAS 失败不写盘");
+    assert_eq!(
+        std::fs::read(store.abs(&rel)).unwrap(),
+        before,
+        "CAS 失败不写盘"
+    );
 }
 
 #[test]
@@ -385,7 +528,10 @@ fn attic_record_rejected() {
         None,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("records/"), "attic 记录不支持 restore-body：{err}");
+    assert!(
+        err.to_string().contains("records/"),
+        "attic 记录不支持 restore-body：{err}"
+    );
 }
 
 // ---------- 实施评审 B1：fix 修复版本必须入 git 同批提交（否则 history 锚不在史） ----------
@@ -411,7 +557,10 @@ impl CommitSink for RecordingSink {
 fn hand_edit_title(store: &Store, rel: &str, title: &str) -> Vec<u8> {
     let mut bytes = std::fs::read(store.abs(rel)).unwrap();
     let old = format!("\"title\": \"{title}\"").into_bytes();
-    assert!(bytes.windows(old.len()).any(|w| w == old), "夹具：payload title 存在");
+    assert!(
+        bytes.windows(old.len()).any(|w| w == old),
+        "夹具：payload title 存在"
+    );
     let new = format!("\"title\": \"{title}-edited\"").into_bytes();
     let pos = bytes.windows(old.len()).position(|w| w == old).unwrap();
     bytes.splice(pos..pos + old.len(), new);
@@ -432,7 +581,10 @@ fn b1_fix_output_enters_same_batch_commit() {
     assert_eq!(batches.len(), 1, "fix 产生新字节 → 恰一批提交");
     let batch = &batches[0];
     assert!(batch.contains(&rel), "记录路径在批：{batch:?}");
-    assert!(batch.contains(&"events.jsonl".to_string()), "事件日志同批：{batch:?}");
+    assert!(
+        batch.contains(&"events.jsonl".to_string()),
+        "事件日志同批：{batch:?}"
+    );
     assert!(
         batch.contains(&".gitattributes".to_string()),
         "BD5 ②：规则文件随受管写批次（fix 亦然）：{batch:?}"
@@ -446,7 +598,10 @@ fn b1_fix_commit_failure_lands_in_retryable_pending() {
     let rel = ops::get(&store, &id).unwrap().rel.clone();
     let hand_edited = hand_edit_title(&store, &rel, "b1-pending");
     let expect = token::for_bytes(1, &hand_edited);
-    let sink = RecordingSink { batches: Default::default(), fail: true };
+    let sink = RecordingSink {
+        batches: Default::default(),
+        fail: true,
+    };
     // 提交失败 → 真相层不回滚、转 commit-pending（D17；不静默无历史）。
     ops::fix_record(&store, &types, &id, None, None, Some(&expect), Some(&sink)).unwrap();
     let pending = ops::list_pending_commits(&store).unwrap();

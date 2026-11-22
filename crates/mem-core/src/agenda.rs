@@ -49,6 +49,7 @@ pub struct Proposal {
 
 /// 机械性扫描（不落笔、不改记录——只产提案；D6 自主性的边界）。
 pub fn scan_agenda(store: &Store, types: &TypeSet) -> MemResult<Vec<Proposal>> {
+    store.read_compatible_missing_features()?;
     let scan = ops::scan_all(store)?;
     let now = crate::clock::now_rfc3339();
     let mut out: Vec<Proposal> = Vec::new();
@@ -179,6 +180,7 @@ pub fn scan_agenda(store: &Store, types: &TypeSet) -> MemResult<Vec<Proposal>> {
             }
         }
     }
+    store.read_compatible_missing_features()?;
     Ok(out)
 }
 
@@ -194,6 +196,8 @@ fn age_in_days(rfc3339: &str) -> u64 {
 /// 提案落盘（agenda/<id>.json；提案 = steps 为空的 plan，确认后可补 steps 执行）。
 pub fn write_proposals(store: &Store, proposals: &[Proposal]) -> MemResult<usize> {
     store.check_writable()?;
+    let _barrier = crate::lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
     for p in proposals {
         let plan = Plan {
             id: p.id.clone(),
@@ -204,7 +208,7 @@ pub fn write_proposals(store: &Store, proposals: &[Proposal]) -> MemResult<usize
             in_progress: None,
             created: p.created.clone(),
         };
-        save_plan(store, &plan)?;
+        save_plan_locked(store, &plan)?;
     }
     Ok(proposals.len())
 }
@@ -299,6 +303,12 @@ fn plan_rel(store: &Store, id: &str) -> MemResult<String> {
 
 pub fn save_plan(store: &Store, plan: &Plan) -> MemResult<()> {
     store.check_writable()?;
+    let _barrier = crate::lock::barrier_shared(store)?;
+    store.check_compatible_for_write()?;
+    save_plan_locked(store, plan)
+}
+
+fn save_plan_locked(store: &Store, plan: &Plan) -> MemResult<()> {
     let rel = plan_rel(store, &plan.id)?;
     let dir = agenda_dir(store);
     std::fs::create_dir_all(&dir).map_err(|e| MemError::io(dir.display().to_string(), e))?;
@@ -312,6 +322,13 @@ pub fn save_plan(store: &Store, plan: &Plan) -> MemResult<()> {
 }
 
 pub fn load_plan(store: &Store, plan_id: &str) -> MemResult<Option<Plan>> {
+    store.read_compatible_missing_features()?;
+    let result = load_plan_unchecked(store, plan_id);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn load_plan_unchecked(store: &Store, plan_id: &str) -> MemResult<Option<Plan>> {
     let rel = plan_rel(store, plan_id)?;
     let p = store.abs(&rel);
     if !p.is_file() {
@@ -332,6 +349,13 @@ pub fn load_plan(store: &Store, plan_id: &str) -> MemResult<Option<Plan>> {
 }
 
 pub fn list_plans(store: &Store) -> MemResult<Vec<Plan>> {
+    store.read_compatible_missing_features()?;
+    let result = list_plans_unchecked(store);
+    store.read_compatible_missing_features()?;
+    result
+}
+
+fn list_plans_unchecked(store: &Store) -> MemResult<Vec<Plan>> {
     let dir = agenda_dir(store);
     crate::paths::validate_store_relative_path(store, "agenda")?;
     let mut out = Vec::new();
@@ -382,6 +406,7 @@ pub fn apply(
     // 计划状态与进度决定本次要执行哪些动作，必须在独占屏障内读取，
     // 否则并发 apply 会带着屏障外的旧快照覆盖 done/检查点并重复动作。
     let _barrier = crate::lock::barrier_exclusive(store)?;
+    store.check_compatible_for_write()?;
     let mut plan = load_plan(store, plan_id)?.ok_or_else(|| MemError::MissingRecord {
         id_or_path: format!("plan {plan_id}"),
     })?;
@@ -404,7 +429,7 @@ pub fn apply(
     }
     // executing 标记先落盘（崩溃可检出，D17）。
     plan.status = PlanStatus::Executing;
-    save_plan(store, &plan)?;
+    save_plan_locked(store, &plan)?;
     let mut report = AppliedReport::default();
     // 计划级独占门闩贯穿全部步骤；各 step 使用不自行取门闩的 locked 变体。
     let result = (|| -> MemResult<()> {
@@ -417,7 +442,7 @@ pub fn apply(
                     StepRecovery::Completed => {
                         plan.completed_steps += 1;
                         plan.in_progress = None;
-                        save_plan(store, &plan)?;
+                        save_plan_locked(store, &plan)?;
                         report.executed += 1;
                         continue;
                     }
@@ -431,21 +456,15 @@ pub fn apply(
                 }
             } else {
                 plan.in_progress = Some(capture_step_checkpoint(store, step, index)?);
-                save_plan(store, &plan)?;
+                save_plan_locked(store, &plan)?;
             }
             let checkpoint = plan
                 .in_progress
                 .as_ref()
                 .expect("步骤检查点已持久化")
                 .clone();
-            let ctx = ops::WriteContext {
-                store,
-                types,
-                by: "mem apply".into(),
-                committer,
-                session_id: None,
-                pause_hook: None,
-            };
+            let ctx = ops::WriteContext::new(store, types, "mem apply")
+                .with_committer(committer);
             match step {
                 PlanStep::Merge { dup, canonical } => {
                     ops::merge_locked(
@@ -473,7 +492,7 @@ pub fn apply(
             }
             plan.completed_steps += 1;
             plan.in_progress = None;
-            save_plan(store, &plan)?;
+            save_plan_locked(store, &plan)?;
             report.executed += 1;
         }
         Ok(())
@@ -481,12 +500,12 @@ pub fn apply(
     match result {
         Ok(()) => {
             plan.status = PlanStatus::Done;
-            save_plan(store, &plan)?;
+            save_plan_locked(store, &plan)?;
             Ok(report)
         }
         Err(e) => {
             plan.status = PlanStatus::Failed;
-            let _ = save_plan(store, &plan);
+            let _ = save_plan_locked(store, &plan);
             Err(e)
         }
     }

@@ -125,14 +125,7 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext {
-        store,
-        types,
-        by: "0198f7b2(zcode_main)".into(),
-        committer: None,
-        session_id: None,
-        pause_hook: None,
-    }
+    WriteContext::new(store, types, "0198f7b2(zcode_main)").with_committer(None).with_session_id(None)
 }
 
 fn task_payload(project: &str, slug: &str, status: &str) -> serde_json::Value {
@@ -214,14 +207,7 @@ fn concurrent_double_add_single_winner() {
         handles.push(std::thread::spawn(move || {
             let s = Store::open(&root, OpenMode::Auto).unwrap();
             let ts = TypeSet::load_dir(&types_dir).unwrap();
-            let c = WriteContext {
-                store: &s,
-                types: &ts,
-                by: format!("w{i}"),
-                committer: None,
-                session_id: None,
-                pause_hook: None,
-            };
+            let c = WriteContext::new(&s, &ts, format!("w{i}")).with_committer(None).with_session_id(None);
             ops::add(
                 &c,
                 AddArgs {
@@ -399,6 +385,28 @@ fn update_with_valid_token_bumps_version_and_logs_event() {
     // 正文按字节保持：v2 body 原样落盘。
     let bytes = std::fs::read(store.abs(&out.rel)).unwrap();
     assert!(window_contains(&bytes, b"v2 body"));
+}
+
+#[test]
+fn update_rechecks_disk_features_after_acquiring_write_barrier() {
+    let (_t, store, types) = fresh_store();
+    let added = add_task(&store, &types, "feature-gate-update");
+    let before = std::fs::read(store.abs(&added.rel)).unwrap();
+    let config_path = store.abs("mem.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["record.future/v1"]);
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let error = ops::update(
+        &ctx(&store, &types),
+        &added.record.envelope.id,
+        &added.token,
+        task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "feature-gate-update", "done"),
+        None,
+    ).unwrap_err();
+
+    assert!(matches!(error, MemError::MissingFeatures(features) if features == vec!["record.future/v1"]));
+    assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), before);
 }
 
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -839,14 +847,7 @@ fn concurrent_payload_updates_cannot_create_a_dag_cycle() {
         std::thread::spawn(move || {
             let store = Store::open(&root, OpenMode::Auto).unwrap();
             let types = TypeSet::load_dir(&store.abs("types")).unwrap();
-            let ctx = WriteContext {
-                store: &store,
-                types: &types,
-                by: "race".into(),
-                committer: None,
-                session_id: None,
-                pause_hook: None,
-            };
+            let ctx = WriteContext::new(&store, &types, "race").with_committer(None).with_session_id(None);
             start.wait();
             ops::update(
                 &ctx,
@@ -1313,7 +1314,7 @@ fn r16_add_revalidates_reference_after_waiting_for_shared_barrier() {
     });
     rx.recv().unwrap();
     // 在创建方等待共享门闩期间完成删除；之后创建方必须在门闩内重新校验引用。
-    ops::delete_locked(&c, &target_id, &token, false).unwrap();
+    ops::delete_locked_test(&c, &target_id, &token, false).unwrap();
     drop(gate);
     let err = creator.join().unwrap().unwrap_err();
     assert!(
@@ -1588,14 +1589,7 @@ fn r15_get_rejects_paths_that_escape_store_root() {
 fn commits_include_record_and_events_same_batch() {
     let (_t, store, types) = fresh_store();
     let sink = RecordingSink::default();
-    let c = WriteContext {
-        store: &store,
-        types: &types,
-        by: "w".into(),
-        committer: Some(&sink),
-        session_id: None,
-        pause_hook: None,
-    };
+    let c = WriteContext::new(&store, &types, "w").with_committer(Some(&sink)).with_session_id(None);
     let out = ops::add(
         &c,
         AddArgs {
@@ -1620,14 +1614,7 @@ fn commit_failure_becomes_pending_not_rollback() {
         batches: Default::default(),
         fail: true,
     };
-    let c = WriteContext {
-        store: &store,
-        types: &types,
-        by: "w".into(),
-        committer: Some(&sink),
-        session_id: None,
-        pause_hook: None,
-    };
+    let c = WriteContext::new(&store, &types, "w").with_committer(Some(&sink)).with_session_id(None);
     let out = ops::add(
         &c,
         AddArgs {
