@@ -602,13 +602,13 @@ struct FileNotifyInformation {
 /// RDC 订阅（watch 目录整棵子树；线程持续读取，计数器聚合）。
 pub struct RdcWatcher {
     inner: Arc<RdcInner>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 struct RdcInner {
     undigested: AtomicU64,
     gap: AtomicBool,
     stop: AtomicBool,
-    dir_handle: std::sync::atomic::AtomicIsize,
     probe_event: std::sync::atomic::AtomicIsize,
     probe_waiters: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<Option<u64>>>>,
 }
@@ -645,7 +645,6 @@ impl RdcWatcher {
                 undigested: AtomicU64::new(0),
                 gap: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
-                dir_handle: std::sync::atomic::AtomicIsize::new(handle as isize),
                 probe_event: std::sync::atomic::AtomicIsize::new(probe_event as isize),
                 probe_waiters: std::sync::Mutex::new(Vec::new()),
             });
@@ -663,13 +662,18 @@ impl RdcWatcher {
                         &ignore,
                     );
                 });
-            if spawn.is_err() {
-                inner.dir_handle.store(0, Ordering::SeqCst);
-                CloseHandle(handle);
-                CloseHandle(probe_event);
-                return None;
-            }
-            Some(RdcWatcher { inner })
+            let worker = match spawn {
+                Ok(worker) => worker,
+                Err(_) => {
+                    CloseHandle(handle);
+                    CloseHandle(probe_event);
+                    return None;
+                }
+            };
+            Some(RdcWatcher {
+                inner,
+                worker: Some(worker),
+            })
         }
     }
 
@@ -702,18 +706,22 @@ impl RdcWatcher {
 impl Drop for RdcWatcher {
     fn drop(&mut self) {
         self.inner.stop.store(true, Ordering::SeqCst);
-        let handle = self.inner.dir_handle.load(Ordering::SeqCst);
-        if handle != 0 {
-            unsafe {
-                CancelIoEx(handle as HANDLE, std::ptr::null());
-            }
+        let probe_event = self.inner.probe_event.load(Ordering::SeqCst) as HANDLE;
+        unsafe {
+            SetEvent(probe_event);
         }
-        // 线程被唤醒后见到 stop 退出；句柄由线程关闭。
+        // 唤醒并 join worker：worker 负责取消、确认 I/O 完成，再释放 I/O 缓冲区。
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        unsafe {
+            CloseHandle(probe_event);
+        }
     }
 }
 
 fn reply_rdc_probes(inner: &RdcInner) {
-    let result = if inner.gap.load(Ordering::SeqCst) {
+    let result = if inner.gap.load(Ordering::SeqCst) || inner.stop.load(Ordering::SeqCst) {
         None
     } else {
         Some(inner.undigested.load(Ordering::SeqCst))
@@ -724,6 +732,15 @@ fn reply_rdc_probes(inner: &RdcInner) {
     };
     for waiter in std::mem::take(&mut *waiters) {
         let _ = waiter.send(result);
+    }
+}
+
+unsafe fn cancel_and_drain_rdc(handle: HANDLE, overlapped: &OVERLAPPED) {
+    // CancelIoEx 只发出取消请求；缓冲区与 OVERLAPPED 仍须存活到完成结果可取。
+    unsafe {
+        CancelIoEx(handle, overlapped);
+        let mut ignored = 0u32;
+        GetOverlappedResult(handle, overlapped, &mut ignored, 1);
     }
 }
 
@@ -777,9 +794,7 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
             // H8：订阅线程起不来 = 订阅死亡，永久不可证明。
             inner.gap.store(true, Ordering::SeqCst);
             reply_rdc_probes(inner);
-            inner.dir_handle.store(0, Ordering::SeqCst);
             CloseHandle(handle);
-            CloseHandle(probe_event);
             return;
         }
         let mut buf = vec![0u8; 64 * 1024];
@@ -787,10 +802,10 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
         let mut probe_after_rearm = false;
         'watch: loop {
             if inner.stop.load(Ordering::SeqCst) {
-                inner.dir_handle.store(0, Ordering::SeqCst);
+                inner.gap.store(true, Ordering::SeqCst);
+                reply_rdc_probes(inner);
                 CloseHandle(handle);
                 CloseHandle(event);
-                CloseHandle(probe_event);
                 return;
             }
             let mut ov: OVERLAPPED = std::mem::zeroed();
@@ -812,10 +827,8 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
             if ok == 0 {
                 inner.gap.store(true, Ordering::SeqCst);
                 reply_rdc_probes(inner);
-                inner.dir_handle.store(0, Ordering::SeqCst);
                 CloseHandle(handle);
                 CloseHandle(event);
-                CloseHandle(probe_event);
                 return;
             }
 
@@ -824,10 +837,8 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
                 if WaitForSingleObject(event, 0) == WAIT_OBJECT_0 {
                     if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
                         reply_rdc_probes(inner);
-                        inner.dir_handle.store(0, Ordering::SeqCst);
                         CloseHandle(handle);
                         CloseHandle(event);
-                        CloseHandle(probe_event);
                         return;
                     }
                     continue 'watch;
@@ -839,19 +850,18 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
             loop {
                 let wait = WaitForMultipleObjects(2, events.as_ptr(), 0, 60_000);
                 if inner.stop.load(Ordering::SeqCst) {
-                    inner.dir_handle.store(0, Ordering::SeqCst);
+                    inner.gap.store(true, Ordering::SeqCst);
+                    reply_rdc_probes(inner);
+                    cancel_and_drain_rdc(handle, &ov);
                     CloseHandle(handle);
                     CloseHandle(event);
-                    CloseHandle(probe_event);
                     return;
                 }
                 if wait == WAIT_OBJECT_0 {
                     if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
                         reply_rdc_probes(inner);
-                        inner.dir_handle.store(0, Ordering::SeqCst);
                         CloseHandle(handle);
                         CloseHandle(event);
-                        CloseHandle(probe_event);
                         return;
                     }
                     continue 'watch;
@@ -861,10 +871,8 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
                     if WaitForSingleObject(event, 0) == WAIT_OBJECT_0 {
                         if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
                             reply_rdc_probes(inner);
-                            inner.dir_handle.store(0, Ordering::SeqCst);
                             CloseHandle(handle);
                             CloseHandle(event);
-                            CloseHandle(probe_event);
                             return;
                         }
                         probe_after_rearm = true;
@@ -878,10 +886,9 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
                 }
                 inner.gap.store(true, Ordering::SeqCst);
                 reply_rdc_probes(inner);
-                inner.dir_handle.store(0, Ordering::SeqCst);
+                cancel_and_drain_rdc(handle, &ov);
                 CloseHandle(handle);
                 CloseHandle(event);
-                CloseHandle(probe_event);
                 return;
             }
         }
@@ -998,4 +1005,22 @@ mod rdc_tests {
     }
 
     #[test]
+    fn dropping_idle_watcher_cancels_and_joins_pending_directory_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("records");
+        std::fs::create_dir_all(&watch).unwrap();
+        let watcher = RdcWatcher::attach(&watch, &[".lock"]).expect("目录可订阅");
+        // 一次探测应答发生在 worker 已重新提交异步读取之后。
+        assert_eq!(watcher.observe_undigested(), Some(0));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(watcher);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Drop 应取消并等待 I/O 完成后 join worker");
+    }
+
 }

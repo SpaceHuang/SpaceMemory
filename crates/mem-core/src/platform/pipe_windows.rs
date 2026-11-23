@@ -89,7 +89,7 @@ impl PipeServer {
     /// `FILE_FLAG_FIRST_PIPE_INSTANCE` 要求同名管道无其他存活实例；旧句柄若在
     /// CreateNamedPipeW 之后才 Drop，重建必败 → 服务端永久失聪。
     /// 读/写全部走重叠 I/O（句柄带 FILE_FLAG_OVERLAPPED，空 OVERLAPPED 未定义）。
-    pub fn try_serve_one(&mut self, reply: &[u8]) -> bool {
+    pub fn try_serve_one(&mut self, make_reply: impl FnOnce() -> Vec<u8>) -> bool {
         unsafe {
             if self.pending_connect {
                 // 等待连接完成（短轮询）。
@@ -115,6 +115,8 @@ impl PipeServer {
             if GetOverlappedResult(self.handle, &ov, &mut got, 0) == 0 && last_err() != ERROR_BROKEN_PIPE {
                 return self.recreate();
             }
+            // 只在请求已读完后构造应答，避免使用接受连接前的旧新鲜度快照。
+            let reply = make_reply();
             // 写应答（重叠 I/O）。
             ResetEvent(self.event);
             let mut written = 0u32;

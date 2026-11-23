@@ -396,13 +396,13 @@ impl Listener {
     /// 非阻塞尝试接受一次连接：读请求 → 组装 Hello → 写回应答 → 断开。
     /// 返回是否发生了握手。
     ///
-    /// 握手只向 watcher 请求一次无写盘、非消费式的新鲜度观察；不在读请求中
-    /// 消化计数或运行索引维护。观察失败或订阅有变更时，客户端会退回真相层直读。
+    /// Windows 侧仅在读完请求后组装 Hello，避免采样早于客户端请求；握手不消化
+    /// 计数或运行索引维护。观察失败或订阅有变更时，客户端会退回真相层直读。
     fn try_accept_and_reply(&mut self, store: &Store, sub: Option<&Subscription>) -> bool {
-        let hello = hello_for_store(store, sub);
         #[cfg(windows)]
         {
-            self.handle.try_serve_one(&hello.as_bytes())
+            self.handle
+                .try_serve_one(|| hello_for_store(store, sub).as_bytes().to_vec())
         }
         #[cfg(target_os = "macos")]
         {
@@ -411,6 +411,7 @@ impl Listener {
                 Ok((mut s, _)) => {
                     let mut buf = [0u8; 64];
                     let _ = s.read(&mut buf);
+                    let hello = hello_for_store(store, sub);
                     let _ = s.write_all(&hello.as_bytes());
                     true
                 }
