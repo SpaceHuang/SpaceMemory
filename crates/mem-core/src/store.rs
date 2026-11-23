@@ -96,6 +96,37 @@ fn default_idle() -> u64 {
     86_400
 }
 
+type RawConfig = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+
+fn parse_raw_config(bytes: &[u8]) -> MemResult<RawConfig> {
+    serde_json::from_slice(bytes).map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })
+}
+
+fn raw_value<T: serde::Serialize>(value: &T) -> MemResult<Box<serde_json::value::RawValue>> {
+    let json = serde_json::to_string(value).map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })?;
+    serde_json::value::RawValue::from_string(json).map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })
+}
+
+fn raw_config_value(raw: &RawConfig) -> MemResult<serde_json::Value> {
+    serde_json::from_slice(&serde_json::to_vec(raw).map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })?)
+    .map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })
+}
+
 fn validate_feature_id(feature: &str) -> MemResult<()> {
     let invalid = || MemError::Corrupt {
         path: "mem.json".into(),
@@ -375,12 +406,8 @@ impl Store {
         let path = self.abs("mem.json");
         let bytes =
             std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
-        let mut raw: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
-                path: "mem.json".into(),
-                reason: e.to_string(),
-            })?;
-        let mut config = Self::parse_disk_config_value(raw.clone())?;
+        let mut raw = parse_raw_config(&bytes)?;
+        let mut config = Self::parse_disk_config_value(raw_config_value(&raw)?)?;
         if config.format_version != Self::CURRENT_FORMAT {
             return Err(MemError::RequiresMigration {
                 current: config.format_version,
@@ -392,13 +419,12 @@ impl Store {
         config.required_features.sort();
         config.required_features.dedup();
         if config.required_features.len() != before {
-            raw["required_features"] =
-                serde_json::to_value(&config.required_features).map_err(|e| MemError::Corrupt {
-                    path: "mem.json".into(),
-                    reason: e.to_string(),
-                })?;
-            // 只改目标字段；嵌套和顶层未知 JSON 键按原始 Value 保留。
-            config = Self::parse_disk_config_value(raw.clone())?;
+            raw.insert(
+                "required_features".into(),
+                raw_value(&config.required_features)?,
+            );
+            // 未修改字段一直以 RawValue 保存，避免把合法对象/任意精度数字先解析再写回。
+            config = Self::parse_disk_config_value(raw_config_value(&raw)?)?;
             let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
                 path: "mem.json".into(),
                 reason: e.to_string(),
@@ -466,21 +492,25 @@ impl Store {
         let config_path = root.join("mem.json");
         let bytes = std::fs::read(&config_path)
             .map_err(|e| MemError::io(config_path.display().to_string(), e))?;
-        let raw: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
+        let mut migration_raw = parse_raw_config(&bytes)?;
+        let migrated_features;
+        let version: Option<serde_json::Value> = migration_raw
+            .get("format_version")
+            .map(|raw| serde_json::from_str(raw.get()))
+            .transpose()
+            .map_err(|e| MemError::Corrupt {
                 path: "mem.json".into(),
                 reason: e.to_string(),
             })?;
-        let mut migration_raw = raw.clone();
-        let migrated_features;
-        let object = raw.as_object().ok_or_else(|| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: "顶层配置必须是对象".into(),
-        })?;
-        match object.get("format_version") {
+        match version.as_ref() {
             Some(serde_json::Value::Number(n)) if n.as_u64() == Some(1) => {
                 // 基线版本的配置不能携带受保护格式字段；非空清单不是安全可忽略信息。
-                if let Some(features) = object.get("required_features") {
+                if let Some(raw_features) = migration_raw.get("required_features") {
+                    let features: serde_json::Value = serde_json::from_str(raw_features.get())
+                        .map_err(|e| MemError::Corrupt {
+                            path: "mem.json".into(),
+                            reason: e.to_string(),
+                        })?;
                     if features.as_array().is_none_or(|items| !items.is_empty()) {
                         return Err(MemError::MigrationState(
                             "旧格式含不可安全迁移的必需特性".into(),
@@ -493,7 +523,7 @@ impl Store {
             Some(serde_json::Value::String(v)) if v == "spacememory/2" => {
                 // 已迁移判断必须与 Store::open 共用完整磁盘配置校验；只看
                 // required_features 会把 created=null 等正式打开拒绝的店报为成功。
-                Self::parse_disk_config_value(raw)?;
+                Self::parse_disk_config_value(raw_config_value(&migration_raw)?)?;
                 return Ok(MigrationReport {
                     status: MigrationStatus::AlreadyMigrated,
                     backup_identity: backup_identity.into(),
@@ -518,12 +548,8 @@ impl Store {
                 });
             }
         }
-        let object = migration_raw.as_object_mut().expect("已校验配置对象");
-        object.insert("format_version".into(), serde_json::json!("spacememory/2"));
-        object.insert(
-            "required_features".into(),
-            serde_json::json!(migrated_features),
-        );
+        migration_raw.insert("format_version".into(), raw_value(&"spacememory/2")?);
+        migration_raw.insert("required_features".into(), raw_value(&migrated_features)?);
         let updated = serde_json::to_vec_pretty(&migration_raw).map_err(|e| MemError::Corrupt {
             path: "mem.json".into(),
             reason: e.to_string(),
@@ -584,17 +610,9 @@ impl Store {
         let path = self.abs("mem.json");
         let bytes =
             std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
-        let mut raw: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
-                path: "mem.json".into(),
-                reason: e.to_string(),
-            })?;
-        let object = raw.as_object_mut().ok_or_else(|| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: "顶层配置必须是对象".into(),
-        })?;
-        object.insert(key.to_owned(), value);
-        let config = Self::parse_disk_config_value(raw.clone())?;
+        let mut raw = parse_raw_config(&bytes)?;
+        raw.insert(key.to_owned(), raw_value(&value)?);
+        let config = Self::parse_disk_config_value(raw_config_value(&raw)?)?;
         let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
             path: "mem.json".into(),
             reason: e.to_string(),
@@ -986,6 +1004,13 @@ fn validate_legacy_store(root: &Path) -> MemResult<Vec<String>> {
             scan.warnings.len()
         )));
     }
+    for rel in crate::event::enumerate_md(&store, "attic")? {
+        let path = store.abs(&rel);
+        let bytes =
+            std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
+        crate::record::Record::from_bytes(&bytes)
+            .map_err(|e| MemError::MigrationState(format!("attic 墓碑无法解析（{rel}）：{e}")))?;
+    }
     let log = crate::event::EventLog::new(&store).read_log()?;
     let mut seqs = std::collections::HashSet::new();
     let duplicate_seq = log.events.iter().any(|event| !seqs.insert(event.seq));
@@ -1018,10 +1043,8 @@ fn validate_legacy_store(root: &Path) -> MemResult<Vec<String>> {
     for candidate in candidates {
         let current_path =
             crate::event::current_path_for_id(&store, &candidate.lock_rel, &candidate.id)?;
-        let current = match current_path.as_deref() {
-            Some(path) => crate::event::current_state(&store, path)?,
-            None => crate::event::StateTriple::ABSENT,
-        };
+        let current =
+            crate::event::current_state_for_id(&store, &candidate.lock_rel, Some(&candidate.id))?;
         let last = log
             .events
             .iter()

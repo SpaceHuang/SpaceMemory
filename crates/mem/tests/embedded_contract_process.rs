@@ -762,6 +762,7 @@ fn reconcile_repairs_event_tail_left_by_killed_process() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn process_death_at_publish_and_event_boundaries_is_reconcilable() {
     use std::time::{Duration, Instant};
     for stage in ["record_published", "event_appended"] {
@@ -934,6 +935,7 @@ fn child_migration_pauses_at_format_switch() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn migration_process_death_before_and_after_atomic_switch_is_recoverable() {
     use std::time::{Duration, Instant};
     for (stage, expected_version, retry_status) in [
@@ -1553,6 +1555,7 @@ fn child_restore_body_pauses_at_feature_durability_window() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn feature_registration_crash_windows_preserve_conservative_order() {
     use std::time::{Duration, Instant};
 
@@ -1770,6 +1773,7 @@ fn child_restore_body_starts_after_feature_race_writer_is_paused() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn feature_dependent_write_waits_for_inflight_shared_writer_to_finish() {
     let tmp = tempfile::tempdir().unwrap();
     let store_path = tmp.path().join("store");

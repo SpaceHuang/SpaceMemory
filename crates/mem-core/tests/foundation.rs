@@ -121,6 +121,16 @@ fn sample_payload() -> serde_json::Value {
     })
 }
 
+fn append_raw_config_member(config: &str, key: &str, raw_value: &str) -> String {
+    let mut text = config.trim_end().strip_suffix('}').unwrap().to_owned();
+    text.push_str(",\n  ");
+    text.push_str(&serde_json::to_string(key).unwrap());
+    text.push_str(": ");
+    text.push_str(raw_value);
+    text.push_str("\n}\n");
+    text
+}
+
 // ---------- envelope：确定性序列化（D18/红线27） ----------
 
 #[test]
@@ -546,6 +556,7 @@ fn format_migration_is_atomic_idempotent_and_preserves_unknown_config() {
         record_before
     );
 
+    let migrated_bytes = std::fs::read(&config_path).unwrap();
     let second = Store::migrate_format_v1(&root, "backup-sha256:abc123").unwrap();
     assert_eq!(
         second.status,
@@ -553,7 +564,8 @@ fn format_migration_is_atomic_idempotent_and_preserves_unknown_config() {
     );
     assert_eq!(
         std::fs::read(&config_path).unwrap(),
-        serde_json::to_vec_pretty(&migrated).unwrap()
+        migrated_bytes,
+        "幂等迁移不得改写已迁移配置的字节"
     );
 }
 
@@ -664,8 +676,13 @@ fn migration_rejects_missing_history_record_duplicate_seq_and_corrupt_target_con
         } else {
             config["created"] = serde_json::Value::Null;
         }
-        config["format_version"] = serde_json::json!(1);
-        config.as_object_mut().unwrap().remove("required_features");
+        if case == "corrupt-target" {
+            config["format_version"] = serde_json::json!("spacememory/2");
+            config["required_features"] = serde_json::json!([]);
+        } else {
+            config["format_version"] = serde_json::json!(1);
+            config.as_object_mut().unwrap().remove("required_features");
+        }
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let before = std::fs::read(&config_path).unwrap();
         assert!(
@@ -677,17 +694,91 @@ fn migration_rejects_missing_history_record_duplicate_seq_and_corrupt_target_con
 }
 
 #[test]
+fn migration_accepts_consistent_deleted_tombstone_and_rejects_bad_unmapped_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("deleted-legacy");
+    Store::create(&root).unwrap();
+    let config_path = root.join("mem.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["format_version"] = serde_json::json!(1);
+    config.as_object_mut().unwrap().remove("required_features");
+
+    let record_rel = "records/task/legacy.md";
+    let attic_rel = "attic/task/legacy.md";
+    let bytes =
+        mem_core::record::serialize_new(&sample_envelope(), &sample_payload(), b"deleted body");
+    let attic_path = root.join(attic_rel);
+    std::fs::create_dir_all(attic_path.parent().unwrap()).unwrap();
+    std::fs::write(&attic_path, &bytes).unwrap();
+    let digest = mem_core::token::sha256_hex(&bytes);
+    let create = mem_core::event::Event {
+        seq: 1,
+        ts: "2026-11-22T00:00:00Z".into(),
+        id: UUID_A.into(),
+        path: record_rel.into(),
+        op: mem_core::event::Op::Create,
+        old_v: None,
+        new_v: Some(6),
+        old_digest: None,
+        new_digest: Some(digest.clone()),
+        by: "test".into(),
+        kind: mem_core::event::Kind::Op,
+    };
+    let delete = mem_core::event::Event {
+        seq: 2,
+        ts: "2026-11-22T00:00:01Z".into(),
+        id: UUID_A.into(),
+        path: attic_rel.into(),
+        op: mem_core::event::Op::Delete,
+        old_v: Some(6),
+        new_v: Some(6),
+        old_digest: Some(digest.clone()),
+        new_digest: Some(digest),
+        by: "test".into(),
+        kind: mem_core::event::Kind::Op,
+    };
+    let mut events = create.to_line();
+    events.extend_from_slice(&delete.to_line());
+    std::fs::write(root.join("events.jsonl"), events.clone()).unwrap();
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    Store::migrate_format_v1(&root, "backup").unwrap();
+    assert_eq!(std::fs::read(root.join("events.jsonl")).unwrap(), events);
+    assert_eq!(std::fs::read(&attic_path).unwrap(), bytes);
+
+    let bad_root = tmp.path().join("bad-tombstone-legacy");
+    Store::create(&bad_root).unwrap();
+    let bad_config_path = bad_root.join("mem.json");
+    let mut bad_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bad_config_path).unwrap()).unwrap();
+    bad_config["format_version"] = serde_json::json!(1);
+    bad_config
+        .as_object_mut()
+        .unwrap()
+        .remove("required_features");
+    std::fs::write(&bad_config_path, serde_json::to_vec(&bad_config).unwrap()).unwrap();
+    let bad = bad_root.join("attic/bad.md");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, b"not a valid record").unwrap();
+    let before = std::fs::read(&bad_config_path).unwrap();
+    assert!(Store::migrate_format_v1(&bad_root, "backup").is_err());
+    assert_eq!(std::fs::read(&bad_config_path).unwrap(), before);
+}
+
+#[test]
 fn config_mutations_preserve_arbitrary_precision_unknown_numbers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("precise");
     Store::create(&root).unwrap();
     let config_path = root.join("mem.json");
-    let mut raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-    raw["opaque"] =
-        serde_json::from_str(r#"{"id":100000000000000000001,"ratio":0.123456789012345678901}"#)
-            .unwrap();
-    std::fs::write(&config_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    let original = std::fs::read_to_string(&config_path).unwrap();
+    let original = append_raw_config_member(
+        &original,
+        "opaque",
+        r#"{"id":100000000000000000001,"ratio":0.123456789012345678901,"sentinel":{"$serde_json::private::Number":"123"}}"#,
+    );
+    std::fs::write(&config_path, original).unwrap();
     let store = Store::open(&root, OpenMode::Auto).unwrap();
     store
         .register_required_feature("event.restore_body/v1")
@@ -695,12 +786,22 @@ fn config_mutations_preserve_arbitrary_precision_unknown_numbers() {
     let text = std::fs::read_to_string(&config_path).unwrap();
     assert!(text.contains("100000000000000000001"), "{text}");
     assert!(text.contains("0.123456789012345678901"), "{text}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        parsed["opaque"]["sentinel"]["$serde_json::private::Number"],
+        "123"
+    );
     store
         .set_config_value("another", serde_json::json!(true))
         .unwrap();
     let text = std::fs::read_to_string(&config_path).unwrap();
     assert!(text.contains("100000000000000000001"), "{text}");
     assert!(text.contains("0.123456789012345678901"), "{text}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        parsed["opaque"]["sentinel"]["$serde_json::private::Number"],
+        "123"
+    );
 }
 
 #[test]
@@ -709,18 +810,25 @@ fn migration_preserves_arbitrary_precision_unknown_numbers() {
     let root = tmp.path().join("precise-legacy");
     Store::create(&root).unwrap();
     let path = root.join("mem.json");
-    let mut raw: serde_json::Value =
+    let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    raw["format_version"] = serde_json::json!(1);
-    raw.as_object_mut().unwrap().remove("required_features");
-    raw["opaque"] =
-        serde_json::from_str(r#"{"id":100000000000000000001,"ratio":0.123456789012345678901}"#)
-            .unwrap();
-    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    config["format_version"] = serde_json::json!(1);
+    config.as_object_mut().unwrap().remove("required_features");
+    let raw = append_raw_config_member(
+        &serde_json::to_string(&config).unwrap(),
+        "opaque",
+        r#"{"id":100000000000000000001,"ratio":0.123456789012345678901,"sentinel":{"$serde_json::private::Number":"123"}}"#,
+    );
+    std::fs::write(&path, raw).unwrap();
     Store::migrate_format_v1(&root, "backup").unwrap();
     let text = std::fs::read_to_string(path).unwrap();
     assert!(text.contains("100000000000000000001"), "{text}");
     assert!(text.contains("0.123456789012345678901"), "{text}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        parsed["opaque"]["sentinel"]["$serde_json::private::Number"],
+        "123"
+    );
 }
 
 #[test]

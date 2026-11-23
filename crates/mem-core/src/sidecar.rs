@@ -199,9 +199,9 @@ pub fn serve_with_maintainer(
                 report.rebuilds += 1;
             }
         }
-        // 握手只报告新鲜度状态。所有持久化收敛留给维护 tick，避免读前端握手
-        // 持有整店独占门闩或触发索引/检查点写入。
-        if listener.try_accept_and_reply(store, sub.as_mut()) {
+        // 握手只报告新鲜度状态。所有排空栅栏及持久化收敛留给维护 tick，避免
+        // 读前端握手写入 records/attic 或持有整店独占门闩。
+        if listener.try_accept_and_reply(store, sub.as_ref()) {
             report.handshakes += 1;
             last_activity = Instant::now();
         }
@@ -259,26 +259,6 @@ impl Subscription {
             }
             #[cfg(all(not(windows), not(test)))]
             _ => None,
-        }
-    }
-
-    /// M12：维护失败的信号回注（下次 fresh 查询返回 → tick 路径重试；
-    /// 持续失败则 tick 路径的 run_maintenance Err 终止 serve——语义汇合）。
-    fn reinject(&mut self, _n: u64) {
-        match self {
-            #[cfg(windows)]
-            Subscription::Rdc(ws) => {
-                // 回注到首个订阅者即可（合并计数语义）。
-                if let Some(w) = ws.first() {
-                    w.reinject(_n);
-                }
-            }
-            #[cfg(test)]
-            Subscription::Test(pending) => {
-                pending.fetch_add(_n, std::sync::atomic::Ordering::SeqCst);
-            }
-            #[cfg(all(not(windows), not(test)))]
-            _ => {}
         }
     }
 }
@@ -398,27 +378,15 @@ impl Listener {
     /// 非阻塞尝试接受一次连接：读请求 → 组装 Hello → 写回应答 → 断开。
     /// 返回是否发生了握手。
     ///
-    /// B4：`undigested` 在**应答时刻**新鲜取得——仍有未消化变更时先执行维护
-    ///（经收敛原语，r4 B3：维护后二次查询为 0 才算消化），Hello 恒反映咨询
-    /// 时刻的真实订阅状态；未收敛/gap → 如实报告未消化（读路径直读）。
-    fn try_accept_and_reply(&mut self, store: &Store, sub: Option<&mut Subscription>) -> bool {
+    /// 握手不执行订阅排空查询：Windows RDC 的严格查询需要向监控目录写哨兵。
+    /// 因而无论当前计数如何，握手都报告“无法证明”，客户端退回真相层直读。
+    fn try_accept_and_reply(&mut self, store: &Store, sub: Option<&Subscription>) -> bool {
         let backend = sub
             .as_ref()
             .map(|s| s.backend())
             .unwrap_or("none")
             .to_string();
-        let undigested = match sub {
-            // `fresh_undigested` 会消费通知；握手只读，因此把观察到的数量立即回注，
-            // 后续维护 tick 仍能据此收敛派生索引。
-            Some(s) => match s.fresh_undigested() {
-                Some(n) if n > 0 => {
-                    s.reinject(n);
-                    Some(n)
-                }
-                other => other,
-            },
-            None => None,
-        };
+        let undigested = None;
         let hello = Hello {
             version: SIDECAR_VERSION,
             backend: backend.clone(),
@@ -470,12 +438,12 @@ mod tests {
         let store = Store::open(&root, crate::store::OpenMode::Auto).unwrap();
         let mut listener = Listener::bind(&store).unwrap();
         let pending = std::sync::Arc::new(AtomicU64::new(3));
-        let mut sub = Subscription::Test(pending.clone());
+        let sub = Subscription::Test(pending.clone());
         let before_checkpoint = crate::freshness::load_checkpoint(&store);
         let before_index = std::fs::read(store.abs("index/index.sqlite")).ok();
 
         // 无客户端连接时仍会构造握手视图；路径没有 maintainer 参数，不能触发维护。
-        assert!(!listener.try_accept_and_reply(&store, Some(&mut sub)));
+        assert!(!listener.try_accept_and_reply(&store, Some(&sub)));
         assert_eq!(pending.load(Ordering::SeqCst), 3, "握手必须保留变更信号");
         assert_eq!(crate::freshness::load_checkpoint(&store), before_checkpoint);
         assert_eq!(
