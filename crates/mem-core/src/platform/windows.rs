@@ -20,7 +20,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    WaitForSingleObject,
+    SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// 锁哨兵字节偏移（1 MiB）：owner JSON 驻留 0 偏移、锁范围与之不重叠——
@@ -602,19 +602,15 @@ struct FileNotifyInformation {
 /// RDC 订阅（watch 目录整棵子树；线程持续读取，计数器聚合）。
 pub struct RdcWatcher {
     inner: Arc<RdcInner>,
-    watch_dir: std::path::PathBuf,
 }
 
 struct RdcInner {
     undigested: AtomicU64,
-    /// M12：握手路径维护失败时回注的未消化计数（下次 fresh 查询返回，保证
-    /// 变更信号不因一次维护失败而丢失——与 tick 路径"失败即终止 serve"汇合）。
-    pending: AtomicU64,
-    /// r12：watcher 线程已处理的**哨兵事件**计数——fresh 查询的排空栅栏。
-    sentinel_seen: AtomicU64,
     gap: AtomicBool,
     stop: AtomicBool,
     dir_handle: std::sync::atomic::AtomicIsize,
+    probe_event: std::sync::atomic::AtomicIsize,
+    probe_waiters: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<Option<u64>>>>,
 }
 
 impl RdcWatcher {
@@ -639,96 +635,162 @@ impl RdcWatcher {
             if handle.is_null() || handle == -1isize as HANDLE {
                 return None; // 目录打不开 → 订阅不可用（调用方降级）
             }
-            // r12：创建哨兵文件（fresh 查询的排空栅栏——见 fresh_undigested）。
-            let sentinel = watch_dir.join(".rdc-sentinel");
-            let _ = std::fs::write(&sentinel, b"");
+            // 同步 fresh 查询的线程间唤醒事件，不在受监控目录创建哨兵文件。
+            let probe_event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            if probe_event.is_null() {
+                CloseHandle(handle);
+                return None;
+            }
             let inner = Arc::new(RdcInner {
                 undigested: AtomicU64::new(0),
-                pending: AtomicU64::new(0),
-                sentinel_seen: AtomicU64::new(0),
                 gap: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
                 dir_handle: std::sync::atomic::AtomicIsize::new(handle as isize),
+                probe_event: std::sync::atomic::AtomicIsize::new(probe_event as isize),
+                probe_waiters: std::sync::Mutex::new(Vec::new()),
             });
             let thread_inner = Arc::clone(&inner);
             // HANDLE 非 Send：线程内经 isize 原样重建（同一句柄的所有权移交线程）。
             let handle_val = handle as isize;
-            std::thread::Builder::new()
+            let probe_event_val = probe_event as isize;
+            let spawn = std::thread::Builder::new()
                 .name("mem-rdc".into())
                 .spawn(move || {
-                    rdc_read_loop(handle_val as HANDLE, &thread_inner, &ignore);
-                })
-                .ok()?;
-            Some(RdcWatcher { inner, watch_dir: watch_dir.to_path_buf() })
+                    rdc_read_loop(
+                        handle_val as HANDLE,
+                        probe_event_val as HANDLE,
+                        &thread_inner,
+                        &ignore,
+                    );
+                });
+            if spawn.is_err() {
+                inner.dir_handle.store(0, Ordering::SeqCst);
+                CloseHandle(handle);
+                CloseHandle(probe_event);
+                return None;
+            }
+            Some(RdcWatcher { inner })
         }
     }
 
-    /// 新鲜查询 + 消化（B4/r12：**哨兵排空**——严格同代证明）。
-    ///
-    /// RDC 通知是异步投递的：仅读当前计数会漏掉"已写入、通知尚在投递中"的
-    /// 变更（r12 复现 B4 竞态）。本方法利用同目录句柄**通知按序投递**的保证：
-    /// 向哨兵文件（watch 目录内、不计入变更数）写入一次，内核完成 pending
-    /// 通知时该批**必然已包含此前全部写入**——watcher 线程处理完哨兵事件后，
-    /// 计数即为严格新鲜值。等待哨兵事件超时（watcher 卡顿）→ None（不可证明
-    /// → 直读，安全侧）。
+    /// 以 watcher 线程同步排空当前已完成的目录通知，再读取并消费变更数。
     pub fn fresh_undigested(&self) -> Option<u64> {
+        self.observe_undigested()?;
+        Some(self.inner.undigested.swap(0, Ordering::SeqCst))
+    }
+
+    /// 只观察当前通知状态，不消费计数；握手据此证明快路径或退回直读。
+    pub fn observe_undigested(&self) -> Option<u64> {
         if self.inner.gap.load(Ordering::SeqCst) {
             return None;
         }
-        // 排空栅栏：追加哨兵 → 等 watcher 处理完哨兵事件（至多 ~500ms）。
-        let target = self.inner.sentinel_seen.load(Ordering::SeqCst) + 1;
-        if let Some(sp) = self.sentinel_dir() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&sp) {
-                use std::io::Write;
-                let _ = f.write_all(b" ");
-                let _ = f.flush();
-            }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.inner.probe_waiters.lock().ok()?.push(tx);
+        let probe_event = self.inner.probe_event.load(Ordering::SeqCst) as HANDLE;
+        if unsafe { SetEvent(probe_event) } == 0 {
+            self.inner.gap.store(true, Ordering::SeqCst);
+            reply_rdc_probes(&self.inner);
+            return None;
         }
-        for _ in 0..50 {
-            if self.inner.sentinel_seen.load(Ordering::SeqCst) >= target {
-                return Some(self.inner.pending.swap(0, Ordering::SeqCst)
-                    + self.inner.undigested.swap(0, Ordering::SeqCst));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        None // 哨兵事件未按时处理：不可证明（直读，安全侧）
+        rx.recv_timeout(std::time::Duration::from_millis(750))
+            .ok()
+            .flatten()
     }
 
-    fn sentinel_dir(&self) -> Option<std::path::PathBuf> {
-        // 哨兵文件路径 = watch 目录 + .rdc-sentinel（由 attach 记录）。
-        Some(self.watch_dir.join(".rdc-sentinel"))
-    }
-
-    /// M12：维护失败的信号回注（下次 fresh 查询返回 → 重试维护）。
-    pub fn reinject(&self, n: u64) {
-        self.inner.pending.fetch_add(n, Ordering::SeqCst);
-    }
 }
 
 impl Drop for RdcWatcher {
     fn drop(&mut self) {
         self.inner.stop.store(true, Ordering::SeqCst);
-        unsafe {
-            CancelIoEx(self.inner.dir_handle.load(Ordering::SeqCst) as HANDLE, std::ptr::null());
+        let handle = self.inner.dir_handle.load(Ordering::SeqCst);
+        if handle != 0 {
+            unsafe {
+                CancelIoEx(handle as HANDLE, std::ptr::null());
+            }
         }
         // 线程被唤醒后见到 stop 退出；句柄由线程关闭。
     }
 }
 
-fn rdc_read_loop(handle: HANDLE, inner: &Arc<RdcInner>, ignore: &[String]) {
+fn reply_rdc_probes(inner: &RdcInner) {
+    let result = if inner.gap.load(Ordering::SeqCst) {
+        None
+    } else {
+        Some(inner.undigested.load(Ordering::SeqCst))
+    };
+    let Ok(mut waiters) = inner.probe_waiters.lock() else {
+        inner.gap.store(true, Ordering::SeqCst);
+        return;
+    };
+    for waiter in std::mem::take(&mut *waiters) {
+        let _ = waiter.send(result);
+    }
+}
+
+unsafe fn process_rdc_completion(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    buf: &[u8],
+    inner: &RdcInner,
+    ignore: &[String],
+) -> bool {
+    let mut got = 0u32;
+    if unsafe { GetOverlappedResult(handle, overlapped, &mut got, 0) } == 0 || got == 0 {
+        // 任何结果读取失败都是事件流缺口（含通知缓冲溢出）——永久不可证明。
+        inner.gap.store(true, Ordering::SeqCst);
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset + 12 <= got as usize {
+        let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+        let action = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+        let name_len =
+            u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        if action == 0 {
+            break;
+        }
+        let name_start = offset + 12;
+        if name_start + name_len <= got as usize {
+            let name_w: Vec<u16> = buf[name_start..name_start + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let name = String::from_utf16_lossy(&name_w);
+            // 只忽略机制锁文件末段后缀；文件名包含旧哨兵标记的真实记录照常计数。
+            let last = name.rsplit(['\\', '/']).next().unwrap_or(&name);
+            if !ignore.iter().any(|p| last.ends_with(p.as_str())) {
+                inner.undigested.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
+    }
+    true
+}
+
+fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ignore: &[String]) {
     unsafe {
         let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
         if event.is_null() {
-            // H8：订阅线程起不来 = 订阅死亡——必须置 gap（永久不可证明），
-            // 否则 watcher 存活而事件流中断 = 僵尸订阅，证明名存实亡。
+            // H8：订阅线程起不来 = 订阅死亡，永久不可证明。
             inner.gap.store(true, Ordering::SeqCst);
+            reply_rdc_probes(inner);
+            inner.dir_handle.store(0, Ordering::SeqCst);
+            CloseHandle(handle);
+            CloseHandle(probe_event);
             return;
         }
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
+        let events = [event, probe_event];
+        let mut probe_after_rearm = false;
+        'watch: loop {
             if inner.stop.load(Ordering::SeqCst) {
+                inner.dir_handle.store(0, Ordering::SeqCst);
                 CloseHandle(handle);
                 CloseHandle(event);
+                CloseHandle(probe_event);
                 return;
             }
             let mut ov: OVERLAPPED = std::mem::zeroed();
@@ -738,83 +800,89 @@ fn rdc_read_loop(handle: HANDLE, inner: &Arc<RdcInner>, ignore: &[String]) {
                 handle,
                 buf.as_mut_ptr() as *mut core::ffi::c_void,
                 buf.len() as u32,
-                1, // watch subtree（records/ 深层键路径）
+                1,
                 FILE_NOTIFY_CHANGE_FILE_NAME
                     | FILE_NOTIFY_CHANGE_SIZE
                     | FILE_NOTIFY_CHANGE_LAST_WRITE
                     | FILE_NOTIFY_CHANGE_ATTRIBUTES,
                 &mut bytes_ret,
                 &mut ov,
-                None, // LPOVERLAPPED_COMPLETION_ROUTINE（重叠 I/O 用事件通知）
+                None,
             );
             if ok == 0 {
-                // H8：ReadDirectoryChangesW 调用失败 = 事件流中断 → 置 gap（同上）。
                 inner.gap.store(true, Ordering::SeqCst);
+                reply_rdc_probes(inner);
+                inner.dir_handle.store(0, Ordering::SeqCst);
                 CloseHandle(handle);
                 CloseHandle(event);
+                CloseHandle(probe_event);
                 return;
             }
-            // 阻塞等待本批通知（stop 由 CancelIoEx 解阻塞）。
-            let w = WaitForSingleObject(event, 60_000);
-            if inner.stop.load(Ordering::SeqCst) {
-                CloseHandle(handle);
-                CloseHandle(event);
-                return;
-            }
-            if w != WAIT_OBJECT_0 {
-                continue; // 超时：回环查 stop
-            }
-            let mut got = 0u32;
-            if GetOverlappedResult(handle, &ov, &mut got, 0) == 0 {
-                // 任何结果读取失败都是事件流缺口（含 ENUM_DIR 溢出）——永久不可证明。
-                inner.gap.store(true, Ordering::SeqCst);
-                CloseHandle(handle);
-                CloseHandle(event);
-                return;
-            }
-            if got == 0 {
-                continue;
-            }
-            // 解析 FILE_NOTIFY_INFORMATION 链。
-            let mut offset = 0usize;
-            while offset + 12 <= got as usize {
-                let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
-                let action = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
-                let name_len =
-                    u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
-                if action == 0 {
-                    break;
-                }
-                let name_start = offset + 12;
-                if name_start + name_len <= got as usize {
-                    let name_w: Vec<u16> = buf[name_start..name_start + name_len]
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                        .collect();
-                    let name = String::from_utf16_lossy(&name_w);
-                    // r12：哨兵文件事件 = 排空栅栏信号（不计入变更数）。
-                    // r13 B9-4：**精确匹配**监视根下的哨兵路径本身（Windows 路径
-                    // 大小写不敏感）——此前子串匹配把文件名含 ".rdc-sentinel" 的
-                    // 记录文件事件一并吞掉（外部重命名/放置是设计承认的覆盖域），
-                    // 该记录的新鲜性证明永久失效（红线21）。
-                    if name.eq_ignore_ascii_case(".rdc-sentinel") {
-                        inner.sentinel_seen.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        // r13 B9-4 同族收紧：ignore 只按**末段组件的后缀**匹配
-                        //（机制锁文件形如 <name>.lock）——".tmp-" 中缀不再过滤：
-                        // 机制 tmp 文件伴随真实写入出现，多计数只多触发一轮维护
-                        //（安全侧）；误吞记录事件则不可接受。
-                        let last = name.rsplit(['\\', '/']).next().unwrap_or(&name);
-                        let ignored = ignore.iter().any(|p| last.ends_with(p.as_str()));
-                        if !ignored {
-                            inner.undigested.fetch_add(1, Ordering::SeqCst);
-                        }
+
+            // 处理刚完成的批次后先重新武装 RDC，再回复排空请求。
+            if probe_after_rearm {
+                if WaitForSingleObject(event, 0) == WAIT_OBJECT_0 {
+                    if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
+                        reply_rdc_probes(inner);
+                        inner.dir_handle.store(0, Ordering::SeqCst);
+                        CloseHandle(handle);
+                        CloseHandle(event);
+                        CloseHandle(probe_event);
+                        return;
                     }
+                    continue 'watch;
                 }
-                if next == 0 {
-                    break;
+                reply_rdc_probes(inner);
+                probe_after_rearm = false;
+            }
+
+            loop {
+                let wait = WaitForMultipleObjects(2, events.as_ptr(), 0, 60_000);
+                if inner.stop.load(Ordering::SeqCst) {
+                    inner.dir_handle.store(0, Ordering::SeqCst);
+                    CloseHandle(handle);
+                    CloseHandle(event);
+                    CloseHandle(probe_event);
+                    return;
                 }
-                offset += next as usize;
+                if wait == WAIT_OBJECT_0 {
+                    if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
+                        reply_rdc_probes(inner);
+                        inner.dir_handle.store(0, Ordering::SeqCst);
+                        CloseHandle(handle);
+                        CloseHandle(event);
+                        CloseHandle(probe_event);
+                        return;
+                    }
+                    continue 'watch;
+                }
+                if wait == WAIT_OBJECT_0 + 1 {
+                    // 若目录 I/O 与探测同时完成，优先解析变更并重新武装，再答复。
+                    if WaitForSingleObject(event, 0) == WAIT_OBJECT_0 {
+                        if !process_rdc_completion(handle, &ov, &buf, inner, ignore) {
+                            reply_rdc_probes(inner);
+                            inner.dir_handle.store(0, Ordering::SeqCst);
+                            CloseHandle(handle);
+                            CloseHandle(event);
+                            CloseHandle(probe_event);
+                            return;
+                        }
+                        probe_after_rearm = true;
+                        continue 'watch;
+                    }
+                    reply_rdc_probes(inner);
+                    continue;
+                }
+                if wait == windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+                    continue;
+                }
+                inner.gap.store(true, Ordering::SeqCst);
+                reply_rdc_probes(inner);
+                inner.dir_handle.store(0, Ordering::SeqCst);
+                CloseHandle(handle);
+                CloseHandle(event);
+                CloseHandle(probe_event);
+                return;
             }
         }
     }
@@ -833,11 +901,12 @@ mod rdc_tests {
     use super::*;
 
     #[test]
-    fn rdc_counts_changes_and_drains_but_ignores_mechanism_files() {
+    fn rdc_counts_changes_and_drains_without_creating_sentinel_files() {
         let tmp = tempfile::tempdir().unwrap();
         let watch = tmp.path().join("records");
         std::fs::create_dir_all(&watch).unwrap();
         let w = RdcWatcher::attach(&watch, &[".lock"]).expect("目录可订阅");
+        assert!(!watch.join(".rdc-sentinel").exists(), "订阅不得落哨兵文件");
         // 机制锁文件：不计（*.lock 末段后缀，r13 B9-4 收紧后的规则）。
         std::fs::write(watch.join("x.md.lock"), b"{}").unwrap();
         // tmp 命名文件伴随真实写入出现：按安全侧计数（多计数只多一轮维护，
@@ -879,10 +948,8 @@ mod rdc_tests {
     }
 
     #[test]
-    fn rdc_sentinel_substring_record_events_counted() {
-        // r13 B9-4：文件名含哨兵子串的记录文件（外部放置覆盖域）——事件必须计数，
-        // 不得被当作哨兵信号吞掉（吞掉 → fresh Some(0) → 新鲜性误判 indexed →
-        // 新内容漏命中，红线21）。
+    fn rdc_legacy_sentinel_named_record_events_counted() {
+        // 兼容可能遗留的哨兵子串文件名：它仍是普通记录事件，必须计数。
         let tmp = tempfile::tempdir().unwrap();
         let watch = tmp.path().join("records");
         std::fs::create_dir_all(watch.join("topic")).unwrap();
@@ -907,27 +974,28 @@ mod rdc_tests {
     }
 
     #[test]
-    fn rdc_reinject_preserves_signal_for_retry() {
-        // M12：握手路径维护失败 → reinject 回注——信号不因一次维护失败而丢失。
+    fn rdc_observation_reports_same_size_write_without_persisting_a_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let watch = tmp.path().join("records");
         std::fs::create_dir_all(&watch).unwrap();
-        let w = RdcWatcher::attach(&watch, &[".lock"]).unwrap();
-        w.reinject(7);
-        // 回注的计数在下一次 fresh 查询返回（+ 期间的真实事件）。
-        let mut saw = false;
-        for _ in 0..50 {
-            if let Some(n) = w.fresh_undigested() {
-                if n >= 7 {
-                    saw = true;
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(saw, "回注信号必须在下一次新鲜查询返回");
-        // 消化后归零（回注不泄漏为永久计数）。
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let w = RdcWatcher::attach(&watch, &[".lock"]).expect("目录可订阅");
+        let record = watch.join("same-size.md");
+        std::fs::write(&record, b"old").unwrap();
+
+        let observed = w.observe_undigested();
+
+        assert!(observed.is_some_and(|n| n > 0), "观测必须先排空已完成的 RDC 通知");
+        assert!(!watch.join(".rdc-sentinel").exists(), "观测不得写入标记文件");
+        assert!(
+            w.observe_undigested().is_some_and(|n| n > 0),
+            "只读观测不得消费变更信号"
+        );
+        assert!(
+            w.fresh_undigested().is_some_and(|n| n > 0),
+            "维护 tick 可消费变更"
+        );
         assert_eq!(w.fresh_undigested(), Some(0));
     }
+
+    #[test]
 }

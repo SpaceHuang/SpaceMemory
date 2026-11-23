@@ -261,6 +261,24 @@ impl Subscription {
             _ => None,
         }
     }
+
+    /// 只观察已由订阅线程排空的计数，不消费信号、不执行索引维护。
+    fn observe_undigested(&self) -> Option<u64> {
+        match self {
+            #[cfg(windows)]
+            Subscription::Rdc(ws) => {
+                let mut total = 0u64;
+                for watcher in ws {
+                    total = total.saturating_add(watcher.observe_undigested()?);
+                }
+                Some(total)
+            }
+            #[cfg(test)]
+            Subscription::Test(pending) => Some(pending.load(std::sync::atomic::Ordering::SeqCst)),
+            #[cfg(all(not(windows), not(test)))]
+            _ => None,
+        }
+    }
 }
 
 fn attach_subscription(store: &Store) -> Option<Subscription> {
@@ -378,24 +396,10 @@ impl Listener {
     /// 非阻塞尝试接受一次连接：读请求 → 组装 Hello → 写回应答 → 断开。
     /// 返回是否发生了握手。
     ///
-    /// 握手不执行订阅排空查询：Windows RDC 的严格查询需要向监控目录写哨兵。
-    /// 因而无论当前计数如何，握手都报告“无法证明”，客户端退回真相层直读。
+    /// 握手只向 watcher 请求一次无写盘、非消费式的新鲜度观察；不在读请求中
+    /// 消化计数或运行索引维护。观察失败或订阅有变更时，客户端会退回真相层直读。
     fn try_accept_and_reply(&mut self, store: &Store, sub: Option<&Subscription>) -> bool {
-        let backend = sub
-            .as_ref()
-            .map(|s| s.backend())
-            .unwrap_or("none")
-            .to_string();
-        let undigested = None;
-        let hello = Hello {
-            version: SIDECAR_VERSION,
-            backend: backend.clone(),
-            undigested,
-            max_seq: crate::event::EventLog::new(store).max_seq().unwrap_or(0),
-            last_rebuild: crate::freshness::load_checkpoint(store)
-                .map(|c| c.ts)
-                .unwrap_or_default(),
-        };
+        let hello = hello_for_store(store, sub);
         #[cfg(windows)]
         {
             self.handle.try_serve_one(&hello.as_bytes())
@@ -416,6 +420,24 @@ impl Listener {
     }
 }
 
+fn hello_for_store(store: &Store, sub: Option<&Subscription>) -> Hello {
+    let backend = sub
+        .as_ref()
+        .map(|s| s.backend())
+        .unwrap_or("none")
+        .to_string();
+    let undigested = sub.and_then(Subscription::observe_undigested);
+    Hello {
+        version: SIDECAR_VERSION,
+        backend: backend.clone(),
+        undigested,
+        max_seq: crate::event::EventLog::new(store).max_seq().unwrap_or(0),
+        last_rebuild: crate::freshness::load_checkpoint(store)
+            .map(|c| c.ts)
+            .unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_reports_pending_change_without_running_maintenance_or_consuming_it() {
+    fn handshake_reports_drained_subscription_state_without_maintenance_or_consumption() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("store");
@@ -443,6 +465,8 @@ mod tests {
         let before_index = std::fs::read(store.abs("index/index.sqlite")).ok();
 
         // 无客户端连接时仍会构造握手视图；路径没有 maintainer 参数，不能触发维护。
+        let hello = hello_for_store(&store, Some(&sub));
+        assert_eq!(hello.undigested, Some(3));
         assert!(!listener.try_accept_and_reply(&store, Some(&sub)));
         assert_eq!(pending.load(Ordering::SeqCst), 3, "握手必须保留变更信号");
         assert_eq!(crate::freshness::load_checkpoint(&store), before_checkpoint);
@@ -450,6 +474,10 @@ mod tests {
             std::fs::read(store.abs("index/index.sqlite")).ok(),
             before_index
         );
+        pending.store(0, Ordering::SeqCst);
+        assert_eq!(hello_for_store(&store, Some(&sub)).undigested, Some(0));
+        assert!(!store.abs("records/.rdc-sentinel").exists());
+        assert!(!store.abs("attic/.rdc-sentinel").exists());
     }
 
     #[test]
