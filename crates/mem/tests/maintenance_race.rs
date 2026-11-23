@@ -120,11 +120,20 @@ fn maintenance_race_second_write_not_confirmed_early() {
     let target_rel = mem_core::ops::get(&store, &target_id).unwrap().rel;
     let target_path = dir.join(&target_rel);
     assert!(target_path.is_file());
+    let original_record = mem_core::ops::get(&store, &target_id).unwrap();
+    let original_token = original_record.token;
+    let original_bytes = std::fs::read(&target_path).unwrap();
+    let original_digest = mem_core::token::sha256_hex(&original_bytes);
+    let original_size = original_bytes.len();
+    let original_mtime = file_mtime_nanos(&target_path).expect("Windows 文件修改时间可读取");
 
     // 注入式维护器：第一次 rebuild 后，在竞态窗口注入同尺寸 + mtime 还原的修改。
     let injected = Arc::new(AtomicBool::new(false));
     let injected2 = injected.clone();
     let target2 = target_path.clone();
+    let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (complete_tx, complete_rx) = std::sync::mpsc::channel();
     let maintainer = move |
         store: &mem_core::store::Store,
         permit: &mem_core::store::IndexMaintenancePermit<'_>,
@@ -134,18 +143,34 @@ fn maintenance_race_second_write_not_confirmed_early() {
         let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
         let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
         idx.set_body_texts_under_maintenance(permit)?;
-        if !injected2.swap(true, Ordering::SeqCst) {
+        if !injected2.load(Ordering::SeqCst) {
+            // 测试先停在索引扫描后，让父线程确认完成信号尚未发出，再允许改写。
+            pause_tx.send(()).expect("通知父测试进入可控暂停点");
+            resume_rx.recv().expect("等待父测试放行改写");
+
             // 竞态窗口注入：索引扫描完成之后。同尺寸（r→R 等长，摘要必变）
             // + mtime 纳秒还原（绕过 stat 条件）。
-            let mtime_before = file_mtime_nanos(&target2);
             let mut edited = std::fs::read(&target2).unwrap();
-            if let Some(pos) = find_ascii(&edited, b"race-target") {
-                edited[pos] = b'R';
-            }
+            let pos = find_ascii(&edited, b"race-target").expect("原始记录含竞态标记");
+            edited[pos] = b'R';
             std::fs::write(&target2, &edited).unwrap();
-            if let Some(ns) = mtime_before {
-                set_mtime_nanos(&target2, ns);
-            }
+            set_mtime_nanos(&target2, original_mtime);
+
+            // 发完成信号前先验证等长改写、正文摘要改变、路径与 mtime 恢复。
+            let edited_bytes = std::fs::read(&target2).unwrap();
+            assert_eq!(edited_bytes.len(), original_size, "竞态改写必须保持文件尺寸");
+            assert_ne!(
+                mem_core::token::sha256_hex(&edited_bytes),
+                original_digest,
+                "等长改写必须改变完整文件摘要"
+            );
+            assert_eq!(
+                file_mtime_nanos(&target2),
+                Some(original_mtime),
+                "改写后必须恢复原修改时间"
+            );
+            injected2.store(true, Ordering::SeqCst);
+            complete_tx.send(()).expect("通知父测试改写和复核均已完成");
         }
         Ok(mem_core::freshness::MaintainOutcome {
             index_epoch: idx.epoch().unwrap_or(0),
@@ -163,21 +188,56 @@ fn maintenance_race_second_write_not_confirmed_early() {
         )
     });
 
-    // 等注入完成。RDC 不发布检查点，因此不以 index_epoch 判断查询是否可用。
-    let mut write_injected = false;
+    // 可控暂停：确认改写未完成时父测试不会误将旧令牌当作竞态结果。
+    pause_rx
+        .recv_timeout(std::time::Duration::from_secs(8))
+        .expect("维护器应在首次索引扫描后到达暂停点");
+    assert!(
+        matches!(
+            complete_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "改写尚未放行时不能发出完成信号"
+    );
+    resume_tx.send(()).expect("放行测试改写");
+    complete_rx
+        .recv_timeout(std::time::Duration::from_secs(8))
+        .expect("改写、摘要变化与 mtime 恢复复核后才发完成信号");
+    assert!(injected.load(Ordering::SeqCst), "完成信号必须对应已完成的改写");
+
+    let rewritten_record = mem_core::ops::get(&store, &target_id).unwrap();
+    let rewritten_token = rewritten_record.token;
+    assert_ne!(
+        rewritten_token.digest,
+        original_token.digest,
+        "改写后的记录令牌摘要必须不同于改写前"
+    );
+    assert_eq!(rewritten_record.rel, target_rel, "改写不能改变记录路径");
+    assert_eq!(
+        std::fs::metadata(&target_path).unwrap().len(),
+        original_size as u64,
+        "改写必须保持文件尺寸"
+    );
+    assert_eq!(
+        file_mtime_nanos(&target_path),
+        Some(original_mtime),
+        "改写必须恢复原修改时间"
+    );
+
+    // 等 sidecar 握手应答，确保首个 CLI 查询确实发生在 sidecar 已就绪之后。
+    let mut sidecar_hello = None;
     for _ in 0..80 {
-        if injected.load(Ordering::SeqCst) {
-            write_injected = true;
+        if let Some(hello) = mem_core::sidecar::probe(&store) {
+            sidecar_hello = Some(hello);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert!(
-        write_injected,
-        "测试维护器应完成索引扫描后的竞态写入"
-    );
+    let hello = sidecar_hello.expect("改写完成后 sidecar 应开始响应握手");
+    assert_eq!(hello.backend, "rdc", "Windows 竞态测试应覆盖 RDC 后端");
+    assert_eq!(hello.undigested, None, "RDC 不得冒充查询时点新鲜证明");
 
-    // 断言：生产 Windows 查询明确直读，返回的令牌与磁盘当前令牌一致。
+    // 断言：生产 Windows 查询明确直读，并返回查询前已核验的改写后令牌。
     let out = mem()
         .args(["--store", &s, "find", "race-target", "--limit", "5"])
         .output()
@@ -188,9 +248,9 @@ fn maintenance_race_second_write_not_confirmed_early() {
         "RDC 不提供查询新鲜度证明，生产查询必须直读：{v}"
     );
     let hit_token = v["hits"][0]["token"].as_str().unwrap_or("").to_string();
-    let fresh = mem_core::ops::get(&store, &target_id).unwrap();
     assert_eq!(
-        hit_token, fresh.token.to_string(),
+        hit_token,
+        rewritten_token.to_string(),
         "r4 B3：维护期间二次写入后，第一次读取不得返回旧索引内容\n{v}"
     );
     let _ = h;
