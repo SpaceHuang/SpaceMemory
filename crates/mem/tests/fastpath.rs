@@ -1,17 +1,16 @@
-//! §8-6/B3+re-r2 B4/H7 快路径端到端测试：sidecar 物化索引 → CLI 读路径在证明成立时
-//! 走索引；同尺寸修改后的第一次读取返回新值（红线21 立法场景）。
+//! §8-6/B3+re-r2 B4/H7 端到端测试：sidecar 物化索引；只有新鲜度可证明时查询
+//! 才走索引，否则直读；同尺寸修改后的第一次读取返回新值（红线21）。
 //!
 //! 覆盖：
 //! 1. `mem serve` 注入的物化器真的产出 index.sqlite（含 FTS）；
-//! 2. `mem list/find` 在证明成立（Hello.undigested==0 ∧ stat 一致）时输出
-//!    `read_mode: indexed`，且结果与直读等价；
-//! 3. sidecar 不在 → 同命令输出 `direct` 并标注 reason（降速不是故障）；
+//! 2. `mem list/find` 对无法提供查询时点证明的订阅（Windows RDC）保持 direct；
+//! 3. sidecar 不在或订阅不能证明查询时点 → 同命令输出 `direct` 并标注 reason；
 //! 4. 空闲自退后快路径回落 direct；
 //! 5. **B4**：等长（同尺寸）payload 修改落在轮询间隙内时，第一次读取不得用旧索引
 //!    应答（旧令牌）——订阅源（USN/RDC）的新鲜查询必须先消化或转直读。
 //!
-//! 容忍卷能力差异（开放问题39）：USN（提权）与 RDC（非提权）都算订阅在场；
-//! 都不可用 → 永久 direct（断言按 backend 分支，而非硬编码快路径成立）。
+//! 容忍卷能力差异（开放问题39）：RDC 仅触发后台维护；当前无法证明查询时点的
+//! Windows 握手不得授权 indexed。其他不具备证明来源的平台同样走 direct。
 
 use assert_cmd::Command;
 use serde_json::{json, Value};
@@ -23,6 +22,15 @@ fn mem() -> Command {
 fn j(out: &std::process::Output) -> Value {
     serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("输出不是 JSON：{e}\n{}", String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(windows)]
+fn mode_of(v: &Value) -> &'static str {
+    if v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false) {
+        "indexed"
+    } else {
+        "direct"
+    }
 }
 
 fn items_json_len(v: &Value) -> usize {
@@ -77,7 +85,7 @@ fn fastpath_end_to_end_via_production_binary() {
     let index_ready = wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100);
     assert!(index_ready, "sidecar 必须物化 index.sqlite（B3：mem-index 有生产引用）");
 
-    // 2) 读路径：backend 分支断言（USN/RDC 都算订阅在场——H7 非提权形态）。
+    // 2) 读路径：仅查询时点有证明时允许 indexed；RDC 只负责后台维护。
     let store = mem_core::store::Store::open(&dir, mem_core::store::OpenMode::Auto).unwrap();
     // 探测轮询：sidecar 命名管道就绪需要时间——索引文件已物化 ≠ 握手可答
     //（基线曾出现"首次 probe=None 而紧随的 CLI list 已 indexed"的时序抖动）。
@@ -118,8 +126,8 @@ fn fastpath_end_to_end_via_production_binary() {
             "快路径响应带完整令牌"
         );
         // FTS（仅快路径可用）真实可用。查询用任务唯一值（slug "t1"）。
-        // r11：单次 find 可能撞上 WAL 提交锁 → 直读兜底（正确行为）——轮询至
-        // 出现 indexed；若窗口内始终 direct 且 reason 是查询失败，才是缺陷。
+        // r11：单次 find 可能撞上 WAL 提交锁 → 直读兜底（正确行为）；仅在有
+        // 查询时点证明的订阅上轮询 indexed。
         let mut fv = None;
         for _ in 0..10 {
             let o = mem().args(["--store", &s, "find", "t1"]).output().unwrap();
@@ -134,12 +142,15 @@ fn fastpath_end_to_end_via_production_binary() {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        let fv = fv.expect("稳定窗口内必须出现 indexed 快路径（r11 轮询语义）");
+        let fv = fv.expect("有查询时点证明的订阅应进入 indexed 快路径");
         assert!(fv["read_mode"]["indexed"].is_object(), "find 走 FTS 快路径：{fv}");
         assert_eq!(fv["hits"].as_array().unwrap().len(), 1, "{fv}");
     } else {
-        // 不可订阅卷：永久直读（正确性不受影响），但必须如实标注。
+        // 有订阅但不能证明查询时点（目前 Windows RDC）的卷也必须直读。
         assert!(v["read_mode"]["direct"].is_object(), "read_mode={:?}", v["read_mode"]);
+        if backend_probe.backend == "rdc" {
+            assert_eq!(backend_probe.undigested, None, "RDC 不能作为查询新鲜度证明");
+        }
     }
 
     // 3) sidecar 不在的店：direct 标注。
@@ -682,12 +693,11 @@ fn r8_regressions_hit_surface_budget_floor_trace_budget() {
 
 // ==================== r11 残留回归 ====================
 
-/// r11：大写 ID 前缀跨模式等价（direct 前 id 无大小写不敏感 → 0 / indexed 1）、
-/// 跨模式分页续读（direct 第 1 页 ↔ indexed 第 2 页，无重复无遗漏）、
-/// brief 16 字节语义（r9 skip 语义）复核。
+/// Windows RDC 仅用于后台维护、不能证明查询新鲜度时，sidecar 在场仍须直读正确；
+/// 覆盖大写 ID 前缀、分页续读和 brief 16 字节语义。
 #[test]
-#[cfg(windows)] // 真正进入 indexed 需要本仓库已实现的 RDC 变更订阅
-fn r11_regressions_case_insensitive_prefix_cross_mode_paging() {
+#[cfg(windows)]
+fn r11_windows_async_rdc_keeps_queries_direct_and_correct() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
@@ -715,36 +725,25 @@ fn r11_regressions_case_insensitive_prefix_cross_mode_paging() {
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // ---- r11-a：大写 ID 前缀——direct/indexed 均命中且为同一条（r7 复现 direct 0 / indexed 1）----
+    // ---- r11-a：大写 ID 前缀在 sidecar 在场时直读仍必须命中 ----
     let prefix_upper = t1[..8].to_uppercase();
     let od = mem().args(["--store", &s, "find", &prefix_upper]).output().unwrap();
     let vd = j(&od);
     let ids_d: Vec<&str> = vd["hits"].as_array().unwrap()
         .iter().map(|h| h["id"].as_str().unwrap()).collect();
     assert!(ids_d.contains(&t1.as_str()), "大写 ID 前缀 direct 必须命中 t1（r11）：{vd}");
-    // indexed 轮询——两模式命中集必须一致。
-    let mut ids_i: Vec<String> = Vec::new();
-    for _ in 0..10 {
-        let o = mem().args(["--store", &s, "find", &prefix_upper]).output().unwrap();
-        let v = j(&o);
-        if v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false) {
-            ids_i = v["hits"].as_array().unwrap()
-                .iter().map(|h| h["id"].as_str().unwrap().to_string()).collect();
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    assert_eq!(ids_i.len(), ids_d.len(), "两模式命中集必须一致（r11）：{vd}");
+    assert_eq!(mode_of(&vd), "direct", "异步 RDC 不得授权索引快路径：{vd}");
+    assert_eq!(ids_d, vec![t1.as_str()], "大写 ID 前缀 direct 命中 t1");
 
-    // ---- r11-b：跨模式分页——direct 第 1 页 ↔ indexed 第 2 页，无重复无遗漏 ----
+    // ---- r11-b：分页续读无重复、无遗漏 ----
     let hits_page1 = mem().args(["--store", &s, "find", "alpha", "--limit", "1", "--offset", "0"]).output().unwrap();
     let v_p1 = j(&hits_page1);
-    assert!(v_p1["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false)
-        || v_p1["read_mode"].as_object().map(|m| m.contains_key("direct")).unwrap_or(false));
+    assert_eq!(mode_of(&v_p1), "direct", "sidecar 在场也走 direct：{v_p1}");
     let id_p1 = v_p1["hits"][0]["id"].as_str().unwrap().to_string();
     let off1 = v_p1["resume"]["offset"].as_u64().unwrap() as usize;
     let hits_p2 = mem().args(["--store", &s, "find", "alpha", "--limit", "1", "--offset", &off1.to_string()]).output().unwrap();
     let v_p2 = j(&hits_p2);
+    assert_eq!(mode_of(&v_p2), "direct", "续读保持 direct：{v_p2}");
     let id_p2 = v_p2["hits"][0]["id"].as_str().unwrap().to_string();
     assert_ne!(id_p1, id_p2, "两页不得重复（r7/r11）：{v_p1} / {v_p2}");
     let known: std::collections::HashSet<_> = [t1.clone(), t2.clone()].into_iter().collect();

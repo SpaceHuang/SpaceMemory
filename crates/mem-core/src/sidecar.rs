@@ -265,14 +265,10 @@ impl Subscription {
     /// 只观察已由订阅线程排空的计数，不消费信号、不执行索引维护。
     fn observe_undigested(&self) -> Option<u64> {
         match self {
+            // RDC 的通知异步交付，读请求中的一次观察不能证明此前写入都已入队；
+            // 它只用于后台触发维护，不授权查询使用索引。
             #[cfg(windows)]
-            Subscription::Rdc(ws) => {
-                let mut total = 0u64;
-                for watcher in ws {
-                    total = total.saturating_add(watcher.observe_undigested()?);
-                }
-                Some(total)
-            }
+            Subscription::Rdc(_) => None,
             #[cfg(test)]
             Subscription::Test(pending) => Some(pending.load(std::sync::atomic::Ordering::SeqCst)),
             #[cfg(all(not(windows), not(test)))]
@@ -479,6 +475,26 @@ mod tests {
         assert_eq!(hello_for_store(&store, Some(&sub)).undigested, Some(0));
         assert!(!store.abs("records/.rdc-sentinel").exists());
         assert!(!store.abs("attic/.rdc-sentinel").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rdc_handshake_does_not_claim_a_query_time_freshness_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::create(tmp.path().join("store")).unwrap();
+        let watchers = ["records", "attic"]
+            .into_iter()
+            .map(|path| {
+                crate::platform::RdcWatcher::attach(&store.abs(path), &[".lock"])
+                    .expect("目录可订阅")
+            })
+            .collect();
+        let sub = Subscription::Rdc(watchers);
+
+        let hello = hello_for_store(&store, Some(&sub));
+
+        assert_eq!(hello.backend, "rdc");
+        assert_eq!(hello.undigested, None, "异步通知不能证明查询时点新鲜");
     }
 
     #[test]

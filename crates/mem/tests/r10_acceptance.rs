@@ -1,13 +1,12 @@
 #![cfg(windows)]
 
-//! R10 验收面补齐（TDD-5；keyword-search-design.md §4.1/§4.2——既有测试未覆盖的
-//! indexed 侧与四面对账）：
-//! - 验收 2/5/6/7：indexed 与 direct 逐 ID 等价（多词项与四类记录、与位排除）、
+//! R10 验收面补齐（TDD-5；keyword-search-design.md §4.1/§4.2——查询行为与前端对账）：
+//! - 验收 2/5/6/7：多词项与四类记录、与位排除，CLI/MCP 逐 ID 等价；
 //!   两次检索序列一致、续读穷尽无重复；
 //! - 验收 8/9：跨类型异形同名过滤（CLI `status=1` ≡ MCP `{"status":"1"}` 合并
-//!   命中集）、`--type` 收窄子集、direct/indexed × CLI/MCP 四面对账；
-//! - 验收 10：indexed 告警承接（bad_records 表——坏文件先于物化存在）、坏文件
-//!   变化后告警新鲜（stat 失配 → direct）、fix 后恢复参与、201 条告警双路径
+//!   命中集）、`--type` 收窄子集；Windows RDC 不能证明查询时点时，sidecar 在场也直读；
+//! - 验收 10：坏记录告警（坏文件先于物化存在）、坏文件
+//!   变化后告警新鲜、fix 后恢复参与、201 条告警在 sidecar 前后
 //!   同序同子集 + warnings_truncated。
 
 use assert_cmd::Command;
@@ -149,7 +148,7 @@ fn mcp_find(s: &str, query: &str, filter: Option<(&str, &str)>) -> Value {
 
 #[test]
 #[cfg(windows)]
-fn r10_executor_and_frontend_equivalence_matrix() {
+fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = init(&dir);
@@ -171,8 +170,8 @@ fn r10_executor_and_frontend_equivalence_matrix() {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "alpha", None)) == "indexed", 50, 100),
-        "sidecar 收敛后 find 应走 indexed");
+    assert!(wait_until(|| mode_of(&cli_find(&s, "alpha", None)) == "direct", 50, 100),
+        "RDC 没有查询时点屏障时，sidecar 在场仍须直读");
 
     // 查询矩阵：多词与 / 与位排除 / 单词项 / 异形过滤合并。
     // （"x" 词项命中三条 status="x" 的记录，被 status=1 过滤全部排除——词项 ∧
@@ -186,7 +185,7 @@ fn r10_executor_and_frontend_equivalence_matrix() {
         ("x", Some(("status", "1")), vec![]),                           // 异形同名：全集空（doc "x" 不等值）
     ];
 
-    // 空查询/纯否定双前端拒收（验收 7 后半；indexed 阶段同样拒收）。
+    // 空查询/纯否定双前端拒收（验收 7 后半）。
     let out_e = mem().args(["--store", &s, "find", ""]).output().unwrap();
     assert!(!out_e.status.success());
     let e: Value = serde_json::from_slice(&out_e.stderr).unwrap();
@@ -197,26 +196,27 @@ fn r10_executor_and_frontend_equivalence_matrix() {
     ]);
     assert_eq!(resps[1]["error"]["data"]["kind"], json!("query_invalid"));
 
-    // 四面对账（验收 2/5/8/9）：indexed × {CLI, MCP} 与 direct × {CLI, MCP} 逐 ID 相等。
+    // sidecar 在场时的安全回退：CLI 与 MCP 都必须走 direct 并返回相同集合。
     for (query, filter, expected) in &cases {
         if query.is_empty() {
             continue;
         }
         let cli_v = cli_find(&s, query, *filter);
-        assert_eq!(mode_of(&cli_v), "indexed", "indexed 阶段：{cli_v}");
+        assert_eq!(mode_of(&cli_v), "direct", "RDC 只能触发维护，不能证明查询新鲜度：{cli_v}");
         let mcp_v = mcp_find(&s, query, *filter);
-        assert_eq!(hit_ids(&cli_v, "hits"), hit_ids(&mcp_v, "hits"), "CLI≡MCP（indexed）：{query:?} {filter:?}");
+        assert_eq!(mode_of(&mcp_v), "direct", "MCP 必须同样退回直读：{mcp_v}");
+        assert_eq!(hit_ids(&cli_v, "hits"), hit_ids(&mcp_v, "hits"), "CLI≡MCP（sidecar 在场）：{query:?} {filter:?}");
         let mut got = hit_ids(&cli_v, "hits");
         got.sort();
         assert_eq!(got, *expected, "命中集：{query:?} {filter:?}\n{cli_v}");
     }
 
-    // 验收 5：同库同查询连查两次序列相等（indexed；direct 阶段在 sidecar 退出后同型断言）。
+    // 验收 5：同库同查询连查两次序列相等（sidecar 在场但走 direct）。
     let seq1 = cli_find(&s, "alpha", None);
     let seq2 = cli_find(&s, "alpha", None);
     assert_eq!(seq1["hits"], seq2["hits"], "两次检索序列一致（验收 5）");
 
-    // 验收 2/4：续读穷尽无重复（indexed）。
+    // 验收 2/4：续读穷尽无重复。
     let mut seen = Vec::new();
     let mut off = 0usize;
     for _ in 0..10 {
@@ -248,7 +248,7 @@ fn r10_executor_and_frontend_equivalence_matrix() {
         assert_eq!(hit_ids(&cli_v, "hits"), hit_ids(&mcp_v, "hits"), "CLI≡MCP（direct）：{query:?} {filter:?}");
         let mut got = hit_ids(&cli_v, "hits");
         got.sort();
-        assert_eq!(got, *expected, "direct 命中集与 indexed 一致：{query:?} {filter:?}");
+        assert_eq!(got, *expected, "direct 命中集正确：{query:?} {filter:?}");
     }
     let seq1d = cli_find(&s, "alpha", None);
     let seq2d = cli_find(&s, "alpha", None);
@@ -268,11 +268,11 @@ fn r10_executor_and_frontend_equivalence_matrix() {
     assert_eq!(got, all, "合并命中集（A∪B）：{v}");
 }
 
-// ---------- 验收 10：indexed 告警承接与新鲜性 ----------
+// ---------- 验收 10：直读告警与新鲜性 ----------
 
 #[test]
 #[cfg(windows)]
-fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
+fn r10_acceptance_10_async_rdc_direct_warnings_stay_fresh_and_fixable() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = init(&dir);
@@ -293,14 +293,13 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "indexed", 50, 100));
+    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "direct", 50, 100));
 
-    // indexed 响应携带坏记录告警（来自 bad_records 表——同扫描同事务），
-    // 坏记录不在命中清单、不崩。
+    // RDC 不能为查询提供同步证明；direct 仍应如实报告坏记录。
     let v = cli_find(&s, "target", None);
-    assert_eq!(mode_of(&v), "indexed", "{v}");
+    assert_eq!(mode_of(&v), "direct", "{v}");
     let warnings = v["warnings"].as_array().unwrap();
-    assert_eq!(warnings.len(), 1, "indexed 告警承接（决策⑦）：{v}");
+    assert_eq!(warnings.len(), 1, "直读告警承接：{v}");
     let w = warnings[0].as_str().unwrap();
     assert!(w.starts_with("跳过坏条目 records/doc/target-broken.md："), "三要素·位置+原因：{w}");
     assert!(w.contains("修复入口：mem fix records/doc/target-broken.md"), "三要素·修复入口：{w}");
@@ -329,9 +328,9 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
     };
     let bytes = mem_core::record::serialize_new(&env, &json!({"title":"target-fixed"}), b"");
     std::fs::write(dir.join("records/doc/target-broken.md"), bytes).unwrap();
-    // 变更触发维护收敛 → 回到 indexed → 命中含修复记录、告警清空。
-    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "indexed", 80, 150),
-        "fix 后维护收敛回 indexed");
+    // 变更可触发后台维护；查询仍走 direct 并命中修复后的记录。
+    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "direct", 80, 150),
+        "sidecar 在场时仍安全回退直读");
     let v3 = cli_find(&s, "target", None);
     assert_eq!(v3["warnings"].as_array().unwrap().len(), 0, "修复后告警清空：{v3}");
     let ids = hit_ids(&v3, "hits");
@@ -339,7 +338,7 @@ fn r10_acceptance_10_indexed_bad_record_warnings_fresh_and_fixable() {
     serve.kill().ok();
 }
 
-/// 201 条坏记录：告警上限 = list_limit_max（200），rel 升序截断，双路径同序同子集。
+/// 201 条坏记录：告警上限 = list_limit_max（200），rel 升序截断，sidecar 前后同序同子集。
 #[test]
 #[cfg(windows)]
 fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
@@ -357,7 +356,7 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
         std::fs::write(dir.join(format!("records/doc/bad-{i:03}.md")), b"corrupt").unwrap();
     }
 
-    // direct（无 sidecar）：200 条 rel 升序 + truncated。
+    // 无 sidecar：200 条 rel 升序 + truncated。
     let v = cli_find(&s, "cap", None);
     let warnings = v["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 200, "上限 200（list_limit_max）：{}", warnings.len());
@@ -366,23 +365,22 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     assert!(warnings[199].as_str().unwrap().contains("records/doc/bad-199.md"));
     assert!(v["note"].as_str().unwrap_or("").contains("mem verify"), "note 注明完整清单经 verify：{v}");
 
-    // indexed（sidecar 物化）：同序同子集（排序先行保证，§2.5）。
+    // sidecar 在场时仍走 direct：告警顺序与截断子集保持一致。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "cap", None)) == "indexed", 60, 100));
+    assert!(wait_until(|| mode_of(&cli_find(&s, "cap", None)) == "direct", 60, 100));
     let v2 = cli_find(&s, "cap", None);
-    assert_eq!(mode_of(&v2), "indexed", "{v2}");
+    assert_eq!(mode_of(&v2), "direct", "{v2}");
     assert_eq!(v2["warnings"], v["warnings"], "双路径同序同子集（201 条截断口径）");
     assert_eq!(v2["warnings_truncated"], json!(true));
     serve.kill().ok();
 }
 
-/// B2 生产路径复验（实施评审第三轮修复要求 3）：新文件落盘后的第一次读取不得
-/// 因"扫描后新增文件被检查点提前确认"而漏——direct（stat 失配）必命中；收敛回
-/// indexed 后（下一次物化将其入扫描）仍命中且 read_mode=indexed。CLI 与 MCP 各验。
+/// Windows RDC 生产路径复验：新文件落盘后的第一次读取必须命中；由于 RDC 的异步
+/// 通知不能证明查询时点，sidecar 在场及后台维护期间也必须走 direct。CLI 与 MCP 各验。
 #[test]
 #[cfg(windows)]
 fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
@@ -398,7 +396,7 @@ fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "anchor", None)) == "indexed", 50, 100));
+    assert!(wait_until(|| mode_of(&cli_find(&s, "anchor", None)) == "direct", 50, 100));
 
     // 扫描后新落盘的合法记录 X（外部放置形态）。
     let env = mem_core::envelope::Envelope {
@@ -422,13 +420,12 @@ fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
     assert!(hit_ids(&mcp_v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
         "MCP 新文件第一次读取不得漏（B2）：{mcp_v1}");
 
-    // 维护收敛回 indexed 后仍命中，且此轮响应真走 indexed（显式模式断言）。
-    assert!(wait_until(|| mode_of(&cli_find(&s, "b2newx", None)) == "indexed", 80, 150),
-        "维护收敛回 indexed");
+    // 维护期间和收敛后均直读，不能因异步通知延迟而漏掉新文件。
+    assert!(wait_until(|| mode_of(&cli_find(&s, "b2newx", None)) == "direct", 80, 150),
+        "sidecar 在场时仍安全回退直读");
     let v2 = cli_find(&s, "b2newx", None);
-    assert!(v2["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false),
-        "收敛后应真走 indexed：{v2}");
+    assert_eq!(mode_of(&v2), "direct", "收敛后仍保持直读：{v2}");
     assert!(hit_ids(&v2, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
-        "indexed 命中含新文件：{v2}");
+        "direct 命中含新文件：{v2}");
     serve.kill().ok();
 }
