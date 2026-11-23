@@ -148,7 +148,7 @@ pub fn serve_with_maintainer(
         }
     };
     let mut report = ServeReport::default();
-    // 订阅先建立（收敛原语的新鲜查询需要它），再初始物化。
+    // 订阅先建立，以便捕捉变化并触发后台维护，再初始物化。
     let mut sub = attach_subscription(store);
     let mut last_stat = crate::freshness::stat_snapshot(store);
     if run_maintenance(store, maintainer, sub.as_mut())?.0 {
@@ -173,7 +173,8 @@ pub fn serve_with_maintainer(
         if stop() {
             return Ok(report);
         }
-        // 维护 tick：订阅**新鲜查询**（RDC 计数消化）+ 收敛发布（r4 B3）。
+        // 维护 tick：消费订阅计数作为重建触发；只有具备查询时点证明的来源才能发布检查点。
+        // RDC 能触发重建，但不能证明查询新鲜度，也不能用来发布检查点。
         let now_stat = crate::freshness::stat_snapshot(store);
         let dirty = now_stat != last_stat;
         match sub.as_mut().map(|s| s.fresh_undigested()) {
@@ -239,6 +240,18 @@ impl Subscription {
         }
     }
 
+    /// 是否能签发覆盖查询时点的证明。RDC 只负责触发后台维护，不能用来发布检查点。
+    fn can_prove_query_freshness(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Subscription::Rdc(_) => false,
+            #[cfg(test)]
+            Subscription::Test(_) => true,
+            #[cfg(all(not(windows), not(test)))]
+            _ => false,
+        }
+    }
+
     /// 新鲜查询 + 消化（每次调用都直连 OS 源；None = 覆盖缺口/订阅失效）。
     fn fresh_undigested(&mut self) -> Option<u64> {
         match self {
@@ -262,7 +275,7 @@ impl Subscription {
         }
     }
 
-    /// 只观察已由订阅线程排空的计数，不消费信号、不执行索引维护。
+    /// 查询握手可报告的新鲜度证明；RDC 不具备查询时点证明，故返回 None。
     fn observe_undigested(&self) -> Option<u64> {
         match self {
             // RDC 的通知异步交付，读请求中的一次观察不能证明此前写入都已入队；
@@ -339,7 +352,9 @@ fn run_maintenance_under_permit(
     maintainer: Option<Maintainer<'_>>,
     sub: Option<&mut Subscription>,
 ) -> MemResult<(bool, bool)> {
-    let has_sub = sub.is_some();
+    let has_freshness_proof = sub
+        .as_ref()
+        .is_some_and(|subscription| subscription.can_prove_query_freshness());
     let noop: Maintainer<'static> = &|_s, _permit| {
         Ok(crate::freshness::MaintainOutcome {
             index_epoch: 0,
@@ -350,8 +365,11 @@ fn run_maintenance_under_permit(
     let mut sub_cell = sub;
     let mut fresh_fn =
         move || -> Option<u64> { sub_cell.as_mut().and_then(|s| s.fresh_undigested()) };
-    let fresh: Option<&mut dyn FnMut() -> Option<u64>> =
-        if has_sub { Some(&mut fresh_fn) } else { None };
+    let fresh: Option<&mut dyn FnMut() -> Option<u64>> = if has_freshness_proof {
+        Some(&mut fresh_fn)
+    } else {
+        None
+    };
     let published = crate::freshness::publish_converged_checkpoint(
         store,
         &permit,
@@ -495,6 +513,10 @@ mod tests {
 
         assert_eq!(hello.backend, "rdc");
         assert_eq!(hello.undigested, None, "异步通知不能证明查询时点新鲜");
+        assert!(
+            !sub.can_prove_query_freshness(),
+            "RDC 不能授权发布新鲜度检查点"
+        );
     }
 
     #[test]
