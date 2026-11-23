@@ -47,21 +47,26 @@ struct Holder {
 fn barrier_rw(root: &std::path::Path) -> &'static RwLock<()> {
     let m = BARRIERS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = m.lock().unwrap();
-    map.entry(root.to_path_buf()).or_insert_with(|| Box::leak(Box::new(RwLock::new(()))))
+    map.entry(root.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(RwLock::new(()))))
 }
 
 fn record_state(key: &std::path::Path) -> &'static (Mutex<Holder>, Condvar) {
     let m = RECORD_STATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = m.lock().unwrap();
     map.entry(key.to_path_buf()).or_insert_with(|| {
-        Box::leak(Box::new((Mutex::new(Holder { held: false }), Condvar::new())))
+        Box::leak(Box::new((
+            Mutex::new(Holder { held: false }),
+            Condvar::new(),
+        )))
     })
 }
 
 fn seq_mutex(root: &std::path::Path) -> &'static Mutex<()> {
     let m = SEQUENCES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = m.lock().unwrap();
-    map.entry(root.to_path_buf()).or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+    map.entry(root.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
 }
 
 // ---------- 门闩 ----------
@@ -69,6 +74,7 @@ fn seq_mutex(root: &std::path::Path) -> &'static Mutex<()> {
 /// 门闩 guard：`file` 先于 `inproc` 声明 → Drop 先释平台锁再放进程内槽位。
 pub struct BarrierGuard {
     file: Option<platform::LockFile>,
+    root: PathBuf,
     /// 进程内槽位（Drop 顺序：先平台锁后进程内槽位——字段序即释放序）。
     #[allow(dead_code)] // 仅为持有 RAII guard；读取无意义
     inproc: BarrierSlot,
@@ -80,6 +86,16 @@ pub struct ExclusiveBarrierGuard {
     _guard: BarrierGuard,
 }
 
+impl ExclusiveBarrierGuard {
+    pub(crate) fn check_store(&self, store: &Store) -> MemResult<()> {
+        if self._guard.root == store.physical_root()? {
+            Ok(())
+        } else {
+            Err(MemError::BadArgument("独占门闩属于另一记忆库".into()))
+        }
+    }
+}
+
 /// 只用于需要按运行时条件选择共享/独占门闩、但不消费其能力的持锁点。
 pub enum AnyBarrierGuard {
     Shared(BarrierGuard),
@@ -88,7 +104,8 @@ pub enum AnyBarrierGuard {
 
 impl std::fmt::Debug for ExclusiveBarrierGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExclusiveBarrierGuard").finish_non_exhaustive()
+        f.debug_struct("ExclusiveBarrierGuard")
+            .finish_non_exhaustive()
     }
 }
 
@@ -118,49 +135,85 @@ fn barrier_path(store: &Store) -> PathBuf {
 /// 普通写路径：共享门闩，贯穿写路径全程（红线20）。
 pub fn barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
+    let root = store.physical_root()?;
     let inproc = BarrierSlot::Read(barrier_rw(store.root()).read().unwrap());
     let file = platform::LockFile::acquire_shared(&barrier_path(store))
         .map_err(|e| MemError::io(barrier_path(store).display().to_string(), e))?;
-    Ok(BarrierGuard { file: Some(file), inproc })
+    Ok(BarrierGuard {
+        file: Some(file),
+        root,
+        inproc,
+    })
 }
 
 /// 维护/merge/apply：独占门闩（阻塞直到所有共享持有者退出）。
 pub fn barrier_exclusive(store: &Store) -> MemResult<ExclusiveBarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
+    let root = store.physical_root()?;
     let inproc = BarrierSlot::Write(barrier_rw(store.root()).write().unwrap());
     let file = platform::LockFile::acquire_exclusive(&barrier_path(store))
         .map_err(|e| MemError::io(barrier_path(store).display().to_string(), e))?;
-    Ok(ExclusiveBarrierGuard { _guard: BarrierGuard { file: Some(file), inproc } })
+    Ok(ExclusiveBarrierGuard {
+        _guard: BarrierGuard {
+            file: Some(file),
+            root,
+            inproc,
+        },
+    })
 }
 
 /// 非阻塞尝试（测试与快失败场景）。
 pub fn try_barrier_exclusive(store: &Store) -> MemResult<ExclusiveBarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
+    let root = store.physical_root()?;
     let inproc = match barrier_rw(store.root()).try_write() {
         Ok(g) => BarrierSlot::Write(g),
         Err(_) => {
-            return Err(MemError::LockTimeout { lock_path: "barrier.lock".into(), holder: None })
+            return Err(MemError::LockTimeout {
+                lock_path: "barrier.lock".into(),
+                holder: None,
+            });
         }
     };
     let file = platform::LockFile::try_acquire_exclusive(&barrier_path(store)).map_err(|_| {
-        MemError::LockTimeout { lock_path: "barrier.lock".into(), holder: None }
+        MemError::LockTimeout {
+            lock_path: "barrier.lock".into(),
+            holder: None,
+        }
     })?;
-    Ok(ExclusiveBarrierGuard { _guard: BarrierGuard { file: Some(file), inproc } })
+    Ok(ExclusiveBarrierGuard {
+        _guard: BarrierGuard {
+            file: Some(file),
+            root,
+            inproc,
+        },
+    })
 }
 
 /// 非阻塞尝试共享。
 pub fn try_barrier_shared(store: &Store) -> MemResult<BarrierGuard> {
     crate::paths::validate_store_root_lock(store, "barrier.lock")?;
+    let root = store.physical_root()?;
     let inproc = match barrier_rw(store.root()).try_read() {
         Ok(g) => BarrierSlot::Read(g),
         Err(_) => {
-            return Err(MemError::LockTimeout { lock_path: "barrier.lock".into(), holder: None })
+            return Err(MemError::LockTimeout {
+                lock_path: "barrier.lock".into(),
+                holder: None,
+            });
         }
     };
     let file = platform::LockFile::try_acquire_shared(&barrier_path(store)).map_err(|_| {
-        MemError::LockTimeout { lock_path: "barrier.lock".into(), holder: None }
+        MemError::LockTimeout {
+            lock_path: "barrier.lock".into(),
+            holder: None,
+        }
     })?;
-    Ok(BarrierGuard { file: Some(file), inproc })
+    Ok(BarrierGuard {
+        file: Some(file),
+        root,
+        inproc,
+    })
 }
 
 // ---------- 记录锁 ----------
@@ -215,7 +268,9 @@ fn write_owner(path: &std::path::Path, via: &platform::LockFile) -> MemResult<()
 }
 
 fn ensure_parent(path: &std::path::Path) -> MemResult<()> {
-    let Some(dir) = path.parent() else { return Ok(()) };
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
     if dir.is_dir() {
         return Ok(());
     }
@@ -238,10 +293,7 @@ pub fn record_lock(
     let deadline = Instant::now() + timeout;
     crate::paths::validate_store_relative_path(store, record_rel)?;
     let path = lock_file_path(store, record_rel);
-    crate::paths::validate_store_relative_path(
-        store,
-        &crate::paths::record_lock_rel(record_rel),
-    )?;
+    crate::paths::validate_store_relative_path(store, &crate::paths::record_lock_rel(record_rel))?;
     ensure_parent(&path)?;
     let state = record_state(&path);
     loop {
@@ -254,7 +306,9 @@ pub fn record_lock(
                 if now >= deadline {
                     return Err(timeout_err(&path));
                 }
-                let (g, _t) = cv.wait_timeout(h, deadline.saturating_duration_since(now)).unwrap();
+                let (g, _t) = cv
+                    .wait_timeout(h, deadline.saturating_duration_since(now))
+                    .unwrap();
                 h = g;
             }
             h.held = true;
@@ -263,7 +317,10 @@ pub fn record_lock(
         match platform::LockFile::try_acquire_exclusive(&path) {
             Ok(f) => {
                 write_owner(&path, &f)?;
-                return Ok(RecordLockGuard { file: Some(f), state });
+                return Ok(RecordLockGuard {
+                    file: Some(f),
+                    state,
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 3) 别人持有：读 owner 判陈旧。
@@ -318,20 +375,17 @@ pub fn record_lock(
 
 fn timeout_err(path: &std::path::Path) -> MemError {
     let holder = read_owner(path).map(|o| format!("pid={} host={}", o.pid, o.host));
-    MemError::LockTimeout { lock_path: path.display().to_string(), holder }
+    MemError::LockTimeout {
+        lock_path: path.display().to_string(),
+        holder,
+    }
 }
 
 /// 非阻塞尝试：`Ok(None)` = 忙。
-pub fn try_record_lock(
-    store: &Store,
-    record_rel: &str,
-) -> MemResult<Option<RecordLockGuard>> {
+pub fn try_record_lock(store: &Store, record_rel: &str) -> MemResult<Option<RecordLockGuard>> {
     crate::paths::validate_store_relative_path(store, record_rel)?;
     let path = lock_file_path(store, record_rel);
-    crate::paths::validate_store_relative_path(
-        store,
-        &crate::paths::record_lock_rel(record_rel),
-    )?;
+    crate::paths::validate_store_relative_path(store, &crate::paths::record_lock_rel(record_rel))?;
     ensure_parent(&path)?;
     let state = record_state(&path);
     {
@@ -345,7 +399,10 @@ pub fn try_record_lock(
     match platform::LockFile::try_acquire_exclusive(&path) {
         Ok(f) => {
             write_owner(&path, &f)?;
-            Ok(Some(RecordLockGuard { file: Some(f), state }))
+            Ok(Some(RecordLockGuard {
+                file: Some(f),
+                state,
+            }))
         }
         Err(e) => {
             {

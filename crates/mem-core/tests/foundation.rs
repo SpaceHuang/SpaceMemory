@@ -754,6 +754,32 @@ fn missing_required_features_allow_only_explicit_readonly_and_block_existing_han
 }
 
 #[test]
+fn existing_handle_rejects_missing_required_features_field_for_reads_writes_and_maintenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("missing-required-field");
+    Store::create(&root).unwrap();
+    let store = Store::open(&root, OpenMode::Auto).unwrap();
+    let path = store.abs("mem.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove("required_features");
+    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    assert!(matches!(
+        store.current_format_version(),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.check_writable(),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.acquire_index_maintenance(),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+}
+
+#[test]
 fn required_feature_ids_must_be_valid_and_unique_before_open_probe() {
     for value in [
         serde_json::json!(["missing-format"]),
@@ -870,6 +896,166 @@ fn config_value_update_rechecks_features_and_preserves_disk_on_rejection() {
         matches!(error, mem_core::error::MemError::MissingFeatures(features) if features == vec!["config.future/v1"])
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn invalid_known_config_value_is_rejected_before_disk_or_cache_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("invalid-config-update");
+    Store::create(&root).unwrap();
+    let store = Store::open(&root, OpenMode::Auto).unwrap();
+    let path = store.abs("mem.json");
+    let before_disk = std::fs::read(&path).unwrap();
+    let before_cache = store.config();
+
+    assert!(
+        store
+            .set_config_value("budgets", serde_json::json!("not-an-object"))
+            .is_err()
+    );
+
+    assert_eq!(std::fs::read(&path).unwrap(), before_disk);
+    assert_eq!(store.config(), before_cache);
+}
+
+#[test]
+fn readonly_store_cannot_turn_external_barrier_into_index_maintenance_permit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("readonly-permit");
+    Store::create(&root).unwrap();
+    let readonly = Store::open(&root, OpenMode::ForceReadOnly).unwrap();
+    let barrier = mem_core::lock::barrier_exclusive(&readonly).unwrap();
+
+    assert!(matches!(
+        readonly.index_maintenance_from_guard(barrier),
+        Err(mem_core::error::MemError::ReadOnly)
+    ));
+    assert!(!root.join("index/index.sqlite").exists());
+}
+
+#[test]
+fn rust_store_create_does_not_publish_openable_config_before_layout_is_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("atomic-create");
+    let permit = Store::acquire_init_lock(&root).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let root_for_thread = root.clone();
+    let create = std::thread::spawn(move || {
+        Store::create_under_init_lock_test_with_pause(&root_for_thread, &permit, || {
+            ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+        })
+        .unwrap();
+    });
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(
+        !root.join("mem.json").exists(),
+        "配置是可打开状态的发布点，布局尚未完成时不应存在"
+    );
+    assert!(matches!(
+        Store::open(&root, OpenMode::Auto),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    continue_tx.send(()).unwrap();
+    create.join().unwrap();
+    assert!(Store::open(&root, OpenMode::Auto).is_ok());
+
+    let interrupted = tmp.path().join("interrupted-create");
+    let first_permit = Store::acquire_init_lock(&interrupted).unwrap();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Store::create_under_init_lock_test_with_pause(&interrupted, &first_permit, || {
+            panic!("simulate process interruption before config publication");
+        })
+        .unwrap();
+    }));
+    assert!(failed.is_err());
+    drop(first_permit);
+    assert!(!interrupted.join("mem.json").exists());
+    let retry_permit = Store::acquire_init_lock(&interrupted).unwrap();
+    Store::create_under_init_lock(&interrupted, &retry_permit).unwrap();
+    assert!(Store::open(&interrupted, OpenMode::Auto).is_ok());
+}
+
+#[test]
+fn index_maintenance_permit_cannot_be_rebound_to_another_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_root = tmp.path().join("first");
+    let second_root = tmp.path().join("second");
+    Store::create(&first_root).unwrap();
+    Store::create(&second_root).unwrap();
+    let first = Store::open(&first_root, OpenMode::Auto).unwrap();
+    let second = Store::open(&second_root, OpenMode::Auto).unwrap();
+    let permit = first.acquire_index_maintenance().unwrap();
+
+    assert!(matches!(
+        permit.check_store(&second),
+        Err(mem_core::error::MemError::BadArgument(_))
+    ));
+    let checkpoint = mem_core::freshness::Checkpoint {
+        format_version: second.config().format_version,
+        ts: mem_core::clock::now_rfc3339(),
+        entries: Default::default(),
+        index_epoch: 1,
+    };
+    assert!(mem_core::freshness::save_checkpoint(&second, &checkpoint, &permit).is_err());
+    assert!(!mem_core::freshness::checkpoint_path(&second).exists());
+    drop(permit);
+    let barrier = mem_core::lock::barrier_exclusive(&first).unwrap();
+    assert!(matches!(
+        second.index_maintenance_from_guard(barrier),
+        Err(mem_core::error::MemError::BadArgument(_))
+    ));
+}
+
+#[test]
+fn reconcile_refuses_git_byte_policy_conflict_before_any_mutation_or_callback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("git-policy-conflict");
+    Store::create(&root).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitattributes"), b"*.md text=auto\n").unwrap();
+    std::fs::create_dir_all(root.join(".pending-commits")).unwrap();
+    std::fs::write(root.join(".pending-commits/keep.json"), b"pending").unwrap();
+    let store = Store::open(&root, OpenMode::Auto).unwrap();
+    let before_events = std::fs::read(root.join("events.jsonl")).unwrap();
+    let before_pending = std::fs::read(root.join(".pending-commits/keep.json")).unwrap();
+    let callbacks_called = std::sync::atomic::AtomicBool::new(false);
+    let permit = store.acquire_index_maintenance().unwrap();
+
+    let result = mem_core::sidecar::reconcile_under_maintenance(
+        &store,
+        &permit,
+        Some(&|_, _| {
+            callbacks_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(mem_core::freshness::MaintainOutcome {
+                index_epoch: 1,
+                scan_entries: Default::default(),
+            })
+        }),
+        || {
+            callbacks_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(mem_core::error::MemError::GitAttributesConflict { .. })
+    ));
+    assert!(!callbacks_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        std::fs::read(root.join("events.jsonl")).unwrap(),
+        before_events
+    );
+    assert_eq!(
+        std::fs::read(root.join(".pending-commits/keep.json")).unwrap(),
+        before_pending
+    );
+    assert!(!root.join("index/index.sqlite").exists());
 }
 
 #[test]

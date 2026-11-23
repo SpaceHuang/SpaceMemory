@@ -193,7 +193,7 @@ pub struct InitPermit {
 
 impl InitPermit {
     pub(crate) fn check_root(&self, root: &Path) -> MemResult<()> {
-        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let parent = effective_parent(root);
         let leaf = root.file_name().ok_or_else(|| {
             MemError::BadArgument(format!("初始化路径必须有目录名: {}", root.display()))
         })?;
@@ -206,6 +206,12 @@ impl InitPermit {
             Err(MemError::BadArgument("初始化许可属于另一目标路径".into()))
         }
     }
+}
+
+fn effective_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[derive(Debug)]
@@ -251,11 +257,9 @@ impl Store {
 
     /// 持有贯穿整个 CLI 初始化流程的路径级互斥租约。
     pub fn acquire_init_lock(root: &Path) -> MemResult<InitPermit> {
-        if let Some(parent) = root.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MemError::io(parent.display().to_string(), e))?;
-        }
-        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let parent = effective_parent(root);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| MemError::io(parent.display().to_string(), e))?;
         let leaf = root.file_name().ok_or_else(|| {
             MemError::BadArgument(format!("初始化路径必须有目录名: {}", root.display()))
         })?;
@@ -284,7 +288,7 @@ impl Store {
         let marker = root.join(Self::INIT_IN_PROGRESS);
         let mut quarantined = None;
         if marker.exists() {
-            let parent = root.parent().unwrap_or_else(|| Path::new("."));
+            let parent = effective_parent(root);
             let leaf = root.file_name().ok_or_else(|| {
                 MemError::BadArgument(format!("初始化路径必须有目录名: {}", root.display()))
             })?;
@@ -357,7 +361,15 @@ impl Store {
         }
         self.check_writable()?;
         self.check_compatible_for_write()?;
-        let mut config = self.read_disk_config()?;
+        let path = self.abs("mem.json");
+        let bytes =
+            std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
+                path: "mem.json".into(),
+                reason: e.to_string(),
+            })?;
+        let mut config = Self::parse_disk_config_value(raw.clone())?;
         if config.format_version != Self::CURRENT_FORMAT {
             return Err(MemError::RequiresMigration {
                 current: config.format_version,
@@ -369,12 +381,19 @@ impl Store {
         config.required_features.sort();
         config.required_features.dedup();
         if config.required_features.len() != before {
-            let bytes = serde_json::to_vec_pretty(&config).map_err(|e| MemError::Corrupt {
+            raw["required_features"] =
+                serde_json::to_value(&config.required_features).map_err(|e| MemError::Corrupt {
+                    path: "mem.json".into(),
+                    reason: e.to_string(),
+                })?;
+            // 只改目标字段；嵌套和顶层未知 JSON 键按原始 Value 保留。
+            config = Self::parse_disk_config_value(raw.clone())?;
+            let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
                 path: "mem.json".into(),
                 reason: e.to_string(),
             })?;
-            crate::platform::atomic_write(&self.abs("mem.json"), &bytes)
-                .map_err(|e| MemError::io(self.abs("mem.json").display().to_string(), e))?;
+            crate::platform::atomic_write(&path, &updated)
+                .map_err(|e| MemError::io(path.display().to_string(), e))?;
         }
         *self.config.lock().expect("配置锁") = config;
         Ok(())
@@ -544,7 +563,8 @@ impl Store {
         &self,
         barrier: crate::lock::ExclusiveBarrierGuard,
     ) -> MemResult<IndexMaintenancePermit<'_>> {
-        self.check_compatible_for_write()?;
+        self.check_writable()?;
+        barrier.check_store(self)?;
         Ok(IndexMaintenancePermit {
             store: self,
             barrier,
@@ -579,13 +599,13 @@ impl Store {
             reason: "顶层配置必须是对象".into(),
         })?;
         object.insert(key.to_owned(), value);
+        let config = Self::parse_disk_config_value(raw.clone())?;
         let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
             path: "mem.json".into(),
             reason: e.to_string(),
         })?;
         crate::platform::atomic_write(&path, &updated)
             .map_err(|e| MemError::io(path.display().to_string(), e))?;
-        let config = self.read_disk_config()?;
         *self.config.lock().expect("配置锁") = config;
         Ok(())
     }
@@ -598,6 +618,25 @@ impl Store {
 
     /// 调用者持有 [`Self::acquire_init_lock`] 返回的初始化租约时建店。
     pub fn create_under_init_lock(root: &Path, permit: &InitPermit) -> MemResult<()> {
+        Self::create_under_init_lock_inner(root, permit, None)
+    }
+
+    /// 仅供 debug 集成验收在配置发布前暂停；发布构建不暴露此入口。
+    #[doc(hidden)]
+    #[cfg(all(debug_assertions, not(test)))]
+    pub fn create_under_init_lock_test_with_pause(
+        root: &Path,
+        permit: &InitPermit,
+        hook: impl Fn(),
+    ) -> MemResult<()> {
+        Self::create_under_init_lock_inner(root, permit, Some(&hook))
+    }
+
+    fn create_under_init_lock_inner(
+        root: &Path,
+        permit: &InitPermit,
+        before_config_publish: Option<&dyn Fn()>,
+    ) -> MemResult<()> {
         permit.check_root(root)?;
         let mem_json = root.join("mem.json");
         if mem_json.exists() {
@@ -624,8 +663,6 @@ impl Store {
             path: "mem.json".into(),
             reason: e.to_string(),
         })?;
-        std::fs::write(&mem_json, json)
-            .map_err(|e| MemError::io(mem_json.display().to_string(), e))?;
         // 事件日志：空文件占位（追加式、序号=行序）。
         std::fs::write(root.join("events.jsonl"), b"")
             .map_err(|e| MemError::io(root.join("events.jsonl").display().to_string(), e))?;
@@ -647,6 +684,12 @@ impl Store {
                 e,
             )
         })?;
+        // mem.json 是公开 open 的唯一完成标记；其余布局准备好后才原子发布。
+        if let Some(hook) = before_config_publish {
+            hook();
+        }
+        crate::platform::atomic_write(&mem_json, json.as_bytes())
+            .map_err(|e| MemError::io(mem_json.display().to_string(), e))?;
         Ok(())
     }
 
@@ -775,6 +818,15 @@ impl Store {
         &self.root
     }
 
+    pub(crate) fn physical_root(&self) -> MemResult<PathBuf> {
+        std::fs::canonicalize(&self.root)
+            .map_err(|e| MemError::io(self.root.display().to_string(), e))
+    }
+
+    pub(crate) fn same_physical_store(&self, other: &Store) -> MemResult<bool> {
+        Ok(self.physical_root()? == other.physical_root()?)
+    }
+
     pub fn writable(&self) -> bool {
         self.writable
     }
@@ -836,11 +888,15 @@ impl Store {
         let path = self.abs("mem.json");
         let bytes =
             std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
-        let mut raw: serde_json::Value =
+        let raw: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
                 path: "mem.json".into(),
                 reason: e.to_string(),
             })?;
+        Self::parse_disk_config_value(raw)
+    }
+
+    fn parse_disk_config_value(mut raw: serde_json::Value) -> MemResult<StoreConfig> {
         let version = raw
             .get("format_version")
             .and_then(|v| {
@@ -859,6 +915,21 @@ impl Store {
             });
         }
         raw["format_version"] = serde_json::Value::String(version);
+        if raw["format_version"] == "spacememory/2" {
+            let required = raw
+                .get("required_features")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| MemError::Corrupt {
+                    path: "mem.json".into(),
+                    reason: "spacememory/2 缺少 required_features 数组".into(),
+                })?;
+            if required.iter().any(|v| v.as_str().is_none()) {
+                return Err(MemError::Corrupt {
+                    path: "mem.json".into(),
+                    reason: "required_features 必须为字符串数组".into(),
+                });
+            }
+        }
         let config: StoreConfig = serde_json::from_value(raw).map_err(|e| MemError::Corrupt {
             path: "mem.json".into(),
             reason: e.to_string(),
@@ -1006,7 +1077,7 @@ impl IndexMaintenancePermit<'_> {
 
     /// 校验许可确实绑定到目标店，防止跨店复用独占租约。
     pub fn check_store(&self, store: &Store) -> MemResult<()> {
-        if std::ptr::eq(self.store, store) {
+        if self.store.same_physical_store(store)? {
             Ok(())
         } else {
             Err(MemError::BadArgument("索引维护许可属于另一记忆库".into()))

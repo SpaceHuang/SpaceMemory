@@ -38,6 +38,14 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
 fn restore_body_registers_required_feature_before_publishing_dependent_event() {
     let (tmp, store, types) = fresh_store();
     let (id, token) = add_memory(&store, &types, "feature-registration", b"before");
+    let config_path = store.abs("mem.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["budgets"]["future_budget"] = serde_json::json!({"keep": "budget"});
+    config["subscription"]["future_subscription"] = serde_json::json!({"keep": "subscription"});
+    config["init"]["future_init"] = serde_json::json!({"keep": "init"});
+    config["future_top_level"] = serde_json::json!({"keep": "top"});
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     let hit = ops::get(&store, &id).unwrap();
     let source_path = tmp.path().join("restore-source.md");
     let original =
@@ -59,6 +67,15 @@ fn restore_body_registers_required_feature_before_publishing_dependent_event() {
         store.config().required_features,
         vec!["event.restore_body/v1"]
     );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(persisted["budgets"]["future_budget"]["keep"], "budget");
+    assert_eq!(
+        persisted["subscription"]["future_subscription"]["keep"],
+        "subscription"
+    );
+    assert_eq!(persisted["init"]["future_init"]["keep"], "init");
+    assert_eq!(persisted["future_top_level"]["keep"], "top");
     let log = EventLog::new(&store).read_log().unwrap();
     assert_eq!(log.events.last().unwrap().op, Op::RestoreBody);
 }

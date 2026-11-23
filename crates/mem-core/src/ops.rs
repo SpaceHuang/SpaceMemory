@@ -791,7 +791,6 @@ pub fn link(
     expect_b: &Token,
 ) -> MemResult<(Token, Token)> {
     ctx.store.check_writable()?;
-    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③
     let initial_a = get(ctx.store, a_id)?;
     let initial_b = get(ctx.store, b_id)?;
     ensure_link_endpoint_is_live(&initial_a, "源")?;
@@ -806,6 +805,7 @@ pub fn link(
         lock::AnyBarrierGuard::Shared(lock::barrier_shared(ctx.store)?)
     };
     ctx.store.check_compatible_for_write()?;
+    crate::gitattrs::ensure_for_write(ctx.store)?; // BD5 ②③：在写屏障内核验/补种
     // 在屏障内重解析，删除/恢复不能在验证与发布之间改变端点所在位置。
     let a = get(ctx.store, a_id)?;
     let b = get(ctx.store, b_id)?;
@@ -1662,7 +1662,6 @@ pub fn fix_record(
     committer: Option<&dyn CommitSink>,
 ) -> MemResult<Fixed> {
     store.check_writable()?;
-    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：受管写前核验
     // H1：定位（只读解析路径；真正的内容读取全部在锁内）。
     let rel = match get(store, id_or_path) {
         Ok(hit) => hit.rel,
@@ -1690,6 +1689,7 @@ pub fn fix_record(
     // 不在共享锁下检查后再升级，以免与其他 DAG 写入共同发布成环。
     let _barrier = lock::barrier_exclusive(store)?;
     store.check_compatible_for_write()?;
+    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：在写屏障内核验/补种
     let _rec = lock::record_lock(store, &rel, std::time::Duration::from_secs(30))?;
     // H1：锁内读——并发窗口内的 update 成果不会被 fix 的旧字节覆盖。
     let bytes = std::fs::read(store.abs(&rel)).map_err(|e| MemError::io(rel.clone(), e))?;

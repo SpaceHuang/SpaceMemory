@@ -120,7 +120,10 @@ pub fn serve(store: &Store, idle: Duration, stop: impl Fn() -> bool) -> MemResul
 /// 维护回调（B3 接线）：sidecar 检测到变更时调用——mem bin 注入 mem-index 物化器。
 /// 返回本次物化的结果（代际 + **与索引同一次扫描**的 stat 集，r5 B3）——检查点
 /// entries 采自该集合，物化与检查点恒同代。语义：回调**先于**检查点发布。
-pub type Maintainer<'a> = &'a dyn Fn(&Store, &crate::store::IndexMaintenancePermit<'_>) -> MemResult<crate::freshness::MaintainOutcome>;
+pub type Maintainer<'a> = &'a dyn Fn(
+    &Store,
+    &crate::store::IndexMaintenancePermit<'_>,
+) -> MemResult<crate::freshness::MaintainOutcome>;
 
 pub fn serve_with_maintainer(
     store: &Store,
@@ -139,7 +142,7 @@ pub fn serve_with_maintainer(
                 return Err(MemError::LockTimeout {
                     lock_path: name.display().to_string(),
                     holder: None,
-                })
+                });
             }
             Err(e) => return Err(MemError::io(name.display().to_string(), e)),
         }
@@ -151,10 +154,18 @@ pub fn serve_with_maintainer(
     if run_maintenance(store, maintainer, sub.as_mut())?.0 {
         report.rebuilds += 1;
     }
-    let backend = sub.as_ref().map(|s| s.backend()).unwrap_or("none").to_string();
+    let backend = sub
+        .as_ref()
+        .map(|s| s.backend())
+        .unwrap_or("none")
+        .to_string();
     store.update_config(|c| {
         c.subscription.supported = backend != "none";
-        c.subscription.backend = if backend != "none" { Some(backend.clone()) } else { None };
+        c.subscription.backend = if backend != "none" {
+            Some(backend.clone())
+        } else {
+            None
+        };
     });
     let mut last_activity = Instant::now();
     let mut listener = Listener::bind(store)?;
@@ -257,7 +268,7 @@ impl Subscription {
                 }
             }
             #[cfg(not(windows))]
-            _ => {},
+            _ => {}
         }
     }
 }
@@ -308,12 +319,14 @@ pub fn reconcile_under_maintenance(
     permit: &crate::store::IndexMaintenancePermit<'_>,
     maintainer: Option<Maintainer<'_>>,
     retry_pending: impl FnOnce() -> MemResult<usize>,
-) -> MemResult<(crate::event::BackfillReport, usize, bool)> {
+) -> MemResult<(crate::event::BackfillReport, usize, bool, bool)> {
+    permit.check_store(store)?;
     permit.check_compatible()?;
+    crate::gitattrs::ensure_for_write(store)?;
     let report = crate::event::reconcile_backfill_locked(store, "mem", None)?;
     let retried = retry_pending()?;
     let (rebuilt, converged) = run_maintenance_under_permit(store, permit, maintainer, None)?;
-    Ok((report, retried, rebuilt && converged))
+    Ok((report, retried, rebuilt, converged))
 }
 
 fn run_maintenance_under_permit(
@@ -331,7 +344,8 @@ fn run_maintenance_under_permit(
     };
     let m: Maintainer = maintainer.unwrap_or(noop);
     let mut sub_cell = sub;
-    let mut fresh_fn = move || -> Option<u64> { sub_cell.as_mut().and_then(|s| s.fresh_undigested()) };
+    let mut fresh_fn =
+        move || -> Option<u64> { sub_cell.as_mut().and_then(|s| s.fresh_undigested()) };
     let fresh: Option<&mut dyn FnMut() -> Option<u64>> =
         if has_sub { Some(&mut fresh_fn) } else { None };
     let published = crate::freshness::publish_converged_checkpoint(
@@ -383,7 +397,11 @@ impl Listener {
         sub: Option<&mut Subscription>,
         maintainer: Option<Maintainer<'_>>,
     ) -> bool {
-        let backend = sub.as_ref().map(|s| s.backend()).unwrap_or("none").to_string();
+        let backend = sub
+            .as_ref()
+            .map(|s| s.backend())
+            .unwrap_or("none")
+            .to_string();
         let undigested = match sub {
             Some(s) => match s.fresh_undigested() {
                 Some(n) if n > 0 => {

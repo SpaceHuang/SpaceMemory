@@ -11,7 +11,7 @@ use mem_core::store::{OpenMode, Store};
 use mem_core::token::Token;
 use mem_git::GitProcess;
 use mem_schema::TypeSet;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -76,19 +76,29 @@ macro_rules! arg_str {
 
 fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemError> {
     let store = Store::open(root, OpenMode::Auto)?;
-    let types = TypeSet::load_dir(&store.abs("types")).map_err(|e| {
-        MemError::Corrupt { path: "types".into(), reason: e.to_string() }
+    let types = TypeSet::load_dir(&store.abs("types")).map_err(|e| MemError::Corrupt {
+        path: "types".into(),
+        reason: e.to_string(),
     })?;
     match name {
         "mem_brief" => {
             let checkpoint = mem_core::freshness::load_checkpoint(&store);
             let hello = mem_core::sidecar::probe(&store);
-            let mode = mem_core::freshness::consult_with_hello(&store, checkpoint.as_ref(), hello.as_ref());
+            let mode = mem_core::freshness::consult_with_hello(
+                &store,
+                checkpoint.as_ref(),
+                hello.as_ref(),
+            );
             let (ledgers, _) = session::scan_ledgers(&store)?;
             let principal = arg_str!(args, "principal");
             let identity = ledgers
                 .iter()
-                .filter(|l| principal.as_deref().map(|p| l.principal.contains(p)).unwrap_or(true))
+                .filter(|l| {
+                    principal
+                        .as_deref()
+                        .map(|p| l.principal.contains(p))
+                        .unwrap_or(true)
+                })
                 .max_by(|a, b| a.last_write.cmp(&b.last_write))
                 .map(|l| json!({"session": l.id, "status": l.status, "watermark": l.watermark}));
             let view_ref = arg_str!(args, "view");
@@ -98,7 +108,12 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             let offset_arg = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let r = match view_ref {
                 Some(v) => mem_core::view::execute_from(&store, &v, budget, offset_arg)?,
-                None => mem_core::view::execute_filter(&store, &mem_core::view::ViewFilter::default(), budget, offset_arg)?,
+                None => mem_core::view::execute_filter(
+                    &store,
+                    &mem_core::view::ViewFilter::default(),
+                    budget,
+                    offset_arg,
+                )?,
             };
             let since = args.get("since").and_then(|v| v.as_u64());
             let since_info = since.map(|n| {
@@ -108,15 +123,23 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             // r9 语义（与 CLI 同源实现）：条目完整 JSON 超字节预算 → 跳过 + 清单；
             // items 数组严格 ≤ 预算；resume.offset = 下一未处理项（跳过项经
             // skipped_over_budget 可见，单条读取用 mem_show 绕开分页预算）。
-            let items: Vec<Value> = r.items.iter().map(|i| json!({
-                "id": i.envelope.id, "type": i.envelope.r#type,
-                "modified": i.envelope.modified, "token": i.token.to_string(),
-            })).collect();
+            let items: Vec<Value> = r
+                .items
+                .iter()
+                .map(|i| {
+                    json!({
+                        "id": i.envelope.id, "type": i.envelope.r#type,
+                        "modified": i.envelope.modified, "token": i.token.to_string(),
+                    })
+                })
+                .collect();
             let byte_budget = mem_core::budget::brief_bytes_budget(&store)?;
             let (kept, skipped, byte_truncated) =
                 mem_core::budget::apply_byte_budget(items, byte_budget);
             let truncated = r.truncated || byte_truncated;
-            let used = serde_json::to_string(&kept).map(|s| s.len()).unwrap_or(byte_budget);
+            let used = serde_json::to_string(&kept)
+                .map(|s| s.len())
+                .unwrap_or(byte_budget);
             Ok(json!({
                 "read_mode": mode,
                 "identity": identity,
@@ -134,20 +157,26 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         }
         "mem_session_start" => {
             store.check_writable()?;
-            let principal = args.get("principal").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("principal 必填".into()))?;
+            let principal = args
+                .get("principal")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MemError::BadArgument("principal 必填".into()))?;
             let principal_id = resolve_principal(&store, &principal.to_string())?;
             let handoff = match arg_str!(args, "handoff").as_deref() {
                 None => session::HandoffSpec::None,
                 Some("auto") => session::HandoffSpec::Auto,
                 Some(id) => session::HandoffSpec::Explicit(id.into()),
             };
-            let o = session::start(&store, session::StartArgs {
-                principal: principal_id,
-                view: arg_str!(args, "view"),
-                task_ref: arg_str!(args, "task_ref"),
-                handoff,
-                idle_secs: store.config().session_idle_secs,
-            })?;
+            let o = session::start(
+                &store,
+                session::StartArgs {
+                    principal: principal_id,
+                    view: arg_str!(args, "view"),
+                    task_ref: arg_str!(args, "task_ref"),
+                    handoff,
+                    idle_secs: store.config().session_idle_secs,
+                },
+            )?;
             Ok(json!({
                 "session": o.ledger.id, "status": o.ledger.status,
                 "watermark": o.ledger.watermark, "handoff_from": o.ledger.handoff_from,
@@ -156,8 +185,19 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         }
         "mem_session_flush" => {
             store.check_writable()?;
-            let sid = args.get("session").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("session 必填".into()))?;
-            let trail = args.get("trail").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            let sid = args
+                .get("session")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MemError::BadArgument("session 必填".into()))?;
+            let trail = args
+                .get("trail")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
             let sink = GitProcess::new(store.root());
             let l = session::flush(&store, sid, trail, Some(&sink))?;
             Ok(json!({"session": l.id, "status": l.status, "watermark": l.watermark}))
@@ -167,7 +207,12 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             // 快路径经 open_proved 构造即证明（决策②——MCP list 不再恒直读），
             // CLI 与 MCP 同源调用 mem-core find::execute。
             let filters = parse_mcp_filters(args.get("filters"))?;
-            let limit = mem_core::budget::effective_limit(&store, args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize));
+            let limit = mem_core::budget::effective_limit(
+                &store,
+                args.get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+            );
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let proved = proved_access(&store);
             let vf = match arg_str!(args, "view") {
@@ -176,14 +221,19 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
                     if vr.record.envelope.r#type != "view" {
                         return Err(MemError::BadArgument(format!("{v} 不是 view 记录")));
                     }
-                    Some(mem_core::view::ViewFilter::from_payload(&vr.record.payload)?)
+                    Some(mem_core::view::ViewFilter::from_payload(
+                        &vr.record.payload,
+                    )?)
                 }
                 None => None,
             };
             let prefilter = if vf.is_some() {
                 None
             } else {
-                proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter)
+                proved
+                    .index
+                    .as_ref()
+                    .map(|p| p as &dyn mem_core::find::FindPrefilter)
             };
             let outcome = mem_core::find::execute(mem_core::find::FindParams {
                 store: &store,
@@ -212,14 +262,17 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             // R10 决策⑥：mem_find 新工具——query 必填且须含肯定词项（空查询/纯否定
             // → query_invalid；纯过滤由 mem_list 承载）；filters 值一律 JSON 字符串
             //（决策④：标量文本，类型解释由字段声明承担——非字符串标量显式拒收）。
-            let query = arg_str!(args, "query").ok_or_else(|| {
-                MemError::ParamRejected {
-                    kind: mem_core::find::QUERY_INVALID.into(),
-                    message: "query 必填且须含至少一个肯定词项（纯过滤清单请走 mem_list）".into(),
-                }
+            let query = arg_str!(args, "query").ok_or_else(|| MemError::ParamRejected {
+                kind: mem_core::find::QUERY_INVALID.into(),
+                message: "query 必填且须含至少一个肯定词项（纯过滤清单请走 mem_list）".into(),
             })?;
             let filters = parse_mcp_filters(args.get("filters"))?;
-            let limit = mem_core::budget::effective_limit(&store, args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize));
+            let limit = mem_core::budget::effective_limit(
+                &store,
+                args.get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+            );
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let proved = proved_access(&store);
             let outcome = mem_core::find::execute(mem_core::find::FindParams {
@@ -233,7 +286,10 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
                 limit,
                 offset,
                 mode: proved.mode,
-                prefilter: proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter),
+                prefilter: proved
+                    .index
+                    .as_ref()
+                    .map(|p| p as &dyn mem_core::find::FindPrefilter),
             })?;
             Ok(json!({
                 "read_mode": outcome.mode,
@@ -249,7 +305,10 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             }))
         }
         "mem_show" => {
-            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
             // r12 B7-3：预算是配置错误——先于一切工作响亮拒收；MCP 与 CLI 同预算
             // 语义（R4.2/红线9 不因前端豁免）。
             // R11.2/BD2 响应自适应：正文区合法 UTF-8 → 文本分页（切点码点对齐，
@@ -259,13 +318,18 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             let budget = mem_core::budget::brief_bytes_budget(&store)?;
             let hit = ops::get(&store, id)?;
             let body_utf8 = mem_core::body::is_valid_utf8(&hit.record.body);
-            let off = args.get("body_offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let off = args
+                .get("body_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
             let (body, body_b64, body_truncated, next_off) = if body_utf8 {
-                let (text, truncated, next) = mem_core::body::body_page_text(&hit.record.body, off, budget)
-                    .expect("合法 UTF-8 正文必有文本通道");
+                let (text, truncated, next) =
+                    mem_core::body::body_page_text(&hit.record.body, off, budget)
+                        .expect("合法 UTF-8 正文必有文本通道");
                 (json!(text), Value::Null, truncated, next)
             } else {
-                let (bytes, truncated, next) = mem_core::body::body_page_bytes(&hit.record.body, off, budget);
+                let (bytes, truncated, next) =
+                    mem_core::body::body_page_bytes(&hit.record.body, off, budget);
                 (Value::Null, json!(b64_encode(bytes)), truncated, next)
             };
             Ok(json!({
@@ -284,7 +348,10 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             }))
         }
         "mem_trace" => {
-            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
             let dir = match arg_str!(args, "dir").as_deref() {
                 Some("down") => mem_core::refgraph::TraceDirection::Down,
                 _ => mem_core::refgraph::TraceDirection::Up,
@@ -293,10 +360,18 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             // 同语义：节点序号续读）——此前 resume 里的 skip/limit 在重放时被忽略，
             // 同一页反复返回。depth/limit 请求值同样受全局预算钳制（与 CLI 一致）。
             let (max_depth, max_nodes) = mem_core::budget::trace_budget(&store);
-            let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as usize)
-                .unwrap_or(max_depth).min(max_depth);
-            let nodes = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize)
-                .unwrap_or(max_nodes).min(max_nodes);
+            let depth = args
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(max_depth)
+                .min(max_depth);
+            let nodes = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(max_nodes)
+                .min(max_nodes);
             let skip_n = args.get("skip").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let outcome = mem_core::refgraph::trace_from(&store, id, dir, depth, nodes, skip_n)?;
             let nodes_out = &outcome.nodes;
@@ -349,14 +424,24 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         "mem_add" => {
             let session_id: Option<String> = arg_str!(args, "session");
             let ctx = make_ctx(&store, &types, session_id.as_deref());
-            let out = ops::add(&ctx, ops::AddArgs {
-                type_name: args.get("type").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("type 必填".into()))?.to_string(),
-                payload: args.get("payload").cloned().ok_or_else(|| MemError::BadArgument("payload 必填".into()))?,
-                body: body_bytes(args)?.unwrap_or_default(),
-                // raw 透传（方案 principal-binding 决策②：前端零逻辑）——短名/ID
-                // 解析与两阶段校验单源在核心。
-                principal: arg_str!(args, "principal").map(String::from),
-            })?;
+            let out = ops::add(
+                &ctx,
+                ops::AddArgs {
+                    type_name: args
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| MemError::BadArgument("type 必填".into()))?
+                        .to_string(),
+                    payload: args
+                        .get("payload")
+                        .cloned()
+                        .ok_or_else(|| MemError::BadArgument("payload 必填".into()))?,
+                    body: body_bytes(args)?.unwrap_or_default(),
+                    // raw 透传（方案 principal-binding 决策②：前端零逻辑）——短名/ID
+                    // 解析与两阶段校验单源在核心。
+                    principal: arg_str!(args, "principal").map(String::from),
+                },
+            )?;
             Ok(json!({
                 "created": out.created, "id": out.record.envelope.id, "rel": out.rel,
                 "token": out.token.to_string(), "warnings": out.warnings,
@@ -370,8 +455,13 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             })?;
             let session_id: Option<String> = arg_str!(args, "session");
             let ctx = make_ctx(&store, &types, session_id.as_deref());
-            let out = ops::update(&ctx, args.get("id").and_then(|v| v.as_str()).unwrap_or_default(), &expect,
-                payload, body_bytes(args)?)?;
+            let out = ops::update(
+                &ctx,
+                args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                &expect,
+                payload,
+                body_bytes(args)?,
+            )?;
             Ok(json!({
                 "id": out.record.envelope.id, "version": out.record.envelope.version,
                 "token": out.token.to_string(), "warnings": out.warnings,
@@ -379,33 +469,48 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         }
         "mem_link" => {
             let ctx = make_ctx(&store, &types, None);
-            let (ta, tb) = ops::link(&ctx,
+            let (ta, tb) = ops::link(
+                &ctx,
                 args.get("a").and_then(|v| v.as_str()).unwrap_or_default(),
                 args.get("b").and_then(|v| v.as_str()).unwrap_or_default(),
                 args.get("rel").and_then(|v| v.as_str()).unwrap_or_default(),
-                &parse_expect(args.get("expect_a"))?, &parse_expect(args.get("expect_b"))?)?;
+                &parse_expect(args.get("expect_a"))?,
+                &parse_expect(args.get("expect_b"))?,
+            )?;
             Ok(json!({"a_token": ta.to_string(), "b_token": tb.to_string()}))
         }
         "mem_delete" => {
             let ctx = make_ctx(&store, &types, None);
-            let d = ops::delete_record(&ctx,
+            let d = ops::delete_record(
+                &ctx,
                 args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
                 &parse_expect(args.get("expect"))?,
-                args.get("force").and_then(|v| v.as_bool()).unwrap_or(false))?;
+                args.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
+            )?;
             Ok(json!({"tombstone": d.rel, "warnings": d.warnings}))
         }
         "mem_restore" => {
             let ctx = make_ctx(&store, &types, None);
-            let r = ops::restore_record(&ctx, args.get("id").and_then(|v| v.as_str()).unwrap_or_default(), None)?;
+            let r = ops::restore_record(
+                &ctx,
+                args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                None,
+            )?;
             Ok(json!({"rel": r.rel, "token": r.token.to_string()}))
         }
         "mem_restore_body" => {
             // R11.5 对等 + R11.6/BD4：恢复正文（经确认的内容写；与 CLI restore-body
             // 同批义务——前端功能对等）。来源三形：git:<版本> | file:<店外路径> | history。
-            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MemError::BadArgument("id 必填".into()))?;
             let expect = parse_expect(args.get("expect"))?;
-            let source_spec = arg_str!(args, "source")
-                .ok_or_else(|| MemError::BadArgument("source 必填（git:<版本> | file:<店外路径> | history）".into()))?;
+            let source_spec = arg_str!(args, "source").ok_or_else(|| {
+                MemError::BadArgument(
+                    "source 必填（git:<版本> | file:<店外路径> | history）".into(),
+                )
+            })?;
             let source = parse_restore_source(&source_spec)?;
             let session_id: Option<String> = arg_str!(args, "session");
             let ctx = make_ctx(&store, &types, session_id.as_deref());
@@ -425,11 +530,19 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             // 分页，精确截断判定；被截断的组经 resume.offset 可达，红线9 不因
             // 前端豁免）。
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let d = mem_core::drift::diff_since(&store, args.get("since").and_then(|v| v.as_u64()).unwrap_or(0),
-                usize::MAX, cfg.current_drift_limit as usize)?;
+            let d = mem_core::drift::diff_since(
+                &store,
+                args.get("since").and_then(|v| v.as_u64()).unwrap_or(0),
+                usize::MAX,
+                cfg.current_drift_limit as usize,
+            )?;
             let total = d.changes_since.len();
-            let page: Vec<_> = d.changes_since.into_iter()
-                .skip(offset).take(cfg.diff_since_limit as usize).collect();
+            let page: Vec<_> = d
+                .changes_since
+                .into_iter()
+                .skip(offset)
+                .take(cfg.diff_since_limit as usize)
+                .collect();
             let consumed = offset + page.len();
             let truncated = consumed < total;
             Ok(json!({
@@ -444,38 +557,41 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
         }
         "mem_reconcile" => {
             let permit = store.acquire_index_maintenance()?;
-            let (report, retried, index_rebuilt) = mem_core::sidecar::reconcile_under_maintenance(
-                &store,
-                &permit,
-                Some(&|store, permit| {
-                    let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
-                    let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
-                    idx.set_body_texts_under_maintenance(permit)?;
-                    Ok(mem_core::freshness::MaintainOutcome {
-                        index_epoch: idx.epoch()?,
-                        scan_entries,
-                    })
-                }),
-                || {
-                    let sink = GitProcess::new(store.root());
-                    let mut retried = 0;
-                    for (path, pending) in ops::list_pending_commits(&store)? {
-                        if ops::CommitSink::commit(&sink, &pending.paths).is_ok() {
-                            std::fs::remove_file(&path)
-                                .map_err(|e| MemError::io(path.clone(), e))?;
-                            retried += 1;
+            let (report, retried, index_rebuilt, checkpoint_saved) =
+                mem_core::sidecar::reconcile_under_maintenance(
+                    &store,
+                    &permit,
+                    Some(&|store, permit| {
+                        let mut idx =
+                            mem_index::Index::open_store_under_maintenance(store, permit)?;
+                        let (_, _, scan_entries) =
+                            idx.rebuild_with_entries_under_maintenance(permit)?;
+                        idx.set_body_texts_under_maintenance(permit)?;
+                        Ok(mem_core::freshness::MaintainOutcome {
+                            index_epoch: idx.epoch()?,
+                            scan_entries,
+                        })
+                    }),
+                    || {
+                        let sink = GitProcess::new(store.root());
+                        let mut retried = 0;
+                        for (path, pending) in ops::list_pending_commits(&store)? {
+                            if ops::CommitSink::commit(&sink, &pending.paths).is_ok() {
+                                std::fs::remove_file(&path)
+                                    .map_err(|e| MemError::io(path.clone(), e))?;
+                                retried += 1;
+                            }
                         }
-                    }
-                    Ok(retried)
-                },
-            )?;
+                        Ok(retried)
+                    },
+                )?;
             Ok(json!({
                 "backfill_appended": report.appended.len(),
                 "pending_commits_retried": retried,
                 "skipped_stable": report.skipped_stable,
                 "warnings": report.warnings,
                 "index_rebuilt": index_rebuilt,
-                "checkpoint_saved": false,
+                "checkpoint_saved": checkpoint_saved,
                 "checkpoint_note": "检查点仅由 sidecar 收敛原语发布（r4 H2）",
             }))
         }
@@ -488,12 +604,18 @@ fn dispatch_tool(root: &Path, name: &str, args: &Value) -> Result<Value, MemErro
             let scan = ops::scan_all(&store)?;
             let log = EventLog::new(&store).read_log()?;
             let holes = mem_core::event::chain_audit(&log.events);
-            let ids: std::collections::HashSet<_> = scan.records.iter().map(|r| r.record.envelope.id.clone()).collect();
+            let ids: std::collections::HashSet<_> = scan
+                .records
+                .iter()
+                .map(|r| r.record.envelope.id.clone())
+                .collect();
             let mut dangling = Vec::new();
             for r in &scan.records {
                 for e in &r.record.envelope.refs {
                     if !ids.contains(&e.target) {
-                        dangling.push(json!({"from": r.record.envelope.id, "rel": e.rel, "target": e.target}));
+                        dangling.push(
+                            json!({"from": r.record.envelope.id, "rel": e.rel, "target": e.target}),
+                        );
                     }
                 }
             }
@@ -567,7 +689,10 @@ fn parse_mcp_filters(v: Option<&Value>) -> MemResult<Vec<mem_core::find::FilterC
                     ),
                 });
             };
-            Ok(mem_core::find::FilterCond { field: k.clone(), text: text.to_string() })
+            Ok(mem_core::find::FilterCond {
+                field: k.clone(),
+                text: text.to_string(),
+            })
         })
         .collect()
 }
@@ -604,7 +729,13 @@ fn make_ctx<'a>(
         .and_then(|sid| session::get(store, sid).ok().flatten())
         .map(|l| l.principal)
         .unwrap_or_default();
-    WriteContext::new(store, types, format!("{principal_label}(mcp)")).with_committer(if store.root().join(".git").exists() { Some(&CommitViaCurrent) } else { None }).with_session_id(session_id)
+    WriteContext::new(store, types, format!("{principal_label}(mcp)"))
+        .with_committer(if store.root().join(".git").exists() {
+            Some(&CommitViaCurrent)
+        } else {
+            None
+        })
+        .with_session_id(session_id)
 }
 
 struct CommitViaCurrent;
@@ -632,7 +763,10 @@ fn body_bytes(args: &Value) -> MemResult<Option<Vec<u8>>> {
     if let Some(b64) = args.get("body_b64").and_then(|v| v.as_str()) {
         return Ok(Some(b64_decode(b64)?));
     }
-    Ok(args.get("body").and_then(|v| v.as_str()).map(|b| b.as_bytes().to_vec()))
+    Ok(args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(|b| b.as_bytes().to_vec()))
 }
 
 /// base64 编码（标准字母表 + padding；与写通道 `b64_decode` 同构的保真传输
@@ -647,8 +781,16 @@ fn b64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1.unwrap_or(0) << 8) | b2.unwrap_or(0);
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if b1.is_some() { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if b2.is_some() { T[n as usize & 63] as char } else { '=' });
+        out.push(if b1.is_some() {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if b2.is_some() {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -681,7 +823,9 @@ fn parse_expect(v: Option<&Value>) -> MemResult<Token> {
     let s = v
         .and_then(|v| v.as_str())
         .or_else(|| v.and_then(|v| v.get("version")).and_then(|x| x.as_str()))
-        .ok_or_else(|| MemError::BadArgument("expect 令牌缺失（红线19：读改写必须携带全令牌）".into()))?;
+        .ok_or_else(|| {
+            MemError::BadArgument("expect 令牌缺失（红线19：读改写必须携带全令牌）".into())
+        })?;
     s.parse::<Token>().map_err(MemError::BadArgument)
 }
 
@@ -692,15 +836,23 @@ fn parse_restore_source(spec: &str) -> MemResult<ops::RestoreSource> {
     }
     if let Some(rev) = spec.strip_prefix("git:") {
         if rev.is_empty() {
-            return Err(MemError::BadArgument("git: 源缺版本号（git:<版本>）".into()));
+            return Err(MemError::BadArgument(
+                "git: 源缺版本号（git:<版本>）".into(),
+            ));
         }
-        return Ok(ops::RestoreSource::Git { rev: rev.to_string() });
+        return Ok(ops::RestoreSource::Git {
+            rev: rev.to_string(),
+        });
     }
     if let Some(p) = spec.strip_prefix("file:") {
         if p.is_empty() {
-            return Err(MemError::BadArgument("file: 源缺路径（file:<店外路径>）".into()));
+            return Err(MemError::BadArgument(
+                "file: 源缺路径（file:<店外路径>）".into(),
+            ));
         }
-        return Ok(ops::RestoreSource::File { path: std::path::PathBuf::from(p) });
+        return Ok(ops::RestoreSource::File {
+            path: std::path::PathBuf::from(p),
+        });
     }
     Err(MemError::BadArgument(format!(
         "source 必须为 git:<版本> | file:<店外路径> | history，实际 {spec:?}"

@@ -108,7 +108,11 @@ pub struct StateTriple {
 }
 
 impl StateTriple {
-    pub const ABSENT: StateTriple = StateTriple { location: Location::Absent, version: None, digest: None };
+    pub const ABSENT: StateTriple = StateTriple {
+        location: Location::Absent,
+        version: None,
+        digest: None,
+    };
 }
 
 /// 锁内/扫描时复算当前状态三元组（records/ 与 attic/ 双查）。
@@ -118,36 +122,48 @@ pub fn current_state(store: &Store, record_rel: &str) -> MemResult<StateTriple> 
     current_state_for_id(store, record_rel, None)
 }
 
-pub fn current_state_for_id(store: &Store, record_rel: &str, id: Option<&str>) -> MemResult<StateTriple> {
+pub fn current_state_for_id(
+    store: &Store,
+    record_rel: &str,
+    id: Option<&str>,
+) -> MemResult<StateTriple> {
     store.read_compatible_missing_features()?;
     let result = current_state_for_id_unchecked(store, record_rel, id);
     store.read_compatible_missing_features()?;
     result
 }
 
-fn current_state_for_id_unchecked(store: &Store, record_rel: &str, id: Option<&str>) -> MemResult<StateTriple> {
+fn current_state_for_id_unchecked(
+    store: &Store,
+    record_rel: &str,
+    id: Option<&str>,
+) -> MemResult<StateTriple> {
     let rec_abs = store.abs(record_rel);
     if rec_abs.is_file() {
-        let bytes = std::fs::read(&rec_abs).map_err(|e| MemError::io(rec_abs.display().to_string(), e))?;
-        let rec = crate::record::Record::from_bytes(&bytes).map_err(|e| {
-            MemError::Corrupt { path: record_rel.into(), reason: e.to_string() }
+        let bytes =
+            std::fs::read(&rec_abs).map_err(|e| MemError::io(rec_abs.display().to_string(), e))?;
+        let rec = crate::record::Record::from_bytes(&bytes).map_err(|e| MemError::Corrupt {
+            path: record_rel.into(),
+            reason: e.to_string(),
         })?;
         if id.is_some_and(|expected| rec.envelope.id != expected) {
             // 同一路径已被另一身份复用；不把新记录状态冒认为旧 ID。
         } else {
-        return Ok(StateTriple {
-            location: Location::Records,
-            version: Some(rec.envelope.version),
-            digest: Some(token::sha256_hex(&bytes)),
-        });
+            return Ok(StateTriple {
+                location: Location::Records,
+                version: Some(rec.envelope.version),
+                digest: Some(token::sha256_hex(&bytes)),
+            });
         }
     }
     let attic = paths::attic_rel(record_rel)?;
     let attic_abs = store.abs(&attic);
     if attic_abs.is_file() {
-        let bytes = std::fs::read(&attic_abs).map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
-        let rec = crate::record::Record::from_bytes(&bytes).map_err(|e| {
-            MemError::Corrupt { path: attic.into(), reason: e.to_string() }
+        let bytes = std::fs::read(&attic_abs)
+            .map_err(|e| MemError::io(attic_abs.display().to_string(), e))?;
+        let rec = crate::record::Record::from_bytes(&bytes).map_err(|e| MemError::Corrupt {
+            path: attic.into(),
+            reason: e.to_string(),
         })?;
         if id.is_some_and(|expected| rec.envelope.id != expected) {
             return Ok(StateTriple::ABSENT);
@@ -167,7 +183,11 @@ pub fn triple_from_event(ev: &Event) -> StateTriple {
         return StateTriple::ABSENT;
     }
     StateTriple {
-        location: if ev.path.starts_with("attic/") { Location::Attic } else { Location::Records },
+        location: if ev.path.starts_with("attic/") {
+            Location::Attic
+        } else {
+            Location::Records
+        },
         version: ev.new_v,
         digest: ev.new_digest.clone(),
     }
@@ -215,7 +235,11 @@ impl<'a> EventLog<'a> {
         let bytes = match std::fs::read(&p) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReadLog { events: Vec::new(), torn_tail: false, good_bytes: 0 })
+                return Ok(ReadLog {
+                    events: Vec::new(),
+                    torn_tail: false,
+                    good_bytes: 0,
+                });
             }
             Err(e) => return Err(MemError::io(p.display().to_string(), e)),
         };
@@ -225,15 +249,28 @@ impl<'a> EventLog<'a> {
         let mut ranges = Vec::new();
         let mut start = 0usize;
         for (i, b) in bytes.iter().enumerate() {
-            if *b == b'\n' { ranges.push((start, i, true)); start = i + 1; }
+            if *b == b'\n' {
+                ranges.push((start, i, true));
+                start = i + 1;
+            }
         }
-        if start < bytes.len() { ranges.push((start, bytes.len(), false)); }
+        if start < bytes.len() {
+            ranges.push((start, bytes.len(), false));
+        }
         let last = ranges.len().saturating_sub(1);
         for (i, (start, end, has_newline)) in ranges.into_iter().enumerate() {
             let line = match std::str::from_utf8(&bytes[start..end]) {
                 Ok(s) => s,
-                Err(_e) if i == last => { torn_tail = true; break; }
-                Err(e) => return Err(MemError::Corrupt { path: "events.jsonl".into(), reason: format!("第 {} 行非 UTF-8：{e}", i + 1) }),
+                Err(_e) if i == last => {
+                    torn_tail = true;
+                    break;
+                }
+                Err(e) => {
+                    return Err(MemError::Corrupt {
+                        path: "events.jsonl".into(),
+                        reason: format!("第 {} 行非 UTF-8：{e}", i + 1),
+                    });
+                }
             };
             let line_end = end + usize::from(has_newline);
             if line.trim().is_empty() {
@@ -252,13 +289,20 @@ impl<'a> EventLog<'a> {
                     } else {
                         return Err(MemError::Corrupt {
                             path: "events.jsonl".into(),
-                            reason: format!("第 {} 行不是合法事件（中部损坏，响亮报告）：{e}", i + 1),
+                            reason: format!(
+                                "第 {} 行不是合法事件（中部损坏，响亮报告）：{e}",
+                                i + 1
+                            ),
                         });
                     }
                 }
             }
         }
-        Ok(ReadLog { events, torn_tail, good_bytes })
+        Ok(ReadLog {
+            events,
+            torn_tail,
+            good_bytes,
+        })
     }
 
     pub fn max_seq(&self) -> MemResult<Seq> {
@@ -287,7 +331,11 @@ impl<'a> EventLog<'a> {
         new_digest: Option<&str>,
         by: &str,
     ) -> MemResult<Event> {
-        let kind = if op == Op::Backfill { Kind::Backfill } else { Kind::Op };
+        let kind = if op == Op::Backfill {
+            Kind::Backfill
+        } else {
+            Kind::Op
+        };
         self.append_raw(
             id,
             path,
@@ -343,18 +391,26 @@ impl<'a> EventLog<'a> {
             }
             let existing = std::fs::read(&p).unwrap_or_default();
             if !existing.is_empty() && !existing.ends_with(b"\n") {
-                let mut boundary = std::fs::OpenOptions::new().append(true).open(&p)
+                let mut boundary = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&p)
                     .map_err(|e| MemError::io(p.display().to_string(), e))?;
-                boundary.write_all(b"\n").map_err(|e| MemError::io(p.display().to_string(), e))?;
-                boundary.sync_all().map_err(|e| MemError::io(p.display().to_string(), e))?;
+                boundary
+                    .write_all(b"\n")
+                    .map_err(|e| MemError::io(p.display().to_string(), e))?;
+                boundary
+                    .sync_all()
+                    .map_err(|e| MemError::io(p.display().to_string(), e))?;
             }
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&p)
                 .map_err(|e| MemError::io(p.display().to_string(), e))?;
-            f.write_all(&line).map_err(|e| MemError::io(p.display().to_string(), e))?;
-            f.sync_all().map_err(|e| MemError::io(p.display().to_string(), e))?;
+            f.write_all(&line)
+                .map_err(|e| MemError::io(p.display().to_string(), e))?;
+            f.sync_all()
+                .map_err(|e| MemError::io(p.display().to_string(), e))?;
             Ok(ev)
         })?
     }
@@ -386,8 +442,7 @@ fn repair_torn_tail(p: &std::path::Path, read: &ReadLog) -> MemResult<()> {
     let bytes = std::fs::read(p).map_err(|e| MemError::io(p.display().to_string(), e))?;
     let cut = read.good_bytes.min(bytes.len());
     if cut < bytes.len() {
-        std::fs::write(p, &bytes[..cut])
-            .map_err(|e| MemError::io(p.display().to_string(), e))?;
+        std::fs::write(p, &bytes[..cut]).map_err(|e| MemError::io(p.display().to_string(), e))?;
     }
     Ok(())
 }
@@ -406,17 +461,23 @@ fn enumerate_md_unchecked(store: &Store, prefix: &str) -> MemResult<Vec<String>>
     let mut out = Vec::new();
     let base = store.abs(prefix);
     if std::fs::symlink_metadata(&base).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(MemError::BadArgument(format!("记录根目录不能是符号链接：{prefix}")));
+        return Err(MemError::BadArgument(format!(
+            "记录根目录不能是符号链接：{prefix}"
+        )));
     }
     if !base.is_dir() {
         return Ok(out);
     }
     fn walk(dir: &std::path::Path, rel_base: &str, out: &mut Vec<String>) -> MemResult<()> {
-        for entry in std::fs::read_dir(dir).map_err(|e| MemError::io(dir.display().to_string(), e))? {
+        for entry in
+            std::fs::read_dir(dir).map_err(|e| MemError::io(dir.display().to_string(), e))?
+        {
             let entry = entry.map_err(|e| MemError::io(dir.display().to_string(), e))?;
             let name = entry.file_name().to_string_lossy().to_string();
             let p = entry.path();
-            let kind = entry.file_type().map_err(|e| MemError::io(p.display().to_string(), e))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| MemError::io(p.display().to_string(), e))?;
             // 不跟随子目录或文件符号链接；否则 ID/别名扫描也能越出所选 store。
             if kind.is_symlink() {
                 continue;
@@ -496,7 +557,11 @@ fn enumerate_candidates_unchecked(store: &Store, log: &ReadLog) -> MemResult<Vec
                 }
             }
         };
-        out.push(Candidate { id, current_path: cur, lock_rel });
+        out.push(Candidate {
+            id,
+            current_path: cur,
+            lock_rel,
+        });
     }
     store.read_compatible_missing_features()?;
     Ok(out)
@@ -522,9 +587,9 @@ pub fn reconcile_backfill(
     pause_hook: Option<PauseHook>,
 ) -> MemResult<BackfillReport> {
     store.check_writable()?;
-    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：写例程核验
     let _barrier = lock::barrier_shared(store)?;
     store.check_compatible_for_write()?;
+    crate::gitattrs::ensure_for_write(store)?; // BD5 ②③：在屏障内完成核验/补种
     reconcile_backfill_locked(store, by, pause_hook)
 }
 
@@ -555,7 +620,10 @@ pub(crate) fn reconcile_backfill_locked(
             hook(&c.id);
         }
         let appended = with_sequence_recheck(
-            store, &c, by, &mut report.warnings,
+            store,
+            &c,
+            by,
+            &mut report.warnings,
             log.torn_tail && index + 1 == candidate_count,
         )?;
         match appended {
@@ -641,8 +709,13 @@ fn with_sequence_recheck(
         }
         let existing = std::fs::read(&p).unwrap_or_default();
         if !existing.is_empty() && !existing.ends_with(b"\n") {
-            std::fs::OpenOptions::new().append(true).open(&p)
-                .and_then(|mut f| { f.write_all(b"\n")?; f.sync_all() })
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&p)
+                .and_then(|mut f| {
+                    f.write_all(b"\n")?;
+                    f.sync_all()
+                })
                 .map_err(|e| MemError::io(p.display().to_string(), e))?;
         }
         let mut f = std::fs::OpenOptions::new()
@@ -650,9 +723,11 @@ fn with_sequence_recheck(
             .append(true)
             .open(&p)
             .map_err(|e| MemError::io(p.display().to_string(), e))?;
-        f.write_all(&line).map_err(|e| MemError::io(p.display().to_string(), e))?;
-        f.sync_all().map_err(|e| MemError::io(p.display().to_string(), e))?;
-    Ok(Some(ev))
+        f.write_all(&line)
+            .map_err(|e| MemError::io(p.display().to_string(), e))?;
+        f.sync_all()
+            .map_err(|e| MemError::io(p.display().to_string(), e))?;
+        Ok(Some(ev))
     })?
 }
 
@@ -664,7 +739,11 @@ pub fn current_path_for_id(store: &Store, record_rel: &str, id: &str) -> MemResu
     result
 }
 
-fn current_path_for_id_unchecked(store: &Store, record_rel: &str, id: &str) -> MemResult<Option<String>> {
+fn current_path_for_id_unchecked(
+    store: &Store,
+    record_rel: &str,
+    id: &str,
+) -> MemResult<Option<String>> {
     let rec_abs = store.abs(record_rel);
     if rec_abs.is_file() {
         if let Ok(bytes) = std::fs::read(&rec_abs) {
@@ -734,14 +813,32 @@ mod r15_tail_tests {
     }
 
     fn add(log: &EventLog<'_>, id: &str) {
-        log.append_simple(id, "records/task/a.md", Op::Create, None, Some(1), None, Some("d"), "test").unwrap();
+        log.append_simple(
+            id,
+            "records/task/a.md",
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some("d"),
+            "test",
+        )
+        .unwrap();
     }
 
     fn record_bytes(id: &str, title: &str) -> Vec<u8> {
         let env = crate::envelope::Envelope {
-            id: id.into(), r#type: "topic".into(), created: "2026-11-01T00:00:00Z".into(),
-            modified: "2026-11-01T00:00:00Z".into(), version: 1, principal: None,
-            refs: vec![], aliases: vec![], evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+            id: id.into(),
+            r#type: "topic".into(),
+            created: "2026-11-01T00:00:00Z".into(),
+            modified: "2026-11-01T00:00:00Z".into(),
+            version: 1,
+            principal: None,
+            refs: vec![],
+            aliases: vec![],
+            evidence_cutoff_seq: None,
+            commit: None,
+            extra: Default::default(),
         };
         crate::record::serialize_new(&env, &serde_json::json!({"title":title}), b"")
     }
@@ -772,7 +869,15 @@ mod r15_tail_tests {
         b.extend_from_slice(b"{\"by\":\"\xe4\xb8");
         std::fs::write(&p, b).unwrap();
         add(&log, "b");
-        assert_eq!(log.read_log().unwrap().events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            log.read_log()
+                .unwrap()
+                .events
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let valid = std::fs::read(&p).unwrap();
         let split = valid.iter().position(|b| *b == b'\n').unwrap();
         let mut bad = valid[..=split].to_vec();
@@ -794,19 +899,63 @@ mod r15_tail_tests {
         let b_state = current_state_for_id(&store, rel, Some("id-b")).unwrap();
         assert_eq!(a_state.location, Location::Attic);
         assert_eq!(b_state.location, Location::Records);
-        let ca = Candidate { id: "id-a".into(), current_path: Some(attic.into()), lock_rel: rel.into() };
-        let cb = Candidate { id: "id-b".into(), current_path: Some(rel.into()), lock_rel: rel.into() };
-        assert_eq!(current_path_of(&store, &ca).unwrap().as_deref(), Some(attic));
+        let ca = Candidate {
+            id: "id-a".into(),
+            current_path: Some(attic.into()),
+            lock_rel: rel.into(),
+        };
+        let cb = Candidate {
+            id: "id-b".into(),
+            current_path: Some(rel.into()),
+            lock_rel: rel.into(),
+        };
+        assert_eq!(
+            current_path_of(&store, &ca).unwrap().as_deref(),
+            Some(attic)
+        );
         assert_eq!(current_path_of(&store, &cb).unwrap().as_deref(), Some(rel));
         let digest_a = token::sha256_hex(&record_bytes("id-a", "A"));
         let digest_b = token::sha256_hex(&record_bytes("id-b", "B"));
         let log = EventLog::new(&store);
-        log.append_simple("id-a", rel, Op::Create, None, Some(1), None, Some(&digest_a), "test").unwrap();
-        log.append_simple("id-a", attic, Op::Delete, Some(1), Some(1), Some(&digest_a), Some(&digest_a), "test").unwrap();
-        log.append_simple("id-b", rel, Op::Create, None, Some(1), None, Some(&digest_b), "test").unwrap();
+        log.append_simple(
+            "id-a",
+            rel,
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some(&digest_a),
+            "test",
+        )
+        .unwrap();
+        log.append_simple(
+            "id-a",
+            attic,
+            Op::Delete,
+            Some(1),
+            Some(1),
+            Some(&digest_a),
+            Some(&digest_a),
+            "test",
+        )
+        .unwrap();
+        log.append_simple(
+            "id-b",
+            rel,
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some(&digest_b),
+            "test",
+        )
+        .unwrap();
         let before = log.read_log().unwrap().events.len();
         let reconciled = reconcile_backfill(&store, "test", None).unwrap();
-        assert!(reconciled.appended.is_empty(), "稳定的 A/B 状态不应被错误回填");
+        assert!(
+            reconciled.appended.is_empty(),
+            "稳定的 A/B 状态不应被错误回填"
+        );
         assert_eq!(log.read_log().unwrap().events.len(), before);
     }
 }
@@ -887,7 +1036,10 @@ mod r11_op_tests {
         let ev: Event = serde_json::from_str(&ev_line("restore_body")).unwrap();
         assert_eq!(ev.op, Op::RestoreBody);
         let line = String::from_utf8(ev.to_line()).unwrap();
-        assert!(line.contains("\"restore_body\""), "序列化往返保操作名：{line}");
+        assert!(
+            line.contains("\"restore_body\""),
+            "序列化往返保操作名：{line}"
+        );
         assert_eq!(Op::RestoreBody.to_string(), "restore_body");
     }
 
@@ -905,14 +1057,30 @@ mod r11_op_tests {
         // 兜底事件保留 old_v/new_v → 版本链经其推进，不断裂（不伪造空洞）。
         let events = vec![
             Event {
-                seq: 1, ts: "t".into(), id: "i".into(), path: "records/x.md".into(),
-                op: Op::Create, old_v: None, new_v: Some(1),
-                old_digest: None, new_digest: Some("d1".into()), by: "m".into(), kind: Kind::Op,
+                seq: 1,
+                ts: "t".into(),
+                id: "i".into(),
+                path: "records/x.md".into(),
+                op: Op::Create,
+                old_v: None,
+                new_v: Some(1),
+                old_digest: None,
+                new_digest: Some("d1".into()),
+                by: "m".into(),
+                kind: Kind::Op,
             },
             Event {
-                seq: 2, ts: "t".into(), id: "i".into(), path: "records/x.md".into(),
-                op: Op::Unknown, old_v: Some(1), new_v: Some(2),
-                old_digest: Some("d1".into()), new_digest: Some("d2".into()), by: "m".into(), kind: Kind::Op,
+                seq: 2,
+                ts: "t".into(),
+                id: "i".into(),
+                path: "records/x.md".into(),
+                op: Op::Unknown,
+                old_v: Some(1),
+                new_v: Some(2),
+                old_digest: Some("d1".into()),
+                new_digest: Some("d2".into()),
+                by: "m".into(),
+                kind: Kind::Op,
             },
         ];
         assert!(chain_audit(&events).is_empty(), "未知操作值不断言为空洞");

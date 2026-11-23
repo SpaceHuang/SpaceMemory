@@ -72,6 +72,7 @@ Index::open_store_readonly(store: &Store) -> MemResult<Index>
 | CAS 令牌 | `mem_core::token::Token` | 使用完整摘要；冲突 `MemError::Conflict` 携带当前令牌。 |
 | 初始化租约 | `Store::{acquire_init_lock, create_under_init_lock}` 与 `InitPermit` | 许可不可伪造且绑定目标路径；CLI 在播种和自举前持有同一许可。`create` 是单步封装。 |
 | 维护许可与索引 | `Store::acquire_index_maintenance`、`Index::{open_store, open_store_under_maintenance}` | 店索引创建须先验证磁盘兼容性并持有独占维护许可；已持许可路径传递同一许可，避免锁重入。只读打开使用 `open_store_readonly`。 |
+| 维护对账 | `sidecar::reconcile_under_maintenance` | 返回 `(backfill_report, pending_retried, index_rebuilt, checkpoint_saved)`。`index_rebuilt` 只表示本次是否执行索引物化；`checkpoint_saved` 只表示新鲜度证据允许发布了检查点。没有订阅证据时可出现 `true, false`，调用方不得把未保存检查点误报成索引未重建。维护许可必须属于传入的同一物理店，且在回填、pending 重试和索引写入前检查 `.gitattributes` 字节直通规则。 |
 | 事件查询 | `mem_core::event::EventLog::read_log` | 只读历史读取；修复/回填通过受管写入口执行。 |
 | MCP 工具 | `mem_mcp::tools::tool_definitions()` | 运行时工具表是唯一来源，随候选提交固定。 |
 

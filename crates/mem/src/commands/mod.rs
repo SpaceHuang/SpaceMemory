@@ -7,11 +7,11 @@ use std::io::Read;
 
 use mem_core::error::{MemError, MemResult};
 use mem_core::event::EventLog;
+use mem_core::ops::CommitSink;
 use mem_core::ops::{self, WriteContext};
 use mem_core::session;
 use mem_core::store::{OpenMode, Store};
 use mem_core::token::Token;
-use mem_core::ops::CommitSink;
 use mem_git::GitProcess;
 use mem_schema::TypeSet;
 
@@ -21,13 +21,19 @@ pub fn dispatch(cli: &Cli) -> Result<i32, String> {
     match run(cli) {
         Ok(code) => Ok(code),
         Err(e @ MemError::Conflict { .. }) => {
-            eprintln!("{}", serde_json::json!({ "error": e.to_string(), "conflict": true }));
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": e.to_string(), "conflict": true })
+            );
             Ok(2) // 冲突是独立退出码（一等结果，D3）
         }
         // 检索/过滤参数的显式拒收（R10 §2.7：4 枚机判 kind）——非零退出 + JSON
         // 错误体携带 kind（与 MCP JSON-RPC error 的 data.kind 同码）。
         Err(e) if e.param_kind().is_some() => {
-            eprintln!("{}", serde_json::json!({ "error": e.to_string(), "kind": e.param_kind() }));
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": e.to_string(), "kind": e.param_kind() })
+            );
             Ok(1)
         }
         Err(e) => Err(e.to_string()),
@@ -36,7 +42,11 @@ pub fn dispatch(cli: &Cli) -> Result<i32, String> {
 
 fn run(cli: &Cli) -> MemResult<i32> {
     match &cli.cmd {
-        Cmd::Init { path, template_dir, principal } => {
+        Cmd::Init {
+            path,
+            template_dir,
+            principal,
+        } => {
             cmd_init(path, template_dir.as_deref(), principal)?;
             Ok(0)
         }
@@ -60,12 +70,28 @@ fn run(cli: &Cli) -> MemResult<i32> {
             match cmd {
                 Cmd::Init { .. } => unreachable!(),
                 Cmd::Migrate { .. } => unreachable!(),
-                Cmd::Brief { view, principal, since, offset } => {
-                    cmd_brief(&store, view.as_deref(), principal.as_deref(), *since, *offset)?;
+                Cmd::Brief {
+                    view,
+                    principal,
+                    since,
+                    offset,
+                } => {
+                    cmd_brief(
+                        &store,
+                        view.as_deref(),
+                        principal.as_deref(),
+                        *since,
+                        *offset,
+                    )?;
                     Ok(0)
                 }
                 Cmd::Session { sub } => match sub {
-                    SessionCmd::Start { view, principal, task_ref, handoff } => {
+                    SessionCmd::Start {
+                        view,
+                        principal,
+                        task_ref,
+                        handoff,
+                    } => {
                         cmd_session_start(
                             &store,
                             &types,
@@ -85,23 +111,59 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     cmd_reconcile(&store, *deep)?;
                     Ok(0)
                 }
-                Cmd::List { view, type_filter, filters, limit, offset } => {
-                    cmd_list(&store, &types, view.as_deref(), type_filter.as_deref(), filters, *limit, *offset)?;
+                Cmd::List {
+                    view,
+                    type_filter,
+                    filters,
+                    limit,
+                    offset,
+                } => {
+                    cmd_list(
+                        &store,
+                        &types,
+                        view.as_deref(),
+                        type_filter.as_deref(),
+                        filters,
+                        *limit,
+                        *offset,
+                    )?;
                     Ok(0)
                 }
-                Cmd::Find { query, filters, limit, offset } => {
+                Cmd::Find {
+                    query,
+                    filters,
+                    limit,
+                    offset,
+                } => {
                     cmd_find(&store, &types, query, filters, *limit, *offset)?;
                     Ok(0)
                 }
-                Cmd::Show { id, body, body_offset, body_out } => {
+                Cmd::Show {
+                    id,
+                    body,
+                    body_offset,
+                    body_out,
+                } => {
                     cmd_show(&store, id, *body, *body_offset, body_out.as_deref())?;
                     Ok(0)
                 }
-                Cmd::Trace { id, dir, depth, limit, skip } => {
+                Cmd::Trace {
+                    id,
+                    dir,
+                    depth,
+                    limit,
+                    skip,
+                } => {
                     cmd_trace(&store, id, dir, *depth, *limit, *skip)?;
                     Ok(0)
                 }
-                Cmd::Add { type_name, payload, body, principal, session: sess } => {
+                Cmd::Add {
+                    type_name,
+                    payload,
+                    body,
+                    principal,
+                    session: sess,
+                } => {
                     cmd_add(
                         &store,
                         &types,
@@ -113,7 +175,13 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     )?;
                     Ok(0)
                 }
-                Cmd::Update { id, expect, payload, body_file, session: sess } => {
+                Cmd::Update {
+                    id,
+                    expect,
+                    payload,
+                    body_file,
+                    session: sess,
+                } => {
                     cmd_update(
                         &store,
                         &types,
@@ -125,11 +193,22 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     )?;
                     Ok(0)
                 }
-                Cmd::Link { a, b, rel, expect_a, expect_b } => {
+                Cmd::Link {
+                    a,
+                    b,
+                    rel,
+                    expect_a,
+                    expect_b,
+                } => {
                     cmd_link(&store, &types, a, b, rel, expect_a, expect_b)?;
                     Ok(0)
                 }
-                Cmd::Merge { dup, canonical, expect_dup, expect_canonical } => {
+                Cmd::Merge {
+                    dup,
+                    canonical,
+                    expect_dup,
+                    expect_canonical,
+                } => {
                     cmd_merge(&store, &types, dup, canonical, expect_dup, expect_canonical)?;
                     Ok(0)
                 }
@@ -160,9 +239,9 @@ fn run(cli: &Cli) -> MemResult<i32> {
                         && filter.types.len() == 1;
                     let limit_n = mem_core::budget::effective_limit(&store, *limit);
                     let fast = match (&index, can_index) {
-                        (Some(idx), true) => {
-                            idx.query_by_type(&filter.types[0], limit_n, offset.unwrap_or(0)).ok()
-                        }
+                        (Some(idx), true) => idx
+                            .query_by_type(&filter.types[0], limit_n, offset.unwrap_or(0))
+                            .ok(),
                         _ => None,
                     };
                     match fast {
@@ -171,9 +250,15 @@ fn run(cli: &Cli) -> MemResult<i32> {
                             // 时不报错（索引永不 gate 正确性，红线8；可丢弃缓存不
                             // 得成为读命令单点故障），放弃快路径、**重新执行直读并
                             // 返回直读结果**（read_mode 如实标 direct + reason）。
-                            let direct = mem_core::view::execute_from(&store, id, limit_n, offset.unwrap_or(0))?;
+                            let direct = mem_core::view::execute_from(
+                                &store,
+                                id,
+                                limit_n,
+                                offset.unwrap_or(0),
+                            )?;
                             let fast_ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
-                            let direct_ids: Vec<_> = direct.items.iter().map(|i| i.envelope.id.clone()).collect();
+                            let direct_ids: Vec<_> =
+                                direct.items.iter().map(|i| i.envelope.id.clone()).collect();
                             if fast_ids == direct_ids {
                                 out_json(&serde_json::json!({
                                     "read_mode": mode,
@@ -196,7 +281,12 @@ fn run(cli: &Cli) -> MemResult<i32> {
                             }
                         }
                         None => {
-                            let r = mem_core::view::execute_from(&store, id, limit_n, offset.unwrap_or(0))?;
+                            let r = mem_core::view::execute_from(
+                                &store,
+                                id,
+                                limit_n,
+                                offset.unwrap_or(0),
+                            )?;
                             out_json(&serde_json::json!({
                                 "read_mode": mode,
                                 "items": r.items.iter().map(|i| serde_json::json!({
@@ -226,8 +316,20 @@ fn run(cli: &Cli) -> MemResult<i32> {
                     cmd_apply(&store, &types, plan_id)?;
                     Ok(0)
                 }
-                Cmd::Fix { id, envelope, payload, expect } => {
-                    cmd_fix(&store, &types, id, envelope.as_deref(), payload.as_deref(), expect.as_deref())?;
+                Cmd::Fix {
+                    id,
+                    envelope,
+                    payload,
+                    expect,
+                } => {
+                    cmd_fix(
+                        &store,
+                        &types,
+                        id,
+                        envelope.as_deref(),
+                        payload.as_deref(),
+                        expect.as_deref(),
+                    )?;
                     Ok(0)
                 }
                 Cmd::RestoreBody { id, expect, source } => {
@@ -279,7 +381,10 @@ mod store_root_tests {
         );
         unsafe { std::env::remove_var("MEM_STORE") };
         let r = store_root_or_default(None);
-        assert!(r.ends_with(".agent-memory"), "缺省 = 用户级数据目录，实际 {r:?}");
+        assert!(
+            r.ends_with(".agent-memory"),
+            "缺省 = 用户级数据目录，实际 {r:?}"
+        );
     }
 }
 
@@ -325,7 +430,10 @@ fn resolve_principal(store: &Store, id_or_slug: &str) -> MemResult<String> {
 }
 
 fn out_json(v: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(v).expect("JSON 输出不会失败"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("JSON 输出不会失败")
+    );
 }
 
 fn read_body(spec: Option<&str>) -> MemResult<Vec<u8>> {
@@ -338,8 +446,9 @@ fn read_body(spec: Option<&str>) -> MemResult<Vec<u8>> {
                 .map_err(|e| MemError::BadArgument(format!("stdin 读取失败：{e}")))?;
             Ok(buf)
         }
-        Some(p) => std::fs::read(p)
-            .map_err(|e| MemError::BadArgument(format!("正文文件 {p} 不可读：{e}"))),
+        Some(p) => {
+            std::fs::read(p).map_err(|e| MemError::BadArgument(format!("正文文件 {p} 不可读：{e}")))
+        }
     }
 }
 
@@ -359,12 +468,11 @@ fn cmd_init(
     // r14 发布准备：查找逻辑单源下沉 mem_assets::resolve_seed_files——
     // 模板覆盖 > exe 旁 builtin-types/ > Homebrew share 布局 > 内嵌字节
     //（packaging.md §2 清单第 4/3 项；share 布局覆盖 Homebrew 安装根）。
-    let exe_dir =
-        std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.to_path_buf()));
-    let seed = mem_assets::resolve_seed_files(
-        template_dir.map(std::path::Path::new),
-        exe_dir.as_deref(),
-    );
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()));
+    let seed =
+        mem_assets::resolve_seed_files(template_dir.map(std::path::Path::new), exe_dir.as_deref());
     let (asset_source, template_dir_used): (&str, Option<String>) = match &seed.origin {
         mem_assets::SeedOrigin::External(d) => ("external", Some(d.display().to_string())),
         mem_assets::SeedOrigin::Embedded => ("embedded", None),
@@ -389,13 +497,22 @@ fn cmd_init(
         let _ = std::process::Command::new("git")
             .arg("-C")
             .arg(path)
-            .args(["-c", "user.name=mem", "-c", "user.email=mem@local", "add", "-A"])
+            .args([
+                "-c",
+                "user.name=mem",
+                "-c",
+                "user.email=mem@local",
+                "add",
+                "-A",
+            ])
             .output();
     }
     // 自举首条 principal（经类型声明引入，红线12/13）。
     let store = Store::open_under_init_lock(path, OpenMode::Auto, &init_permit)?;
     let types = load_types(&store)?;
-    let ctx = WriteContext::new(&store, &types, "mem init").with_committer(None).with_session_id(None);
+    let ctx = WriteContext::new(&store, &types, "mem init")
+        .with_committer(None)
+        .with_session_id(None);
     // 自举载荷来自播种数据（红线1：类型字段含义在数据，不在代码）；
     // 机制只覆写唯一键推导必须知道的两个名字字段（slug/label）。
     let mut payload: serde_json::Value = serde_json::from_slice(
@@ -413,11 +530,20 @@ fn cmd_init(
     payload["slug"] = serde_json::Value::String(principal_label.to_string());
     payload["label"] = serde_json::Value::String(principal_label.to_string());
     if payload.get("host").map(|v| v.is_null()).unwrap_or(true) {
-        payload["host"] = serde_json::json!(std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok());
+        payload["host"] = serde_json::json!(
+            std::env::var("COMPUTERNAME")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .ok()
+        );
     }
     let _ = ops::add(
         &ctx,
-        ops::AddArgs { type_name: "principal".into(), payload, body: Vec::new(), principal: None },
+        ops::AddArgs {
+            type_name: "principal".into(),
+            payload,
+            body: Vec::new(),
+            principal: None,
+        },
     )?;
     Store::finish_cli_init(path, &init_permit)?;
     out_json(&serde_json::json!({
@@ -450,7 +576,11 @@ fn cmd_brief(
     let (ledgers, _) = session::scan_ledgers(store)?;
     let identity = ledgers
         .iter()
-        .filter(|l| principal.map(|p| l.principal == p || l.principal.contains(p)).unwrap_or(true))
+        .filter(|l| {
+            principal
+                .map(|p| l.principal == p || l.principal.contains(p))
+                .unwrap_or(true)
+        })
         .max_by(|a, b| a.last_write.cmp(&b.last_write))
         .map(|l| {
             serde_json::json!({
@@ -460,19 +590,29 @@ fn cmd_brief(
         });
     // 视图：显式参数 > mem.json 缺省视图指针（显式声明，红线11） > 全库最近。
     let cfg = store.config();
-    let view_ref = view
-        .map(String::from)
-        .or_else(|| cfg.extra.get("default_view").and_then(|v| v.as_str()).map(String::from));
+    let view_ref = view.map(String::from).or_else(|| {
+        cfg.extra
+            .get("default_view")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
     let (mut items, mut truncated) = match view_ref {
         Some(v) => {
-            let r = mem_core::view::execute_from(store, &v, cfg.budgets.brief_items as usize, offset.unwrap_or(0))?;
+            let r = mem_core::view::execute_from(
+                store,
+                &v,
+                cfg.budgets.brief_items as usize,
+                offset.unwrap_or(0),
+            )?;
             let t = r.truncated;
             (brief_items(r), t)
         }
         None => {
             // 快路径：无视图参数 = 全库最近 N 条 → 索引 query_all；不可用则直读。
             let budget = cfg.budgets.brief_items as usize;
-            let fast = index.as_ref().and_then(|idx| idx.query_all(budget, offset.unwrap_or(0)).ok());
+            let fast = index
+                .as_ref()
+                .and_then(|idx| idx.query_all(budget, offset.unwrap_or(0)).ok());
             match fast {
                 Some(rows) => (
                     rows.iter()
@@ -488,7 +628,12 @@ fn cmd_brief(
                 ),
                 None => {
                     let filter = mem_core::view::ViewFilter::default();
-                    let r = mem_core::view::execute_filter(store, &filter, budget, offset.unwrap_or(0))?;
+                    let r = mem_core::view::execute_filter(
+                        store,
+                        &filter,
+                        budget,
+                        offset.unwrap_or(0),
+                    )?;
                     let t = r.truncated;
                     (brief_items(r), t)
                 }
@@ -623,30 +768,30 @@ fn cmd_session_flush(store: &Store, session_id: &str, trail: Vec<String>) -> Mem
 fn cmd_reconcile(store: &Store, deep: bool) -> MemResult<()> {
     let permit = store.acquire_index_maintenance()?;
     let sink = sink_for(store);
-    let (report, retried, index_rebuilt) = mem_core::sidecar::reconcile_under_maintenance(
-        store,
-        &permit,
-        Some(&|store, permit| {
-            let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
-            let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
-            idx.set_body_texts_under_maintenance(permit)?;
-            Ok(mem_core::freshness::MaintainOutcome {
-                index_epoch: idx.epoch()?,
-                scan_entries,
-            })
-        }),
-        || {
-            let mut retried = 0;
-            for (path, pc) in ops::list_pending_commits(store)? {
-                if sink.commit(&pc.paths).is_ok() {
-                    std::fs::remove_file(&path)
-                        .map_err(|e| MemError::io(path.clone(), e))?;
-                    retried += 1;
+    let (report, retried, index_rebuilt, checkpoint_saved) =
+        mem_core::sidecar::reconcile_under_maintenance(
+            store,
+            &permit,
+            Some(&|store, permit| {
+                let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
+                let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
+                idx.set_body_texts_under_maintenance(permit)?;
+                Ok(mem_core::freshness::MaintainOutcome {
+                    index_epoch: idx.epoch()?,
+                    scan_entries,
+                })
+            }),
+            || {
+                let mut retried = 0;
+                for (path, pc) in ops::list_pending_commits(store)? {
+                    if sink.commit(&pc.paths).is_ok() {
+                        std::fs::remove_file(&path).map_err(|e| MemError::io(path.clone(), e))?;
+                        retried += 1;
+                    }
                 }
-            }
-            Ok(retried)
-        },
-    )?;
+                Ok(retried)
+            },
+        )?;
     // --deep：全量内容摘要核对（维护审计）。
     let mut deep_report = serde_json::Value::Null;
     if deep {
@@ -663,7 +808,7 @@ fn cmd_reconcile(store: &Store, deep: bool) -> MemResult<()> {
         "warnings": report.warnings,
         "pending_commits_retried": retried,
         "index_rebuilt": index_rebuilt,
-        "checkpoint_saved": false,
+        "checkpoint_saved": checkpoint_saved,
         "checkpoint_note": "检查点仅由 sidecar 收敛原语发布（r4 H2/B3）",
         "deep": deep_report,
     }));
@@ -743,7 +888,10 @@ fn cmd_list(
     let prefilter = if vf.is_some() {
         None
     } else {
-        proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter)
+        proved
+            .index
+            .as_ref()
+            .map(|p| p as &dyn mem_core::find::FindPrefilter)
     };
     let outcome = mem_core::find::execute(mem_core::find::FindParams {
         store,
@@ -801,7 +949,10 @@ fn cmd_find(
         limit,
         offset,
         mode: proved.mode,
-        prefilter: proved.index.as_ref().map(|p| p as &dyn mem_core::find::FindPrefilter),
+        prefilter: proved
+            .index
+            .as_ref()
+            .map(|p| p as &dyn mem_core::find::FindPrefilter),
     })?;
     out_json(&serde_json::json!({
         "read_mode": outcome.mode,
@@ -846,12 +997,9 @@ fn cmd_show(
         // 字节经文件交付 / --no-body：stdout 不重复正文。
         (serde_json::Value::Null, false, serde_json::Value::Null)
     } else if body_utf8 {
-        let (text, truncated, next_off) = mem_core::body::body_page_text(
-            &hit.record.body,
-            body_offset.unwrap_or(0),
-            budget,
-        )
-        .expect("合法 UTF-8 正文必有文本通道");
+        let (text, truncated, next_off) =
+            mem_core::body::body_page_text(&hit.record.body, body_offset.unwrap_or(0), budget)
+                .expect("合法 UTF-8 正文必有文本通道");
         let resume = if truncated {
             serde_json::json!({ "body_offset": next_off })
         } else {
@@ -932,7 +1080,9 @@ fn cmd_trace(
         "up" => mem_core::refgraph::TraceDirection::Up,
         "down" => mem_core::refgraph::TraceDirection::Down,
         other => {
-            return Err(MemError::BadArgument(format!("--dir 只接受 up|down，实际 {other}")))
+            return Err(MemError::BadArgument(format!(
+                "--dir 只接受 up|down，实际 {other}"
+            )));
         }
     };
     let skip_n = skip.unwrap_or(0);
@@ -999,7 +1149,13 @@ fn write_ctx<'a>(
         .flatten()
         .map(|l| l.principal)
         .unwrap_or_default();
-    WriteContext::new(store, types, format!("{principal_label}(cli)")).with_committer(if store.root().join(".git").exists() { Some(&CliSink) } else { None }).with_session_id(session_id)
+    WriteContext::new(store, types, format!("{principal_label}(cli)"))
+        .with_committer(if store.root().join(".git").exists() {
+            Some(&CliSink)
+        } else {
+            None
+        })
+        .with_session_id(session_id)
 }
 
 /// CLI 写命令的提交汇（经 open_store 时登记的 CURRENT_STORE 定位店根）。
@@ -1009,8 +1165,6 @@ impl CommitSink for CliSink {
         sink_for_current().commit(paths)
     }
 }
-
-
 
 static CURRENT_STORE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 fn sink_for_current() -> GitProcess {
@@ -1067,7 +1221,11 @@ fn cmd_update(
     let payload_v: serde_json::Value = serde_json::from_str(payload)
         .map_err(|e| MemError::BadArgument(format!("--payload 不是合法 JSON：{e}")))?;
     let expect_t = parse_token(expect)?;
-    let body = if body_file.is_some() { Some(read_body(body_file)?) } else { None };
+    let body = if body_file.is_some() {
+        Some(read_body(body_file)?)
+    } else {
+        None
+    };
     let ctx = write_ctx(store, types, session_id);
     let out = ops::update(&ctx, id, &expect_t, payload_v, body)?;
     out_json(&serde_json::json!({
@@ -1090,7 +1248,14 @@ fn cmd_link(
     expect_b: &str,
 ) -> MemResult<()> {
     let ctx = write_ctx(store, types, None);
-    let (ta, tb) = ops::link(&ctx, a, b, rel, &parse_token(expect_a)?, &parse_token(expect_b)?)?;
+    let (ta, tb) = ops::link(
+        &ctx,
+        a,
+        b,
+        rel,
+        &parse_token(expect_a)?,
+        &parse_token(expect_b)?,
+    )?;
     out_json(&serde_json::json!({ "a_token": ta.to_string(), "b_token": tb.to_string() }));
     Ok(())
 }
@@ -1118,7 +1283,13 @@ fn cmd_merge(
     Ok(())
 }
 
-fn cmd_delete(store: &Store, types: &TypeSet, id: &str, expect: &str, force: bool) -> MemResult<()> {
+fn cmd_delete(
+    store: &Store,
+    types: &TypeSet,
+    id: &str,
+    expect: &str,
+    force: bool,
+) -> MemResult<()> {
     let ctx = write_ctx(store, types, None);
     let d = ops::delete_record(&ctx, id, &parse_token(expect)?, force)?;
     out_json(&serde_json::json!({ "tombstone": d.rel, "warnings": d.warnings }));
@@ -1181,7 +1352,10 @@ fn cmd_bind(store: &Store, view: &str) -> MemResult<()> {
     if v.record.envelope.r#type != "view" {
         return Err(MemError::BadArgument(format!("{view} 不是 view 记录")));
     }
-    store.set_config_value("default_view", serde_json::Value::String(v.record.envelope.id.clone()))?;
+    store.set_config_value(
+        "default_view",
+        serde_json::Value::String(v.record.envelope.id.clone()),
+    )?;
     out_json(&serde_json::json!({ "default_view": v.record.envelope.id }));
     Ok(())
 }
@@ -1204,8 +1378,11 @@ fn cmd_agenda(store: &Store, types: &TypeSet, scan: bool) -> MemResult<()> {
 
 fn cmd_apply(store: &Store, types: &TypeSet, plan_id: &str) -> MemResult<()> {
     let sink = sink_for(store);
-    let committer: Option<&dyn mem_core::ops::CommitSink> =
-        if store.root().join(".git").exists() { Some(&sink) } else { None };
+    let committer: Option<&dyn mem_core::ops::CommitSink> = if store.root().join(".git").exists() {
+        Some(&sink)
+    } else {
+        None
+    };
     let r = mem_core::agenda::apply(store, types, plan_id, committer)?;
     out_json(&serde_json::json!({
         "plan": plan_id,
@@ -1228,29 +1405,39 @@ fn cmd_fix(
     let provided = match (envelope, payload) {
         (None, None) => None,
         _ => {
-            let env_v: serde_json::Value = serde_json::from_str(
-                envelope.ok_or_else(|| {
-                    MemError::BadArgument("fix 需要 --envelope 与 --payload 成对提供".into())
-                })?,
-            )
+            let env_v: serde_json::Value = serde_json::from_str(envelope.ok_or_else(|| {
+                MemError::BadArgument("fix 需要 --envelope 与 --payload 成对提供".into())
+            })?)
             .map_err(|e| MemError::BadArgument(format!("--envelope 不是合法 JSON：{e}")))?;
-            let env = mem_core::envelope::Envelope::from_json(&env_v)
-                .map_err(|reason| MemError::EnvelopeInvalid { path: id.into(), reason })?;
-            let payload_v: serde_json::Value = serde_json::from_str(
-                payload.ok_or_else(|| {
-                    MemError::BadArgument("fix 需要 --envelope 与 --payload 成对提供".into())
-                })?,
-            )
+            let env = mem_core::envelope::Envelope::from_json(&env_v).map_err(|reason| {
+                MemError::EnvelopeInvalid {
+                    path: id.into(),
+                    reason,
+                }
+            })?;
+            let payload_v: serde_json::Value = serde_json::from_str(payload.ok_or_else(|| {
+                MemError::BadArgument("fix 需要 --envelope 与 --payload 成对提供".into())
+            })?)
             .map_err(|e| MemError::BadArgument(format!("--payload 不是合法 JSON：{e}")))?;
             Some((env, payload_v))
         }
     };
     let expect_t = expect.map(parse_token).transpose()?;
     // B1：fix 修复版本与事件同批入史（有 .git 才挂提交汇——无 git 形态合法，红线10）。
-    let committer: Option<&dyn mem_core::ops::CommitSink> =
-        if store.root().join(".git").exists() { Some(&git) } else { None };
-    let out =
-        mem_core::ops::fix_record(store, types, id, Some(&git), provided, expect_t.as_ref(), committer)?;
+    let committer: Option<&dyn mem_core::ops::CommitSink> = if store.root().join(".git").exists() {
+        Some(&git)
+    } else {
+        None
+    };
+    let out = mem_core::ops::fix_record(
+        store,
+        types,
+        id,
+        Some(&git),
+        provided,
+        expect_t.as_ref(),
+        committer,
+    )?;
     out_json(&serde_json::json!({
         "rel": out.rel,
         "id": out.record.envelope.id,
@@ -1290,15 +1477,23 @@ fn parse_restore_source(spec: &str) -> MemResult<ops::RestoreSource> {
     }
     if let Some(rev) = spec.strip_prefix("git:") {
         if rev.is_empty() {
-            return Err(MemError::BadArgument("git: 源缺版本号（git:<版本>）".into()));
+            return Err(MemError::BadArgument(
+                "git: 源缺版本号（git:<版本>）".into(),
+            ));
         }
-        return Ok(ops::RestoreSource::Git { rev: rev.to_string() });
+        return Ok(ops::RestoreSource::Git {
+            rev: rev.to_string(),
+        });
     }
     if let Some(p) = spec.strip_prefix("file:") {
         if p.is_empty() {
-            return Err(MemError::BadArgument("file: 源缺路径（file:<店外路径>）".into()));
+            return Err(MemError::BadArgument(
+                "file: 源缺路径（file:<店外路径>）".into(),
+            ));
         }
-        return Ok(ops::RestoreSource::File { path: std::path::PathBuf::from(p) });
+        return Ok(ops::RestoreSource::File {
+            path: std::path::PathBuf::from(p),
+        });
     }
     Err(MemError::BadArgument(format!(
         "--source 必须为 git:<版本> | file:<店外路径> | history，实际 {spec:?}"
@@ -1311,8 +1506,11 @@ fn cmd_verify(store: &Store, types: &TypeSet, deep: bool) -> MemResult<()> {
     let holes = mem_core::event::chain_audit(&log.events);
     // 断链注记（悬空引用：R3.4 显式报告语义；引用按 ID，D11）。
     let mut dangling = Vec::new();
-    let ids: std::collections::HashSet<_> =
-        scan.records.iter().map(|r| r.record.envelope.id.clone()).collect();
+    let ids: std::collections::HashSet<_> = scan
+        .records
+        .iter()
+        .map(|r| r.record.envelope.id.clone())
+        .collect();
     for r in &scan.records {
         for e in &r.record.envelope.refs {
             if !ids.contains(&e.target) {

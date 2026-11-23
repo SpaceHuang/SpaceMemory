@@ -41,8 +41,12 @@ pub struct RefRow {
 
 pub struct Index {
     pub(crate) conn: Connection,
-    // declared after conn so SQLite closes before the cross-process snapshot lock releases
-    _snapshot_lock: mem_core::platform::LockFile,
+    // 只读连接持有共享快照锁直到 SQLite 关闭；可写句柄在每个写操作中先拿店门闩，
+    // 再短持有独占快照锁，避免句柄生命周期形成反向锁序。
+    _snapshot_lock: Option<mem_core::platform::LockFile>,
+    path: std::path::PathBuf,
+    store_root: Option<std::path::PathBuf>,
+    writable: bool,
 }
 
 /// r10 B7-2：payload 折叠列内容——**逐值独立 fold** 后以 LF 连接。
@@ -64,13 +68,19 @@ pub fn payload_values_folded(payload: &serde_json::Value) -> String {
 }
 
 pub(crate) fn index_safe(s: &str) -> String {
-    s.replace('\u{e000}', "\u{e000}\u{e001}").replace('\0', "\u{e000}\u{e002}")
+    s.replace('\u{e000}', "\u{e000}\u{e001}")
+        .replace('\0', "\u{e000}\u{e002}")
 }
 
 fn snapshot_lock_path(path: &Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
+}
+
+fn physical_store_root(store: &Store) -> MemResult<std::path::PathBuf> {
+    std::fs::canonicalize(store.root())
+        .map_err(|e| MemError::io(store.root().display().to_string(), e))
 }
 
 fn sqlite_uri_path(path: &Path) -> String {
@@ -131,10 +141,19 @@ impl Index {
         let lock_path = snapshot_lock_path(path);
         let snapshot_lock = mem_core::platform::LockFile::acquire_exclusive(&lock_path)
             .map_err(|e| MemError::io(lock_path.display().to_string(), e))?;
-        let conn = Connection::open(path)
-            .map_err(|e| MemError::Corrupt { path: path.display().to_string(), reason: e.to_string() })?;
+        let conn = Connection::open(path).map_err(|e| MemError::Corrupt {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
         Self::init_schema(&conn)?;
-        Ok(Index { conn, _snapshot_lock: snapshot_lock })
+        drop(snapshot_lock);
+        Ok(Index {
+            conn,
+            _snapshot_lock: None,
+            path: path.to_path_buf(),
+            store_root: None,
+            writable: true,
+        })
     }
 
     /// r4 B2：**只读**打开已存在的索引——文件缺失/schema 不符 → Err（调用方直读）。
@@ -143,7 +162,9 @@ impl Index {
     /// 不通过（回退 direct，禁止"空告警的 indexed"）。
     pub fn open_readonly(path: &Path) -> MemResult<Index> {
         if !path.is_file() {
-            return Err(MemError::MissingRecord { id_or_path: path.display().to_string() });
+            return Err(MemError::MissingRecord {
+                id_or_path: path.display().to_string(),
+            });
         }
         let lock_path = snapshot_lock_path(path);
         let snapshot_lock = mem_core::platform::LockFile::acquire_shared_existing(&lock_path)
@@ -155,7 +176,10 @@ impl Index {
             uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
-        .map_err(|e| MemError::Corrupt { path: path.display().to_string(), reason: e.to_string() })?;
+        .map_err(|e| MemError::Corrupt {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
         // schema 存在性核对（只读查询；缺表/缺列 = 物化未完成/旧代索引 → Err 直读）。
         let ok: i64 = conn
             .query_row(
@@ -177,7 +201,13 @@ impl Index {
                 reason: "索引 schema 不完整或为旧代（bad_records 缺表 = 告警通道缺席，物化未完成/异物文件）".into(),
             });
         }
-        Ok(Index { conn, _snapshot_lock: snapshot_lock })
+        Ok(Index {
+            conn,
+            _snapshot_lock: Some(snapshot_lock),
+            path: path.to_path_buf(),
+            store_root: None,
+            writable: false,
+        })
     }
 
     fn init_schema(conn: &Connection) -> MemResult<()> {
@@ -219,7 +249,10 @@ impl Index {
             );
             "#,
         )
-        .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+        .map_err(|e| MemError::Corrupt {
+            path: "index".into(),
+            reason: e.to_string(),
+        })?;
         // r5/r7 列迁移（旧库幂等补列；新库 CREATE 已含，报错忽略）。
         let _ = conn.execute_batch(
             "ALTER TABLE records ADD COLUMN body_text TEXT NOT NULL DEFAULT '';
@@ -235,7 +268,9 @@ impl Index {
     pub fn open_store(store: &Store) -> MemResult<Index> {
         let path = validate_store_index_paths(store)?;
         let permit = store.acquire_index_maintenance()?;
-        Self::open_store_validated_under_maintenance(store, &permit, &path)
+        let mut index = Self::open_store_validated_under_maintenance(store, &permit, &path)?;
+        index.store_root = Some(physical_store_root(store)?);
+        Ok(index)
     }
 
     /// 在调用方已持有整店独占维护许可时打开索引，避免锁重入。
@@ -246,7 +281,9 @@ impl Index {
         permit.check_store(store)?;
         permit.check_compatible()?;
         let path = validate_store_index_paths(store)?;
-        Self::open_store_validated_under_maintenance(store, permit, &path)
+        let mut index = Self::open_store_validated_under_maintenance(store, permit, &path)?;
+        index.store_root = Some(physical_store_root(store)?);
+        Ok(index)
     }
 
     fn open_store_validated_under_maintenance(
@@ -262,7 +299,9 @@ impl Index {
     /// 打开店索引（读路径，只读；缺失/不完整 → Err → 调用方直读）。
     pub fn open_store_readonly(store: &Store) -> MemResult<Index> {
         let path = validate_store_index_paths(store)?;
-        Self::open_readonly(&path)
+        let mut index = Self::open_readonly(&path)?;
+        index.store_root = Some(physical_store_root(store)?);
+        Ok(index)
     }
 
     /// 物化代际（r4 B2）：每次 rebuild 递增；检查点发布时记录该值，读路径核对
@@ -286,9 +325,11 @@ impl Index {
     /// 全量替换式物化（v1：中小规模，简单压倒增量；索引可丢弃，重建成本低）。
     /// 返回 (记录数, 边数)。
     pub fn rebuild(&mut self, store: &Store) -> MemResult<(usize, usize)> {
+        self.check_store(store)?;
         store.check_writable()?;
         let _barrier = mem_core::lock::barrier_shared(store)?;
         store.check_compatible_for_write()?;
+        let _snapshot = self.acquire_write_snapshot()?;
         let (n, r, _) = self.rebuild_with_entries_locked(store)?;
         Ok((n, r))
     }
@@ -308,9 +349,11 @@ impl Index {
         usize,
         std::collections::BTreeMap<String, (u128, u64)>,
     )> {
+        self.check_store(store)?;
         store.check_writable()?;
         let _barrier = mem_core::lock::barrier_shared(store)?;
         store.check_compatible_for_write()?;
+        let _snapshot = self.acquire_write_snapshot()?;
         self.rebuild_with_entries_locked(store)
     }
 
@@ -324,6 +367,8 @@ impl Index {
         std::collections::BTreeMap<String, (u128, u64)>,
     )> {
         permit.check_compatible()?;
+        self.check_permit(permit)?;
+        let _snapshot = self.acquire_write_snapshot()?;
         let store = permit.store();
         self.rebuild_with_entries_locked(store)
     }
@@ -351,9 +396,11 @@ impl Index {
         usize,
         std::collections::BTreeMap<String, (u128, u64)>,
     )> {
+        self.check_store(store)?;
         store.check_writable()?;
         let _barrier = mem_core::lock::barrier_shared(store)?;
         store.check_compatible_for_write()?;
+        let _snapshot = self.acquire_write_snapshot()?;
         self.rebuild_with_entries_with_hook_locked(store, after_scan)
     }
 
@@ -375,7 +422,10 @@ impl Index {
         let mut n_refs = 0usize;
         self.conn
             .execute("BEGIN", [])
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
         let _ = self.conn.execute("DELETE FROM records", []);
         let _ = self.conn.execute("DELETE FROM refs", []);
         // r10（决策⑦/B1）：坏记录与正常记录同一次物化扫描、同一事务落库——
@@ -400,8 +450,10 @@ impl Index {
                 .iter()
                 .map(|a| index_safe(&mem_core::paths::fold(a)))
                 .collect::<Vec<_>>()
-                .join("
-");
+                .join(
+                    "
+",
+                );
             self.upsert_row(&IndexRow {
                 id: s.record.envelope.id.clone(),
                 type_name: s.record.envelope.r#type.clone(),
@@ -461,7 +513,10 @@ impl Index {
         }
         self.conn
             .execute("COMMIT", [])
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
         // 物化代际递增（r4 B2：检查点据此核对与索引同代）。
         let prev = self
             .conn
@@ -477,16 +532,26 @@ impl Index {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [format!("{}", prev + 1)],
             )
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
         self.conn
             .execute(
                 "INSERT INTO meta(key, value) VALUES ('last_rebuild', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [mem_core::clock::now_rfc3339()],
             )
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
         let _ = scan.warnings;
         Ok((n_records, n_refs, entries))
     }
@@ -508,9 +573,11 @@ impl Index {
 
     /// r5 B7：物化时同步 FTS 文本素材列（正文 + 别名；sync_fts 组装 text 时读取）。
     pub fn set_body_texts(&mut self, store: &Store) -> MemResult<()> {
+        self.check_store(store)?;
         store.check_writable()?;
         let _barrier = mem_core::lock::barrier_shared(store)?;
         store.check_compatible_for_write()?;
+        let _snapshot = self.acquire_write_snapshot()?;
         self.set_body_texts_locked(store)
     }
 
@@ -552,8 +619,12 @@ impl Index {
                 )
                 .map_err(sq_err)?;
         }
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|e| MemError::Corrupt { path: "index".into(), reason: e.to_string() })?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| MemError::Corrupt {
+                path: "index".into(),
+                reason: e.to_string(),
+            })?;
         Ok(())
     }
 
@@ -563,7 +634,35 @@ impl Index {
         permit: &mem_core::store::IndexMaintenancePermit<'_>,
     ) -> MemResult<()> {
         permit.check_compatible()?;
+        self.check_permit(permit)?;
+        let _snapshot = self.acquire_write_snapshot()?;
         self.set_body_texts_locked(permit.store())
+    }
+
+    fn check_store(&self, store: &Store) -> MemResult<()> {
+        if !self.writable {
+            return Err(MemError::ReadOnly);
+        }
+        let Some(bound_root) = &self.store_root else {
+            return Err(MemError::BadArgument(
+                "只读或未绑定的索引不能用于店级写入".into(),
+            ));
+        };
+        if *bound_root == physical_store_root(store)? {
+            Ok(())
+        } else {
+            Err(MemError::BadArgument("索引属于另一记忆库".into()))
+        }
+    }
+
+    fn check_permit(&self, permit: &mem_core::store::IndexMaintenancePermit<'_>) -> MemResult<()> {
+        self.check_store(permit.store())
+    }
+
+    fn acquire_write_snapshot(&self) -> MemResult<mem_core::platform::LockFile> {
+        let lock_path = snapshot_lock_path(&self.path);
+        mem_core::platform::LockFile::acquire_exclusive(&lock_path)
+            .map_err(|e| MemError::io(lock_path.display().to_string(), e))
     }
 
     fn insert_ref(&self, r: &RefRow) -> MemResult<()> {
@@ -592,7 +691,10 @@ impl Index {
             )
             .map_err(sq_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![type_name, limit as i64, offset as i64], row_to_index)
+            .query_map(
+                rusqlite::params![type_name, limit as i64, offset as i64],
+                row_to_index,
+            )
             .map_err(sq_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sq_err)?;
@@ -620,8 +722,14 @@ impl Index {
     /// 多跳边查询（trace 快路径）：一跳邻居。
     pub fn neighbors(&self, id: &str, direction: &'static str) -> MemResult<Vec<RefRow>> {
         let (sql, key) = match direction {
-            "up" => ("SELECT from_id, rel, target FROM refs WHERE from_id = ?1", id),
-            _ => ("SELECT from_id, rel, target FROM refs WHERE target = ?1", id),
+            "up" => (
+                "SELECT from_id, rel, target FROM refs WHERE from_id = ?1",
+                id,
+            ),
+            _ => (
+                "SELECT from_id, rel, target FROM refs WHERE target = ?1",
+                id,
+            ),
         };
         let mut stmt = self.conn.prepare(sql).map_err(sq_err)?;
         let rows = stmt
@@ -647,14 +755,22 @@ impl Index {
             .map_err(sq_err)?;
         let indexed: std::collections::BTreeMap<String, (String, i64)> = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+                ))
             })
             .map_err(sq_err)?
             .filter_map(|x| x.ok())
             .collect();
         let truth: std::collections::BTreeMap<String, (String, u64)> = scan
             .iter()
-            .map(|s| (s.record.envelope.id.clone(), (s.rel.clone(), s.record.envelope.version)))
+            .map(|s| {
+                (
+                    s.record.envelope.id.clone(),
+                    (s.rel.clone(), s.record.envelope.version),
+                )
+            })
             .collect();
         for (id, (rel, ver)) in &truth {
             match indexed.get(id) {
@@ -671,7 +787,9 @@ impl Index {
         }
         for id in indexed.keys() {
             if !truth.contains_key(id) {
-                out.push(format!("索引多余记录 {id}（真相层已不在——可丢弃缓存，仅诊断）"));
+                out.push(format!(
+                    "索引多余记录 {id}（真相层已不在——可丢弃缓存，仅诊断）"
+                ));
             }
         }
         Ok(out)
@@ -704,7 +822,10 @@ fn row_to_index(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {
 }
 
 fn sq_err(e: rusqlite::Error) -> MemError {
-    MemError::Corrupt { path: "index/index.sqlite".into(), reason: e.to_string() }
+    MemError::Corrupt {
+        path: "index/index.sqlite".into(),
+        reason: e.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -747,36 +868,70 @@ mod r11_body_material_tests {
     #[test]
     fn non_utf8_body_materializes_empty_string() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&{
-            let p = tmp.path().join("store");
-            mem_core::store::Store::create(&p).unwrap();
-            p
-        }, OpenMode::Auto).unwrap();
+        let store = Store::open(
+            &{
+                let p = tmp.path().join("store");
+                mem_core::store::Store::create(&p).unwrap();
+                p
+            },
+            OpenMode::Auto,
+        )
+        .unwrap();
         // 记录1：非文本正文（PNG 头 + "abs" 编巧合——素材列不得携带它）。
-        let bin_id = write_record(&store, "image", "bin1",
-            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF]);
+        let bin_id = write_record(
+            &store,
+            "image",
+            "bin1",
+            &[
+                0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF,
+            ],
+        );
         // 记录2：合法 UTF-8 正文（SVG 文本）——照常写折叠文本。
-        let svg_id = write_record(&store, "image", "svg1",
-            br#"<svg>abstract</svg>"#);
+        let svg_id = write_record(&store, "image", "svg1", br#"<svg>abstract</svg>"#);
 
         let mut idx = Index::open_store(&store).unwrap();
         let (n, _) = idx.rebuild(&store).unwrap();
-        assert_eq!(n, 2, "库中含非文本记录时物化成功（无 NOT NULL 违规）——验收5 断言");
+        assert_eq!(
+            n, 2,
+            "库中含非文本记录时物化成功（无 NOT NULL 违规）——验收5 断言"
+        );
 
         let rows = idx.query_all(10, 0).unwrap();
-        let bin_row = rows.iter().find(|r| r.id == bin_id).expect("非文本记录在索引中");
-        assert_eq!(bin_row.body_folded, "", "非文本正文素材 = 空串（不含编码巧合）");
-        let svg_row = rows.iter().find(|r| r.id == svg_id).expect("文本记录在索引中");
-        assert!(svg_row.body_folded.contains("abstract"), "合法正文照常折叠入素材列");
+        let bin_row = rows
+            .iter()
+            .find(|r| r.id == bin_id)
+            .expect("非文本记录在索引中");
+        assert_eq!(
+            bin_row.body_folded, "",
+            "非文本正文素材 = 空串（不含编码巧合）"
+        );
+        let svg_row = rows
+            .iter()
+            .find(|r| r.id == svg_id)
+            .expect("文本记录在索引中");
+        assert!(
+            svg_row.body_folded.contains("abstract"),
+            "合法正文照常折叠入素材列"
+        );
 
         // set_body_texts（写例程第二处物化点）同契约。
         idx.set_body_texts(&store).unwrap();
-        let bt: String = idx.conn
-            .query_row("SELECT body_text FROM records WHERE id = ?1", [&bin_id], |r| r.get(0))
+        let bt: String = idx
+            .conn
+            .query_row(
+                "SELECT body_text FROM records WHERE id = ?1",
+                [&bin_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(bt, "", "正文文本列对非文本正文写空串");
-        let bt2: String = idx.conn
-            .query_row("SELECT body_text FROM records WHERE id = ?1", [&svg_id], |r| r.get(0))
+        let bt2: String = idx
+            .conn
+            .query_row(
+                "SELECT body_text FROM records WHERE id = ?1",
+                [&svg_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(bt2.contains("<svg>"));
     }
@@ -786,17 +941,27 @@ mod r11_body_material_tests {
         // 设计 §3.4："非文本正文"与"合法 UTF-8 空正文"同为空串、不需要区分——
         // 素材列唯一职责是粗筛超集，正文域真值由 G1 谓词在精筛层裁定。
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&{
-            let p = tmp.path().join("store");
-            mem_core::store::Store::create(&p).unwrap();
-            p
-        }, OpenMode::Auto).unwrap();
+        let store = Store::open(
+            &{
+                let p = tmp.path().join("store");
+                mem_core::store::Store::create(&p).unwrap();
+                p
+            },
+            OpenMode::Auto,
+        )
+        .unwrap();
         let bin_id = write_record(&store, "image", "bin2", &[0xFF, 0xFE, 0x00]);
         let empty_id = write_record(&store, "note", "empty2", b"");
         let mut idx = Index::open_store(&store).unwrap();
         idx.rebuild(&store).unwrap();
         let rows = idx.query_all(10, 0).unwrap();
-        assert_eq!(rows.iter().find(|r| r.id == bin_id).unwrap().body_folded, "");
-        assert_eq!(rows.iter().find(|r| r.id == empty_id).unwrap().body_folded, "");
+        assert_eq!(
+            rows.iter().find(|r| r.id == bin_id).unwrap().body_folded,
+            ""
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.id == empty_id).unwrap().body_folded,
+            ""
+        );
     }
 }

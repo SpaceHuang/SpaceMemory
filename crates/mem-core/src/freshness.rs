@@ -104,40 +104,62 @@ pub fn consult(
     subscription: Option<&dyn Subscription>,
 ) -> ReadMode {
     match store.read_compatible_missing_features() {
-        Err(error) => return ReadMode::Direct { reason: format!("当前数据特性不可由此版本读取：{error}") },
+        Err(error) => {
+            return ReadMode::Direct {
+                reason: format!("当前数据特性不可由此版本读取：{error}"),
+            };
+        }
         Ok(missing) if !missing.is_empty() => {
             return ReadMode::Direct {
                 reason: format!("存在只读兼容特性 {missing:?}，跳过派生索引并直读真相层"),
-            }
+            };
         }
         Ok(_) => {}
     }
     // 只读存储：索引维护例程不可写 → 检查点无法推进 → 不可证明（D5）。
     if !store.writable() {
-        return ReadMode::Direct { reason: "只读存储（检查点不可推进）".into() };
+        return ReadMode::Direct {
+            reason: "只读存储（检查点不可推进）".into(),
+        };
     }
     let Some(cp) = checkpoint else {
-        return ReadMode::Direct { reason: "无索引检查点（嵌入模式/冷启动）".into() };
+        return ReadMode::Direct {
+            reason: "无索引检查点（嵌入模式/冷启动）".into(),
+        };
     };
     let current_format = match store.current_format_version() {
         Ok(version) => version,
-        Err(error) => return ReadMode::Direct { reason: format!("无法确认数据目录格式：{error}") },
+        Err(error) => {
+            return ReadMode::Direct {
+                reason: format!("无法确认数据目录格式：{error}"),
+            };
+        }
     };
     if cp.format_version != current_format {
-        return ReadMode::Direct { reason: "检查点基础格式与数据目录不匹配".into() };
+        return ReadMode::Direct {
+            reason: "检查点基础格式与数据目录不匹配".into(),
+        };
     }
     let Some(sub) = subscription else {
-        return ReadMode::Direct { reason: "sidecar 不在（嵌入模式 = 直读 + 无 FTS）".into() };
+        return ReadMode::Direct {
+            reason: "sidecar 不在（嵌入模式 = 直读 + 无 FTS）".into(),
+        };
     };
     // (a) stat 一致。
     let now = stat_snapshot(store);
     if now != cp.entries {
-        return ReadMode::Direct { reason: "stat 失配（records/ 与检查点不一致）".into() };
+        return ReadMode::Direct {
+            reason: "stat 失配（records/ 与检查点不一致）".into(),
+        };
     }
     // (b) 订阅覆盖无缺口。
     match sub.undigested_changes_since(&cp.ts) {
-        None => ReadMode::Direct { reason: "变更日志订阅不存在/不覆盖该区间".into() },
-        Some(0) => ReadMode::Indexed { via_subscription: sub.backend().to_string() },
+        None => ReadMode::Direct {
+            reason: "变更日志订阅不存在/不覆盖该区间".into(),
+        },
+        Some(0) => ReadMode::Indexed {
+            via_subscription: sub.backend().to_string(),
+        },
         Some(n) => ReadMode::Direct {
             reason: format!("订阅存在 {n} 条未消化变更（索引落后于真相）"),
         },
@@ -156,8 +178,17 @@ pub fn load_checkpoint(store: &Store) -> Option<Checkpoint> {
 }
 
 /// 持久化检查点（**只发生在写例程/sidecar 维护**，不在读路径）。
-pub fn save_checkpoint(store: &Store, cp: &Checkpoint, permit: &crate::store::IndexMaintenancePermit<'_>) -> std::io::Result<()> {
-    permit.check_compatible().map_err(|e| std::io::Error::other(e.to_string()))?;
+pub fn save_checkpoint(
+    store: &Store,
+    cp: &Checkpoint,
+    permit: &crate::store::IndexMaintenancePermit<'_>,
+) -> std::io::Result<()> {
+    permit
+        .check_store(store)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    permit
+        .check_compatible()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let p = checkpoint_path(store);
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
@@ -171,7 +202,9 @@ pub fn save_checkpoint(store: &Store, cp: &Checkpoint, permit: &crate::store::In
 #[cfg(all(debug_assertions, not(test)))]
 pub fn save_checkpoint_test(store: &Store, cp: &Checkpoint) -> std::io::Result<()> {
     let p = checkpoint_path(store);
-    if let Some(dir) = p.parent() { std::fs::create_dir_all(dir)?; }
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let bytes = serde_json::to_vec_pretty(cp)?;
     crate::platform::atomic_write(&p, &bytes)
 }
@@ -186,23 +219,37 @@ pub fn consult_with_hello(
     hello: Option<&crate::sidecar::Hello>,
 ) -> ReadMode {
     if !store.writable() {
-        return ReadMode::Direct { reason: "只读存储（检查点不可推进）".into() };
+        return ReadMode::Direct {
+            reason: "只读存储（检查点不可推进）".into(),
+        };
     }
     let Some(cp) = checkpoint else {
-        return ReadMode::Direct { reason: "无索引检查点（sidecar 从未维护过）".into() };
+        return ReadMode::Direct {
+            reason: "无索引检查点（sidecar 从未维护过）".into(),
+        };
     };
     let current_format = match store.current_format_version() {
         Ok(version) => version,
-        Err(error) => return ReadMode::Direct { reason: format!("无法确认数据目录格式：{error}") },
+        Err(error) => {
+            return ReadMode::Direct {
+                reason: format!("无法确认数据目录格式：{error}"),
+            };
+        }
     };
     if cp.format_version != current_format {
-        return ReadMode::Direct { reason: "检查点基础格式与数据目录不匹配".into() };
+        return ReadMode::Direct {
+            reason: "检查点基础格式与数据目录不匹配".into(),
+        };
     }
     let Some(h) = hello else {
-        return ReadMode::Direct { reason: "sidecar 不在（嵌入模式 = 直读 + 无 FTS）".into() };
+        return ReadMode::Direct {
+            reason: "sidecar 不在（嵌入模式 = 直读 + 无 FTS）".into(),
+        };
     };
     if h.backend == "none" {
-        return ReadMode::Direct { reason: "卷不支持变更日志订阅（永久直读形态）".into() };
+        return ReadMode::Direct {
+            reason: "卷不支持变更日志订阅（永久直读形态）".into(),
+        };
     }
     if h.undigested != Some(0) {
         return ReadMode::Direct {
@@ -211,9 +258,13 @@ pub fn consult_with_hello(
     }
     let now = stat_snapshot(store);
     if now != cp.entries {
-        return ReadMode::Direct { reason: "stat 失配（records/ 与检查点不一致）".into() };
+        return ReadMode::Direct {
+            reason: "stat 失配（records/ 与检查点不一致）".into(),
+        };
     }
-    ReadMode::Indexed { via_subscription: h.backend.clone() }
+    ReadMode::Indexed {
+        via_subscription: h.backend.clone(),
+    }
 }
 
 /// **统一维护收敛原语**（r4 B3/H2）：执行维护（物化索引）→ 新鲜查询确认收敛 →
@@ -238,9 +289,13 @@ pub struct MaintainOutcome {
 pub fn publish_converged_checkpoint(
     store: &Store,
     permit: &crate::store::IndexMaintenancePermit<'_>,
-    maintain: &dyn Fn(&Store, &crate::store::IndexMaintenancePermit<'_>) -> MemResult<MaintainOutcome>,
+    maintain: &dyn Fn(
+        &Store,
+        &crate::store::IndexMaintenancePermit<'_>,
+    ) -> MemResult<MaintainOutcome>,
     mut fresh: Option<&mut dyn FnMut() -> Option<u64>>,
 ) -> MemResult<Option<Checkpoint>> {
+    permit.check_store(store)?;
     for _round in 0..4 {
         let outcome = maintain(store, permit)?;
         match fresh.as_mut() {
@@ -257,15 +312,13 @@ pub fn publish_converged_checkpoint(
                         entries: outcome.scan_entries,
                         index_epoch: outcome.index_epoch,
                     };
-                    save_checkpoint(store, &cp, permit).map_err(|e| {
-                        MemError::Corrupt {
-                            path: "index/checkpoint.json".into(),
-                            reason: e.to_string(),
-                        }
+                    save_checkpoint(store, &cp, permit).map_err(|e| MemError::Corrupt {
+                        path: "index/checkpoint.json".into(),
+                        reason: e.to_string(),
                     })?;
                     return Ok(Some(cp));
                 }
-                Some(_) => continue, // 维护期间有新写入：再维护一轮
+                Some(_) => continue,     // 维护期间有新写入：再维护一轮
                 None => return Ok(None), // 订阅失效/gap：不可证明，不发布
             },
             None => return Ok(None), // 无订阅证据：只维护不发布（H2）

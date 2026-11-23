@@ -10,6 +10,114 @@ fn fresh_store() -> (tempfile::TempDir, mem_core::store::Store) {
 }
 
 #[test]
+fn child_index_rebuild_worker() {
+    let Ok(root) = std::env::var("SM_INDEX_LOCK_ROOT") else {
+        return;
+    };
+    let ready = std::path::PathBuf::from(std::env::var("SM_INDEX_LOCK_READY").unwrap());
+    let start = std::path::PathBuf::from(std::env::var("SM_INDEX_LOCK_START").unwrap());
+    let store =
+        mem_core::store::Store::open(root.as_ref(), mem_core::store::OpenMode::Auto).unwrap();
+    let mut index = mem_index::Index::open_store(&store).unwrap();
+    std::fs::write(ready, b"ready").unwrap();
+    wait_for_file(&start);
+    index.rebuild(&store).unwrap();
+}
+
+#[test]
+fn child_index_maintenance_worker() {
+    let Ok(root) = std::env::var("SM_INDEX_LOCK_ROOT") else {
+        return;
+    };
+    let ready = std::path::PathBuf::from(std::env::var("SM_INDEX_MAINT_READY").unwrap());
+    let store =
+        mem_core::store::Store::open(root.as_ref(), mem_core::store::OpenMode::Auto).unwrap();
+    let permit = store.acquire_index_maintenance().unwrap();
+    std::fs::write(ready, b"ready").unwrap();
+    let _index = mem_index::Index::open_store_under_maintenance(&store, &permit).unwrap();
+}
+
+#[test]
+fn index_rebuild_and_explicit_maintenance_do_not_reverse_lock_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("lock-order-store");
+    mem_core::store::Store::create(&root).unwrap();
+    let writer_ready = tmp.path().join("writer.ready");
+    let writer_start = tmp.path().join("writer.start");
+    let maintenance_ready = tmp.path().join("maintenance.ready");
+    let mut writer = spawn_index_lock_child(
+        "child_index_rebuild_worker",
+        &root,
+        "SM_INDEX_LOCK_READY",
+        &writer_ready,
+        Some(("SM_INDEX_LOCK_START", &writer_start)),
+    );
+    wait_for_file(&writer_ready);
+    let mut maintenance = spawn_index_lock_child(
+        "child_index_maintenance_worker",
+        &root,
+        "SM_INDEX_MAINT_READY",
+        &maintenance_ready,
+        None,
+    );
+    wait_for_file(&maintenance_ready);
+    std::fs::write(&writer_start, b"go").unwrap();
+
+    let writer_ok = wait_child_bounded(&mut writer);
+    let maintenance_ok = wait_child_bounded(&mut maintenance);
+    assert!(
+        writer_ok && maintenance_ok,
+        "索引写入路径必须在有限时间内按同一锁序完成"
+    );
+}
+
+fn spawn_index_lock_child(
+    test_name: &str,
+    root: &std::path::Path,
+    ready_env: &str,
+    ready: &std::path::Path,
+    gate: Option<(&str, &std::path::Path)>,
+) -> std::process::Child {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", test_name, "--nocapture"])
+        .env("SM_INDEX_LOCK_ROOT", root)
+        .env(ready_env, ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some((name, path)) = gate {
+        cmd.env(name, path);
+    }
+    cmd.spawn().unwrap()
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待同步文件超时: {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn wait_child_bounded(child: &mut std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.success();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn writable_store_index_open_refuses_missing_feature_before_creating_database() {
     let (_tmp, store) = fresh_store();
     let config_path = store.abs("mem.json");
@@ -26,6 +134,32 @@ fn writable_store_index_open_refuses_missing_feature_before_creating_database() 
         "{err}"
     );
     assert!(!store.abs("index/index.sqlite").exists());
+}
+
+#[test]
+fn an_index_handle_cannot_rebuild_into_another_stores_database() {
+    let (_tmp, first) = fresh_store();
+    let second_root = first.root().parent().unwrap().join("second-store");
+    mem_core::store::Store::create(&second_root).unwrap();
+    let second =
+        mem_core::store::Store::open(&second_root, mem_core::store::OpenMode::Auto).unwrap();
+    let mut index = mem_index::Index::open_store(&first).unwrap();
+
+    let error = index.rebuild(&second).unwrap_err();
+
+    assert!(
+        matches!(error, mem_core::error::MemError::BadArgument(_)),
+        "{error}"
+    );
+    assert!(!second.abs("index/index.sqlite").exists());
+    let permit = first.acquire_index_maintenance().unwrap();
+    let error = mem_index::Index::open_store_under_maintenance(&second, &permit)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, mem_core::error::MemError::BadArgument(_)),
+        "{error}"
+    );
 }
 
 #[test]
@@ -121,6 +255,43 @@ fn open_proved_rechecks_disk_features_on_an_existing_store_handle() {
         proved.mode
     );
     assert!(proved.index.is_none());
+}
+
+#[test]
+fn missing_required_features_field_blocks_old_store_and_index_handles_without_mutation() {
+    let (_tmp, store) = fresh_store();
+    let mut index = mem_index::Index::open_store(&store).unwrap();
+    index.rebuild(&store).unwrap();
+    let events_before = std::fs::read(store.abs("events.jsonl")).unwrap();
+    let index_before = std::fs::read(store.abs("index/index.sqlite")).unwrap();
+    let path = store.abs("mem.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("required_features");
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let config_after_corruption = std::fs::read(&path).unwrap();
+
+    assert!(matches!(
+        store.read_compatible_missing_features(),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        index.rebuild(&store),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        mem_index::Index::open_store(&store),
+        Err(mem_core::error::MemError::Corrupt { .. })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), config_after_corruption);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        events_before
+    );
+    assert_eq!(
+        std::fs::read(store.abs("index/index.sqlite")).unwrap(),
+        index_before
+    );
 }
 
 #[cfg(unix)]
