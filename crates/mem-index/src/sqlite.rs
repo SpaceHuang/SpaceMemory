@@ -213,7 +213,9 @@ impl Index {
     fn init_schema(conn: &Connection) -> MemResult<()> {
         conn.execute_batch(
             r#"
-            PRAGMA journal_mode = WAL;
+            -- rollback journal commits complete while the caller holds the store and snapshot
+            -- write locks; there is no WAL checkpoint or database mutation when Connection drops.
+            PRAGMA journal_mode = DELETE;
             CREATE TABLE IF NOT EXISTS records (
                 id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
@@ -546,12 +548,6 @@ impl Index {
                 path: "index".into(),
                 reason: e.to_string(),
             })?;
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
         let _ = scan.warnings;
         Ok((n_records, n_refs, entries))
     }
@@ -619,12 +615,6 @@ impl Index {
                 )
                 .map_err(sq_err)?;
         }
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
         Ok(())
     }
 

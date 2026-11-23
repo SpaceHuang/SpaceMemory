@@ -1,12 +1,44 @@
 //! 店级索引数据库与 snapshot 锁必须遵守 store 路径边界。
 
-#[cfg(unix)]
 fn fresh_store() -> (tempfile::TempDir, mem_core::store::Store) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("store");
     mem_core::store::Store::create(&root).unwrap();
     let store = mem_core::store::Store::open(&root, mem_core::store::OpenMode::Auto).unwrap();
     (tmp, store)
+}
+
+#[test]
+fn writable_index_close_never_checkpoints_or_changes_database_outside_snapshot_lock() {
+    let (_tmp, store) = fresh_store();
+    let mut setup = mem_index::Index::open_store(&store).unwrap();
+    setup.rebuild(&store).unwrap();
+    drop(setup);
+
+    let index = mem_index::Index::open_store(&store).unwrap();
+    let db = store.abs("index/index.sqlite");
+    let wal = store.abs("index/index.sqlite-wal");
+    let snapshot = store.abs("index/index.sqlite.lock");
+    assert!(
+        !wal.exists(),
+        "writable indexes use rollback journaling, so close has no WAL checkpoint"
+    );
+    let db_before = std::fs::read(&db).unwrap();
+    let shared_snapshot = mem_core::platform::LockFile::acquire_shared(&snapshot).unwrap();
+
+    let closer = std::thread::spawn(move || drop(index));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        closer.is_finished(),
+        "closing must not need a checkpoint lock"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), db_before);
+    closer.join().unwrap();
+    assert!(!wal.exists());
+    drop(shared_snapshot);
+
+    let reopened = mem_index::Index::open_store_readonly(&store).unwrap();
+    assert_eq!(reopened.epoch().unwrap(), 1);
 }
 
 #[test]
