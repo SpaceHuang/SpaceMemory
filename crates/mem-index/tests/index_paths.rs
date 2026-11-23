@@ -8,6 +8,77 @@ fn fresh_store() -> (tempfile::TempDir, mem_core::store::Store) {
     (tmp, store)
 }
 
+fn seed_records(store: &mem_core::store::Store, count: usize, text_len: usize) -> Vec<String> {
+    let text = "x".repeat(text_len);
+    let mut ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let id = format!("0198f7a9-0000-7cd2-9e3f-{i:012x}");
+        let envelope = mem_core::envelope::Envelope {
+            id: id.clone(),
+            r#type: "task".into(),
+            created: "2026-11-23T00:00:00Z".into(),
+            modified: "2026-11-23T00:00:00Z".into(),
+            version: 1,
+            principal: None,
+            refs: vec![],
+            aliases: vec![],
+            evidence_cutoff_seq: None,
+            commit: None,
+            extra: Default::default(),
+        };
+        let bytes = mem_core::record::serialize_new(
+            &envelope,
+            &serde_json::json!({"slug": format!("task-{i}"), "title": text}),
+            b"",
+        );
+        let path = store.abs(format!("records/task/{id}.md"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+fn hot_journal_path(store: &mem_core::store::Store) -> std::path::PathBuf {
+    store.abs("index/index.sqlite-journal")
+}
+
+fn assert_file_matches(path: &std::path::Path, expected: &[u8]) {
+    let actual = std::fs::read(path).unwrap();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "文件长度改变：{}",
+        path.display()
+    );
+    assert_eq!(
+        mem_core::token::sha256_hex(&actual),
+        mem_core::token::sha256_hex(expected),
+        "文件内容改变：{}",
+        path.display()
+    );
+}
+
+#[test]
+fn child_leave_hot_index_rollback_journal() {
+    let Ok(root) = std::env::var("SM_HOT_INDEX_ROOT") else {
+        return;
+    };
+    let store =
+        mem_core::store::Store::open(std::path::Path::new(&root), mem_core::store::OpenMode::Auto)
+            .unwrap();
+    let db = store.abs("index/index.sqlite");
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE records SET payload_json = payload_json || 'uncommitted-child-write';",
+        )
+        .unwrap();
+    assert!(hot_journal_path(&store).is_file());
+    std::process::exit(73);
+}
+
 #[test]
 fn writable_index_close_never_checkpoints_or_changes_database_outside_snapshot_lock() {
     let (_tmp, store) = fresh_store();
@@ -32,13 +103,173 @@ fn writable_index_close_never_checkpoints_or_changes_database_outside_snapshot_l
         closer.is_finished(),
         "closing must not need a checkpoint lock"
     );
-    assert_eq!(std::fs::read(&db).unwrap(), db_before);
+    assert_file_matches(&db, &db_before);
     closer.join().unwrap();
     assert!(!wal.exists());
     drop(shared_snapshot);
 
     let reopened = mem_index::Index::open_store_readonly(&store).unwrap();
     assert_eq!(reopened.epoch().unwrap(), 1);
+}
+
+#[test]
+fn failed_rebuild_rolls_back_inside_write_locks_and_can_retry() {
+    let (_tmp, store) = fresh_store();
+    let ids = seed_records(&store, 770, 8 * 1024);
+    let mut initial = mem_index::Index::open_store(&store).unwrap();
+    initial.rebuild(&store).unwrap();
+    drop(initial);
+
+    let db = store.abs("index/index.sqlite");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_last_index_row BEFORE INSERT ON records
+             WHEN NEW.id = '{}' BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+            ids.last().unwrap()
+        ))
+        .unwrap();
+    drop(connection);
+
+    let mut index = mem_index::Index::open_store(&store).unwrap();
+    let db_before = std::fs::read(&db).unwrap();
+    let error = index.rebuild(&store).unwrap_err();
+    assert!(error.to_string().contains("injected rebuild failure"));
+    assert_file_matches(&db, &db_before);
+    assert!(
+        !hot_journal_path(&store).exists(),
+        "error return must end transaction"
+    );
+
+    let shared_snapshot =
+        mem_core::platform::LockFile::acquire_shared(&store.abs("index/index.sqlite.lock"))
+            .unwrap();
+    let before_close = std::fs::read(&db).unwrap();
+    drop(index);
+    assert_file_matches(&db, &before_close);
+    assert!(!hot_journal_path(&store).exists());
+    drop(shared_snapshot);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER fail_last_index_row;")
+        .unwrap();
+    drop(connection);
+    let mut retry = mem_index::Index::open_store(&store).unwrap();
+    assert_eq!(retry.rebuild(&store).unwrap().0, 770);
+    assert_eq!(retry.epoch().unwrap(), 2);
+}
+
+#[test]
+fn open_proved_falls_back_without_touching_hot_rollback_journal_and_maintenance_recovers() {
+    let (_tmp, store) = fresh_store();
+    seed_records(&store, 1, 32);
+    let mut index = mem_index::Index::open_store(&store).unwrap();
+    index.rebuild(&store).unwrap();
+    let epoch = index.epoch().unwrap();
+    drop(index);
+
+    let ts = "2026-11-23T00:00:00.000Z";
+    let checkpoint = mem_core::freshness::Checkpoint {
+        format_version: store.config().format_version,
+        ts: ts.into(),
+        entries: mem_core::freshness::stat_snapshot(&store),
+        index_epoch: epoch,
+    };
+    let checkpoint_path = mem_core::freshness::checkpoint_path(&store);
+    std::fs::write(&checkpoint_path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let hello = mem_core::sidecar::Hello {
+        version: 1,
+        backend: "hot-journal-test".into(),
+        undigested: Some(0),
+        max_seq: 0,
+        last_rebuild: ts.into(),
+    };
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_leave_hot_index_rollback_journal",
+            "--nocapture",
+        ])
+        .env("SM_HOT_INDEX_ROOT", store.root())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = child.wait().unwrap();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut b = String::new();
+            let _ = s.read_to_string(&mut b);
+            b
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        status.code(),
+        Some(73),
+        "child must exit without destructors: {stderr}"
+    );
+    let journal = hot_journal_path(&store);
+    assert!(
+        journal.is_file(),
+        "child exit must leave its rollback journal"
+    );
+
+    let db_before = std::fs::read(store.abs("index/index.sqlite")).unwrap();
+    let journal_before = std::fs::read(&journal).unwrap();
+    let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+    let proved = mem_index::open_proved(&store, Some(&hello));
+    assert!(matches!(
+        proved.mode,
+        mem_core::freshness::ReadMode::Direct { .. }
+    ));
+    assert!(proved.index.is_none());
+    assert_file_matches(&store.abs("index/index.sqlite"), &db_before);
+    assert_file_matches(&journal, &journal_before);
+    assert_file_matches(&checkpoint_path, &checkpoint_before);
+    assert_eq!(mem_core::ops::scan_all(&store).unwrap().records.len(), 1);
+
+    let mut recovered = mem_index::Index::open_store(&store).unwrap();
+    recovered.rebuild(&store).unwrap();
+    assert!(
+        !journal.exists(),
+        "writable maintenance rebuild must recover hot journal"
+    );
+    let recovered_epoch = recovered.epoch().unwrap();
+    drop(recovered);
+    let recovered_checkpoint = mem_core::freshness::Checkpoint {
+        format_version: store.config().format_version,
+        ts: "2026-11-23T00:01:00.000Z".into(),
+        entries: mem_core::freshness::stat_snapshot(&store),
+        index_epoch: recovered_epoch,
+    };
+    std::fs::write(
+        &checkpoint_path,
+        serde_json::to_vec(&recovered_checkpoint).unwrap(),
+    )
+    .unwrap();
+    let recovered_hello = mem_core::sidecar::Hello {
+        last_rebuild: recovered_checkpoint.ts.clone(),
+        ..hello
+    };
+    let proved = mem_index::open_proved(&store, Some(&recovered_hello));
+    assert!(matches!(
+        proved.mode,
+        mem_core::freshness::ReadMode::Indexed { .. }
+    ));
+    assert_eq!(
+        proved
+            .index
+            .unwrap()
+            .query_by_type("task", 10, 0)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

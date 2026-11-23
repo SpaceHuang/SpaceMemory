@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 use mem_core::error::{MemError, MemResult};
 use mem_core::ops::{self, Scanned};
@@ -75,6 +76,12 @@ pub(crate) fn index_safe(s: &str) -> String {
 fn snapshot_lock_path(path: &Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn hot_journal_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push("-journal");
     path.with_file_name(name)
 }
 
@@ -169,6 +176,16 @@ impl Index {
         let lock_path = snapshot_lock_path(path);
         let snapshot_lock = mem_core::platform::LockFile::acquire_shared_existing(&lock_path)
             .map_err(|e| MemError::io(lock_path.display().to_string(), e))?;
+        let journal_path = hot_journal_path(path);
+        if journal_path.exists() {
+            return Err(MemError::Corrupt {
+                path: path.display().to_string(),
+                reason: format!(
+                    "索引存在未恢复的 SQLite 回滚日志：{}；只读路径退回真相层，由维护写路径恢复",
+                    journal_path.display()
+                ),
+            });
+        }
         // immutable 只读 URI 禁止 SQLite 建立 -wal/-shm。该连接只用于派生索引，
         // 其结果仍受 open_proved 新鲜性证明约束；失败/无法证明时执行器直读。
         let uri = format!("file:{}?immutable=1", sqlite_uri_path(path));
@@ -422,18 +439,17 @@ impl Index {
         let mut entries = std::collections::BTreeMap::new();
         let mut n_records = 0usize;
         let mut n_refs = 0usize;
+        let tx = self.conn.unchecked_transaction().map_err(sq_err)?;
         self.conn
-            .execute("BEGIN", [])
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
-        let _ = self.conn.execute("DELETE FROM records", []);
-        let _ = self.conn.execute("DELETE FROM refs", []);
+            .execute("DELETE FROM records", [])
+            .map_err(sq_err)?;
+        self.conn.execute("DELETE FROM refs", []).map_err(sq_err)?;
         // r10（决策⑦/B1）：坏记录与正常记录同一次物化扫描、同一事务落库——
         // 全量替换式物化先清后插；error 列存告警行（"跳过坏条目 {rel}：{原因}"，
         // 与 direct 扫描告警同模板前段，响应层追加修复入口）。
-        let _ = self.conn.execute("DELETE FROM bad_records", []);
+        self.conn
+            .execute("DELETE FROM bad_records", [])
+            .map_err(sq_err)?;
         for s in &scan.records {
             // r11：折叠列统一在物化时计算（逐值/逐别名独立 fold 后 LF 连接——
             // LF 分隔符保证 LIKE 子串匹配不跨值/跨别名）。sync_fts 不再覆盖。
@@ -513,19 +529,14 @@ impl Index {
                 entries.insert(rel.clone(), (mtime, md.len()));
             }
         }
-        self.conn
-            .execute("COMMIT", [])
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
         // 物化代际递增（r4 B2：检查点据此核对与索引同代）。
         let prev = self
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'epoch'", [], |r| {
                 r.get::<_, String>(0)
             })
-            .ok()
+            .optional()
+            .map_err(sq_err)?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         self.conn
@@ -534,20 +545,15 @@ impl Index {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [format!("{}", prev + 1)],
             )
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
+            .map_err(sq_err)?;
         self.conn
             .execute(
                 "INSERT INTO meta(key, value) VALUES ('last_rebuild', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [mem_core::clock::now_rfc3339()],
             )
-            .map_err(|e| MemError::Corrupt {
-                path: "index".into(),
-                reason: e.to_string(),
-            })?;
+            .map_err(sq_err)?;
+        tx.commit().map_err(sq_err)?;
         let _ = scan.warnings;
         Ok((n_records, n_refs, entries))
     }
