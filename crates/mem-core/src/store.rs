@@ -96,35 +96,176 @@ fn default_idle() -> u64 {
     86_400
 }
 
-type RawConfig = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+type RawConfig = std::collections::BTreeMap<String, String>;
 
 fn parse_raw_config(bytes: &[u8]) -> MemResult<RawConfig> {
-    serde_json::from_slice(bytes).map_err(|e| MemError::Corrupt {
-        path: "mem.json".into(),
-        reason: e.to_string(),
-    })
+    fn corrupt(reason: impl Into<String>) -> MemError {
+        MemError::Corrupt {
+            path: "mem.json".into(),
+            reason: reason.into(),
+        }
+    }
+    fn skip_ws(bytes: &[u8], at: &mut usize) {
+        while bytes.get(*at).is_some_and(u8::is_ascii_whitespace) {
+            *at += 1;
+        }
+    }
+    fn scan_string(bytes: &[u8], at: &mut usize) -> Result<(), MemError> {
+        if bytes.get(*at) != Some(&b'"') {
+            return Err(corrupt("配置对象键必须是 JSON 字符串"));
+        }
+        *at += 1;
+        while let Some(byte) = bytes.get(*at) {
+            match byte {
+                b'\\' => {
+                    *at += 2;
+                }
+                b'"' => {
+                    *at += 1;
+                    return Ok(());
+                }
+                _ => *at += 1,
+            }
+        }
+        Err(corrupt("配置 JSON 字符串未闭合"))
+    }
+    fn scan_value(bytes: &[u8], at: &mut usize) -> Result<(), MemError> {
+        let Some(first) = bytes.get(*at).copied() else {
+            return Err(corrupt("配置 JSON 值缺失"));
+        };
+        if first == b'"' {
+            return scan_string(bytes, at);
+        }
+        if first == b'{' || first == b'[' {
+            let mut closing = vec![if first == b'{' { b'}' } else { b']' }];
+            *at += 1;
+            let mut in_string = false;
+            let mut escaped = false;
+            while let Some(byte) = bytes.get(*at).copied() {
+                *at += 1;
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' => closing.push(b'}'),
+                    b'[' => closing.push(b']'),
+                    b'}' | b']' => {
+                        if closing.pop() != Some(byte) {
+                            return Err(corrupt("配置 JSON 容器不匹配"));
+                        }
+                        if closing.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Err(corrupt("配置 JSON 容器未闭合"));
+        }
+        let start = *at;
+        while bytes
+            .get(*at)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b',' | b'}' | b']'))
+        {
+            *at += 1;
+        }
+        if *at == start {
+            return Err(corrupt("配置 JSON 值缺失"));
+        }
+        Ok(())
+    }
+
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).map_err(|e| corrupt(e.to_string()))?;
+    let mut at = 0;
+    skip_ws(bytes, &mut at);
+    if bytes.get(at) != Some(&b'{') {
+        return Err(corrupt("顶层配置必须是对象"));
+    }
+    at += 1;
+    let mut result = RawConfig::new();
+    loop {
+        skip_ws(bytes, &mut at);
+        if bytes.get(at) == Some(&b'}') {
+            at += 1;
+            break;
+        }
+        let key_start = at;
+        scan_string(bytes, &mut at)?;
+        let key: String =
+            serde_json::from_slice(&bytes[key_start..at]).map_err(|e| corrupt(e.to_string()))?;
+        skip_ws(bytes, &mut at);
+        if bytes.get(at) != Some(&b':') {
+            return Err(corrupt("配置 JSON 对象缺少冒号"));
+        }
+        at += 1;
+        skip_ws(bytes, &mut at);
+        let value_start = at;
+        scan_value(bytes, &mut at)?;
+        let value = std::str::from_utf8(&bytes[value_start..at])
+            .map_err(|e| corrupt(e.to_string()))?
+            .to_owned();
+        serde_json::from_str::<serde::de::IgnoredAny>(&value)
+            .map_err(|e| corrupt(e.to_string()))?;
+        result.insert(key, value);
+        skip_ws(bytes, &mut at);
+        match bytes.get(at) {
+            Some(b',') => at += 1,
+            Some(b'}') => {
+                at += 1;
+                break;
+            }
+            _ => return Err(corrupt("配置 JSON 对象缺少逗号或结束括号")),
+        }
+    }
+    skip_ws(bytes, &mut at);
+    if at != bytes.len() {
+        return Err(corrupt("配置 JSON 对象后含有多余内容"));
+    }
+    Ok(result)
 }
 
-fn raw_value<T: serde::Serialize>(value: &T) -> MemResult<Box<serde_json::value::RawValue>> {
-    let json = serde_json::to_string(value).map_err(|e| MemError::Corrupt {
-        path: "mem.json".into(),
-        reason: e.to_string(),
-    })?;
-    serde_json::value::RawValue::from_string(json).map_err(|e| MemError::Corrupt {
+fn raw_value<T: serde::Serialize>(value: &T) -> MemResult<String> {
+    serde_json::to_string(value).map_err(|e| MemError::Corrupt {
         path: "mem.json".into(),
         reason: e.to_string(),
     })
 }
 
 fn raw_config_value(raw: &RawConfig) -> MemResult<serde_json::Value> {
-    serde_json::from_slice(&serde_json::to_vec(raw).map_err(|e| MemError::Corrupt {
-        path: "mem.json".into(),
-        reason: e.to_string(),
-    })?)
-    .map_err(|e| MemError::Corrupt {
+    serde_json::from_str(&serialize_raw_config(raw, false)).map_err(|e| MemError::Corrupt {
         path: "mem.json".into(),
         reason: e.to_string(),
     })
+}
+
+fn serialize_raw_config(raw: &RawConfig, pretty: bool) -> String {
+    let mut output = String::from("{");
+    for (index, (key, value)) in raw.iter().enumerate() {
+        if pretty {
+            output.push_str(if index == 0 { "\n  " } else { ",\n  " });
+        } else if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&serde_json::to_string(key).expect("字符串键可序列化"));
+        output.push(':');
+        if pretty {
+            output.push(' ');
+        }
+        output.push_str(value);
+    }
+    if pretty && !raw.is_empty() {
+        output.push('\n');
+    }
+    output.push('}');
+    output
 }
 
 fn validate_feature_id(feature: &str) -> MemResult<()> {
@@ -423,13 +564,10 @@ impl Store {
                 "required_features".into(),
                 raw_value(&config.required_features)?,
             );
-            // 未修改字段一直以 RawValue 保存，避免把合法对象/任意精度数字先解析再写回。
+            // 未修改字段以原始 JSON 文本保存，避免先解析再写回时改变未知值。
             config = Self::parse_disk_config_value(raw_config_value(&raw)?)?;
-            let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
-                path: "mem.json".into(),
-                reason: e.to_string(),
-            })?;
-            crate::platform::atomic_write(&path, &updated)
+            let updated = serialize_raw_config(&raw, true);
+            crate::platform::atomic_write(&path, updated.as_bytes())
                 .map_err(|e| MemError::io(path.display().to_string(), e))?;
         }
         *self.config.lock().expect("配置锁") = config;
@@ -496,7 +634,7 @@ impl Store {
         let migrated_features;
         let version: Option<serde_json::Value> = migration_raw
             .get("format_version")
-            .map(|raw| serde_json::from_str(raw.get()))
+            .map(|raw| serde_json::from_str(raw))
             .transpose()
             .map_err(|e| MemError::Corrupt {
                 path: "mem.json".into(),
@@ -506,8 +644,8 @@ impl Store {
             Some(serde_json::Value::Number(n)) if n.as_u64() == Some(1) => {
                 // 基线版本的配置不能携带受保护格式字段；非空清单不是安全可忽略信息。
                 if let Some(raw_features) = migration_raw.get("required_features") {
-                    let features: serde_json::Value = serde_json::from_str(raw_features.get())
-                        .map_err(|e| MemError::Corrupt {
+                    let features: serde_json::Value =
+                        serde_json::from_str(raw_features).map_err(|e| MemError::Corrupt {
                             path: "mem.json".into(),
                             reason: e.to_string(),
                         })?;
@@ -550,14 +688,11 @@ impl Store {
         }
         migration_raw.insert("format_version".into(), raw_value(&"spacememory/2")?);
         migration_raw.insert("required_features".into(), raw_value(&migrated_features)?);
-        let updated = serde_json::to_vec_pretty(&migration_raw).map_err(|e| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: e.to_string(),
-        })?;
+        let updated = serialize_raw_config(&migration_raw, true);
         if let Some(hook) = pause_hook {
             hook("before_format_switch");
         }
-        crate::platform::atomic_write(&config_path, &updated)
+        crate::platform::atomic_write(&config_path, updated.as_bytes())
             .map_err(|e| MemError::io(config_path.display().to_string(), e))?;
         if let Some(hook) = pause_hook {
             hook("after_format_switch");
@@ -613,11 +748,8 @@ impl Store {
         let mut raw = parse_raw_config(&bytes)?;
         raw.insert(key.to_owned(), raw_value(&value)?);
         let config = Self::parse_disk_config_value(raw_config_value(&raw)?)?;
-        let updated = serde_json::to_vec_pretty(&raw).map_err(|e| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: e.to_string(),
-        })?;
-        crate::platform::atomic_write(&path, &updated)
+        let updated = serialize_raw_config(&raw, true);
+        crate::platform::atomic_write(&path, updated.as_bytes())
             .map_err(|e| MemError::io(path.display().to_string(), e))?;
         *self.config.lock().expect("配置锁") = config;
         Ok(())

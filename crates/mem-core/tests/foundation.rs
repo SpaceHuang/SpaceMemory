@@ -832,6 +832,27 @@ fn migration_preserves_arbitrary_precision_unknown_numbers() {
 }
 
 #[test]
+fn open_preserves_legal_raw_value_sentinel_objects_in_unknown_config() {
+    for member in [
+        r#"{"$serde_json::private::RawValue":"123"}"#,
+        r#"{"$serde_json::private::RawValue":"keep me"}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sentinel-config");
+        Store::create(&root).unwrap();
+        let config_path = root.join("mem.json");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let config = append_raw_config_member(&config, "opaque", member);
+        std::fs::write(&config_path, config).unwrap();
+
+        let store = Store::open(&root, OpenMode::Auto)
+            .unwrap_or_else(|e| panic!("合法未知对象必须能打开：member={member}: {e}"));
+        let expected: serde_json::Value = serde_json::from_str(member).unwrap();
+        assert_eq!(store.config().extra.get("opaque"), Some(&expected));
+    }
+}
+
+#[test]
 fn format_migration_refuses_pending_commit_debt_without_switching() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("legacy-pending");

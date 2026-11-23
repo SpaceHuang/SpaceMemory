@@ -100,6 +100,50 @@ fn init_accepts_bare_relative_store_path() {
 }
 
 #[test]
+fn add_persists_legal_raw_value_sentinel_objects_without_retyping_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    init_store(&dir);
+
+    let schema_path = dir.join("types/topic/schema.json");
+    let mut schema: Value = serde_json::from_slice(&std::fs::read(&schema_path).unwrap()).unwrap();
+    schema["properties"]["downstream"] = serde_json::json!({"type": "object"});
+    std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema).unwrap()).unwrap();
+
+    let payload = r#"{"slug":"raw-sentinel","title":"Raw sentinel","downstream":{"$serde_json::private::RawValue":"123"}}"#;
+    let out = mem()
+        .args([
+            "--store",
+            dir.to_str().unwrap(),
+            "add",
+            "topic",
+            "--principal",
+            "codex_main",
+            "--payload",
+            payload,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record = dir.join(j(&out)["rel"].as_str().unwrap());
+    let bytes = std::fs::read(record).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(
+        text.contains(r#""$serde_json::private::RawValue": "123""#),
+        "{text}"
+    );
+    let loaded = mem_core::record::Record::from_bytes(text.as_bytes()).unwrap();
+    assert_eq!(
+        loaded.payload["downstream"]["$serde_json::private::RawValue"],
+        "123"
+    );
+}
+
+#[test]
 fn init_quarantines_and_preserves_an_interrupted_previous_attempt() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");

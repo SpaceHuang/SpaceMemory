@@ -19,7 +19,7 @@ mem-assets = { path = "crates/mem-assets" }
 
 # ---- 机制层基础依赖（脚手架阶段仅引入立即需要的）----
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v7", "rng"] }
 thiserror = "2"
