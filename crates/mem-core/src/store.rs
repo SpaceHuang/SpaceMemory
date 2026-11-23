@@ -206,6 +206,17 @@ impl InitPermit {
             Err(MemError::BadArgument("初始化许可属于另一目标路径".into()))
         }
     }
+
+    /// 播种只允许在仍持有 CLI 初始化标记的自举阶段发生。
+    pub(crate) fn check_initializing(&self, root: &Path) -> MemResult<()> {
+        self.check_root(root)?;
+        if !root.join(Store::INIT_IN_PROGRESS).is_file() {
+            return Err(MemError::BadArgument(
+                "初始化播种许可不处于活动的 mem init 自举阶段".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn effective_parent(path: &Path) -> &Path {
@@ -480,25 +491,9 @@ impl Store {
                 // 目标配置原子替换是唯一完成点：替换失败保留源标记，核验备份后可重试。
             }
             Some(serde_json::Value::String(v)) if v == "spacememory/2" => {
-                let features = object
-                    .get("required_features")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| MemError::Corrupt {
-                        path: "mem.json".into(),
-                        reason: "required_features 非数组".into(),
-                    })?;
-                if features.iter().any(|v| v.as_str().is_none()) {
-                    return Err(MemError::Corrupt {
-                        path: "mem.json".into(),
-                        reason: "required_features 必须为字符串数组".into(),
-                    });
-                }
-                validate_required_features(
-                    &features
-                        .iter()
-                        .map(|v| v.as_str().unwrap().to_owned())
-                        .collect::<Vec<_>>(),
-                )?;
+                // 已迁移判断必须与 Store::open 共用完整磁盘配置校验；只看
+                // required_features 会把 created=null 等正式打开拒绝的店报为成功。
+                Self::parse_disk_config_value(raw)?;
                 return Ok(MigrationReport {
                     status: MigrationStatus::AlreadyMigrated,
                     backup_identity: backup_identity.into(),
@@ -769,10 +764,10 @@ impl Store {
                 });
             }
         }
-        let config: StoreConfig = serde_json::from_value(raw).map_err(|e| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: e.to_string(),
-        })?;
+        // serde(flatten) 会把任意精度数字交给 typed Map visitor，serde_json 会以
+        // u128 访问器拒绝超过 u128 的未知数。将未知键从 Value 中分离、独立保留，
+        // 只反序列化本程序认识的字段。
+        let config = Self::parse_disk_config_value(raw)?;
         validate_required_features(&config.required_features)?;
         if config.format_version == "1" && mode != OpenMode::ForceReadOnly {
             return Err(MemError::RequiresMigration {
@@ -930,10 +925,29 @@ impl Store {
                 });
             }
         }
-        let config: StoreConfig = serde_json::from_value(raw).map_err(|e| MemError::Corrupt {
-            path: "mem.json".into(),
-            reason: e.to_string(),
-        })?;
+        let known = [
+            "format_version",
+            "required_features",
+            "created",
+            "budgets",
+            "doubt_rules",
+            "session_idle_secs",
+            "subscription",
+            "init",
+        ];
+        let object = raw.as_object_mut().expect("配置顶层对象已校验");
+        let extras = object
+            .iter()
+            .filter(|(key, _)| !known.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        object.retain(|key, _| known.contains(&key.as_str()));
+        let mut config: StoreConfig =
+            serde_json::from_value(raw).map_err(|e| MemError::Corrupt {
+                path: "mem.json".into(),
+                reason: e.to_string(),
+            })?;
+        config.extra = extras;
         validate_required_features(&config.required_features)?;
         Ok(config)
     }
@@ -973,7 +987,18 @@ fn validate_legacy_store(root: &Path) -> MemResult<Vec<String>> {
         )));
     }
     let log = crate::event::EventLog::new(&store).read_log()?;
-    if log.torn_tail || !crate::event::chain_audit(&log.events).is_empty() {
+    let mut seqs = std::collections::HashSet::new();
+    let duplicate_seq = log.events.iter().any(|event| !seqs.insert(event.seq));
+    let contiguous = log
+        .events
+        .iter()
+        .enumerate()
+        .all(|(i, event)| event.seq == i as u64 + 1);
+    if log.torn_tail
+        || !crate::event::chain_audit(&log.events).is_empty()
+        || duplicate_seq
+        || !contiguous
+    {
         return Err(MemError::MigrationState(
             "事件日志存在损坏或链空洞，需先在旧版本修复后再迁移".into(),
         ));
@@ -986,11 +1011,37 @@ fn validate_legacy_store(root: &Path) -> MemResult<Vec<String>> {
     {
         migrated_features.push("event.restore_body/v1".to_owned());
     }
+    // 预检必须覆盖 records、attic 与事件历史 ID 的并集。deep_digest_audit 只
+    // 遍历可见记录，故在此逐 ID 比较事件最终状态与店内现状，缺记录也会被拒绝。
+    let candidates = crate::event::enumerate_candidates(&store, &log)?;
+    let mut state_drift = Vec::new();
+    for candidate in candidates {
+        let current_path =
+            crate::event::current_path_for_id(&store, &candidate.lock_rel, &candidate.id)?;
+        let current = match current_path.as_deref() {
+            Some(path) => crate::event::current_state(&store, path)?,
+            None => crate::event::StateTriple::ABSENT,
+        };
+        let last = log
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.id == candidate.id);
+        let last_state = last.map(crate::event::triple_from_event);
+        let path_drift = match (last, current_path.as_deref()) {
+            (Some(event), Some(path)) => event.path != path,
+            (Some(event), None) => event.op != crate::event::Op::ExternalDelete,
+            (None, _) => true,
+        };
+        if last_state.as_ref() != Some(&current) || path_drift {
+            state_drift.push(candidate.id);
+        }
+    }
     let drift = crate::ops::deep_digest_audit(&store)?;
-    if !drift.is_empty() {
+    if !drift.is_empty() || !state_drift.is_empty() {
         return Err(MemError::MigrationState(format!(
             "记录与事件状态存在 {} 项待对账差异，需先在旧版本修复",
-            drift.len()
+            drift.len() + state_drift.len()
         )));
     }
     let pending = crate::ops::list_pending_commits(&store)?;
@@ -1078,6 +1129,7 @@ impl IndexMaintenancePermit<'_> {
     /// 校验许可确实绑定到目标店，防止跨店复用独占租约。
     pub fn check_store(&self, store: &Store) -> MemResult<()> {
         if self.store.same_physical_store(store)? {
+            store.check_writable()?;
             Ok(())
         } else {
             Err(MemError::BadArgument("索引维护许可属于另一记忆库".into()))

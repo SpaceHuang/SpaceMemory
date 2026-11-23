@@ -138,6 +138,36 @@ fn init_quarantines_and_preserves_an_interrupted_previous_attempt() {
         b"preserve incomplete store for diagnosis"
     );
     assert!(!marker.exists(), "新店发布前须清理中断标记");
+    let staged = std::process::Command::new("git")
+        .args(["-C", path, "ls-files", "--stage", ".init-in-progress"])
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "初始化标记不得进入 Git 暂存快照"
+    );
+    let restored = tmp.path().join("restored-from-index");
+    std::fs::create_dir(&restored).unwrap();
+    let checkout = std::process::Command::new("git")
+        .args(["-C", path, "checkout-index", "--all", "--prefix"])
+        .arg(format!("{}/", restored.display()))
+        .output()
+        .unwrap();
+    assert!(
+        checkout.status.success(),
+        "恢复暂存快照失败: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+    let opened = mem()
+        .args(["--store", restored.to_str().unwrap(), "list"])
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "最终暂存快照恢复后应能打开: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
     let verify = mem().args(["--store", path, "verify"]).output().unwrap();
     assert!(
         verify.status.success(),

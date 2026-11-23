@@ -23,7 +23,7 @@ pub fn dispatch(cli: &Cli) -> Result<i32, String> {
         Err(e @ MemError::Conflict { .. }) => {
             eprintln!(
                 "{}",
-                serde_json::json!({ "error": e.to_string(), "conflict": true })
+                serde_json::json!({ "error": e.to_string(), "conflict": true, "machine": e.machine_info() })
             );
             Ok(2) // 冲突是独立退出码（一等结果，D3）
         }
@@ -32,11 +32,17 @@ pub fn dispatch(cli: &Cli) -> Result<i32, String> {
         Err(e) if e.param_kind().is_some() => {
             eprintln!(
                 "{}",
-                serde_json::json!({ "error": e.to_string(), "kind": e.param_kind() })
+                serde_json::json!({ "error": e.to_string(), "kind": e.param_kind(), "machine": e.machine_info() })
             );
             Ok(1)
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": e.to_string(), "machine": e.machine_info()})
+            );
+            Ok(1)
+        }
     }
 }
 
@@ -494,6 +500,7 @@ fn cmd_init(
         .map(|o| o.status.success())
         .unwrap_or(false);
     if git_ok {
+        // 初始化标记只保护工作树中的中断恢复；不得进入用户提交的初始快照。
         let _ = std::process::Command::new("git")
             .arg("-C")
             .arg(path)
@@ -504,6 +511,9 @@ fn cmd_init(
                 "user.email=mem@local",
                 "add",
                 "-A",
+                "--",
+                ".",
+                ":!.init-in-progress",
             ])
             .output();
     }

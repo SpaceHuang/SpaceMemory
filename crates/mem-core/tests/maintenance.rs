@@ -74,7 +74,8 @@ fn fresh_store(with_git: bool) -> (tempfile::TempDir, Store, TypeSet) {
 #[test]
 fn direct_save_plan_rechecks_compatibility_before_persisting() {
     let (_tmp, store, _types) = fresh_store(false);
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["agenda.future/v1"]);
     std::fs::write(store.abs("mem.json"), serde_json::to_vec(&config).unwrap()).unwrap();
     let plan = Plan {
@@ -89,7 +90,9 @@ fn direct_save_plan_rechecks_compatibility_before_persisting() {
 
     let error = agenda::save_plan(&store, &plan).unwrap_err();
 
-    assert!(matches!(error, MemError::MissingFeatures(features) if features == vec!["agenda.future/v1"]));
+    assert!(
+        matches!(error, MemError::MissingFeatures(features) if features == vec!["agenda.future/v1"])
+    );
     assert!(!store.abs("agenda/feature-gated-plan.json").exists());
 }
 
@@ -107,7 +110,8 @@ fn direct_agenda_and_pending_reads_recheck_compatibility() {
     };
     agenda::save_plan(&store, &plan).unwrap();
 
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["agenda.future/v1"]);
     std::fs::write(store.abs("mem.json"), serde_json::to_vec(&config).unwrap()).unwrap();
 
@@ -121,20 +125,28 @@ fn direct_agenda_and_pending_reads_recheck_compatibility() {
 fn direct_event_state_reads_recheck_compatibility() {
     let (_tmp, store, _types) = fresh_store(false);
     let rel = "records/project/proj.md";
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["event.future/v1"]);
     std::fs::write(store.abs("mem.json"), serde_json::to_vec(&config).unwrap()).unwrap();
 
     let expected = |err| matches!(err, MemError::MissingFeatures(features) if features == vec!["event.future/v1"]);
-    assert!(expected(mem_core::event::current_state(&store, rel).unwrap_err()));
-    assert!(expected(mem_core::event::current_state_for_id(&store, rel, Some(PROJECT)).unwrap_err()));
-    assert!(expected(mem_core::event::current_path_for_id(&store, rel, PROJECT).unwrap_err()));
+    assert!(expected(
+        mem_core::event::current_state(&store, rel).unwrap_err()
+    ));
+    assert!(expected(
+        mem_core::event::current_state_for_id(&store, rel, Some(PROJECT)).unwrap_err()
+    ));
+    assert!(expected(
+        mem_core::event::current_path_for_id(&store, rel, PROJECT).unwrap_err()
+    ));
 }
 
 #[test]
 fn direct_event_enumeration_rechecks_compatibility() {
     let (_tmp, store, _types) = fresh_store(false);
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["event.future/v1"]);
     std::fs::write(store.abs("mem.json"), serde_json::to_vec(&config).unwrap()).unwrap();
 
@@ -145,6 +157,7 @@ fn direct_event_enumeration_rechecks_compatibility() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn record_scan_rechecks_compatibility_after_scanning() {
     let (_tmp, store, _types) = fresh_store(false);
     let result = ops::scan_all_with_hook_test(&store, |_| {
@@ -176,7 +189,9 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext::new(store, types, "t").with_committer(None).with_session_id(None)
+    WriteContext::new(store, types, "t")
+        .with_committer(None)
+        .with_session_id(None)
 }
 
 // ---------- agenda：机械性扫描（D6：自主的注意力 = 机械动作） ----------

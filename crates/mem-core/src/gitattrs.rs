@@ -28,7 +28,7 @@ fn has_git(store: &Store) -> bool {
 /// init 播种（四件套之①）：店根写入默认内容。幂等——已存在则不动（不吞用户
 /// 自带文件；其冲突状态由 [`ensure_for_write`] 在受管写入时结构化处置）。
 pub fn seed_at_root(root: &std::path::Path, permit: &crate::store::InitPermit) -> MemResult<()> {
-    permit.check_root(root)?;
+    permit.check_initializing(root)?;
     let path = root.join(GITATTRIBUTES_REL);
     if path.exists() {
         return Ok(());
@@ -104,7 +104,10 @@ mod tests {
         let store = store_with_git(tmp.path(), false);
         assert!(!has_git(&store));
         assert_eq!(ensure_for_write(&store).unwrap(), false);
-        assert!(!store.abs(GITATTRIBUTES_REL).exists(), "无 .git 的店不补种（BD5：不适用）");
+        assert!(
+            !store.abs(GITATTRIBUTES_REL).exists(),
+            "无 .git 的店不补种（BD5：不适用）"
+        );
         assert!(audit_findings(false, None).is_empty());
     }
 
@@ -112,8 +115,15 @@ mod tests {
     fn missing_file_reseeded_and_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store_with_git(tmp.path(), true);
-        assert_eq!(ensure_for_write(&store).unwrap(), true, "补种须回报（入当批提交）");
-        assert_eq!(std::fs::read(store.abs(GITATTRIBUTES_REL)).unwrap(), GITATTRIBUTES_CONTENT);
+        assert_eq!(
+            ensure_for_write(&store).unwrap(),
+            true,
+            "补种须回报（入当批提交）"
+        );
+        assert_eq!(
+            std::fs::read(store.abs(GITATTRIBUTES_REL)).unwrap(),
+            GITATTRIBUTES_CONTENT
+        );
         // 再核验：内容相符 → Ok(false)。
         assert_eq!(ensure_for_write(&store).unwrap(), false);
     }
@@ -125,7 +135,10 @@ mod tests {
         std::fs::write(store.abs(GITATTRIBUTES_REL), b"*.png binary\n").unwrap();
         let err = ensure_for_write(&store).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("* -text"), "错误含修复指引（恢复默认内容即解锁）：{msg}");
+        assert!(
+            msg.contains("* -text"),
+            "错误含修复指引（恢复默认内容即解锁）：{msg}"
+        );
         // 读路径不受影响——本函数只在写例程调用。
         // 恢复默认内容后解锁。
         std::fs::write(store.abs(GITATTRIBUTES_REL), GITATTRIBUTES_CONTENT).unwrap();
@@ -145,11 +158,16 @@ mod tests {
     #[test]
     fn seed_at_root_is_idempotent_and_never_overwrites() {
         let tmp = tempfile::tempdir().unwrap();
-        let permit = crate::store::Store::acquire_init_lock(tmp.path()).unwrap();
-        seed_at_root(tmp.path(), &permit).unwrap();
+        let permit = crate::store::Store::acquire_init_lock(&tmp.path().join("new-store")).unwrap();
+        let root = tmp.path().join("new-store");
+        crate::store::Store::begin_cli_init(&root, &permit).unwrap();
+        seed_at_root(&root, &permit).unwrap();
         // 用户自带文件不被覆盖（冲突处置交给写例程的结构化拒绝）。
-        std::fs::write(tmp.path().join(GITATTRIBUTES_REL), b"custom\n").unwrap();
-        seed_at_root(tmp.path(), &permit).unwrap();
-        assert_eq!(std::fs::read(tmp.path().join(GITATTRIBUTES_REL)).unwrap(), b"custom\n");
+        std::fs::write(root.join(GITATTRIBUTES_REL), b"custom\n").unwrap();
+        seed_at_root(&root, &permit).unwrap();
+        assert_eq!(
+            std::fs::read(root.join(GITATTRIBUTES_REL)).unwrap(),
+            b"custom\n"
+        );
     }
 }

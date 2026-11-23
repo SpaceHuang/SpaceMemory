@@ -1,9 +1,12 @@
+#![cfg(debug_assertions)]
+
 //! §8-4c 事件日志 / 状态覆盖回填 / 漂移扫描测试（D12 / 红线24 / 红线26）。
 //!
 //! 覆盖：v1 创建后崩溃、中间空洞、保版本手改、撕裂尾行、外部删除、外部重命名、
 //! 删除后重建、只读存储外部删除；absent 稳定态（同一次删除只回填一次）；
 //! 回填并发（比较后暂停 → update 完成 → 恢复回填不追加过时事件；双并发回填不重复）。
 
+use std::io::Write;
 use std::time::Duration;
 
 use mem_core::envelope::{Envelope, Ref};
@@ -39,7 +42,14 @@ fn env(id: &str, type_name: &str, version: u64) -> Envelope {
 }
 
 /// 手写记录文件落盘（模拟人/崩溃产物；绕过机制写路径）。
-fn hand_write(store: &Store, rel: &str, id: &str, type_name: &str, version: u64, body: &str) -> String {
+fn hand_write(
+    store: &Store,
+    rel: &str,
+    id: &str,
+    type_name: &str,
+    version: u64,
+    body: &str,
+) -> String {
     let e = env(id, type_name, version);
     let payload = serde_json::json!({"slug": "x"});
     let bytes = mem_core::record::serialize_new(&e, &payload, body.as_bytes());
@@ -51,7 +61,9 @@ fn hand_write(store: &Store, rel: &str, id: &str, type_name: &str, version: u64,
 }
 
 fn digest_of(store: &Store, rel: &str) -> Option<String> {
-    std::fs::read(store.abs(rel)).ok().map(|b| token::sha256_hex(&b))
+    std::fs::read(store.abs(rel))
+        .ok()
+        .map(|b| token::sha256_hex(&b))
 }
 
 fn event_count(store: &Store) -> usize {
@@ -69,10 +81,28 @@ fn append_assigns_sequential_seq_and_roundtrips() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
     let e1 = log
-        .append_test_event("0198a", "records/task/p/a.md", Op::Create, None, Some(1), None, Some("d1"), "tester")
+        .append_test_event(
+            "0198a",
+            "records/task/p/a.md",
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some("d1"),
+            "tester",
+        )
         .unwrap();
     let e2 = log
-        .append_test_event("0198a", "records/task/p/a.md", Op::Update, Some(1), Some(2), Some("d1"), Some("d2"), "tester")
+        .append_test_event(
+            "0198a",
+            "records/task/p/a.md",
+            Op::Update,
+            Some(1),
+            Some(2),
+            Some("d1"),
+            Some("d2"),
+            "tester",
+        )
         .unwrap();
     assert_eq!(e1.seq, 1);
     assert_eq!(e2.seq, 2, "序号 = 行序，全库串行分配");
@@ -87,22 +117,88 @@ fn append_assigns_sequential_seq_and_roundtrips() {
 fn torn_tail_is_truncated_and_reported() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d"),
+        "t",
+    )
+    .unwrap();
     // 模拟崩溃撕裂：追加半行 JSON（无换行）。
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.abs("events.jsonl"))
+            .unwrap();
         f.write_all(b"{\"seq\":2,\"ts\":\"20").unwrap();
     }
     let read = log.read_log().unwrap();
     assert_eq!(read.events.len(), 1, "坏行忽略");
     assert!(read.torn_tail, "撕裂尾行必须显式报告");
     // 追加例程先补行界再写：新事件 seq=2，坏行被截断。
-    let e = log.append_test_event("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    let e = log
+        .append_test_event(
+            "0198b",
+            "records/y.md",
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some("d"),
+            "t",
+        )
+        .unwrap();
     assert_eq!(e.seq, 2);
     let read2 = log.read_log().unwrap();
     assert_eq!(read2.events.len(), 2);
     assert!(!read2.torn_tail, "追加后行界修复");
+}
+
+#[test]
+fn torn_tail_repair_preserves_complete_prefix_bytes() {
+    let (_t, store) = fresh_store();
+    let log = event::EventLog::new(&store);
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d"),
+        "t",
+    )
+    .unwrap();
+    let path = store.abs("events.jsonl");
+    let prefix = std::fs::read(&path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"seq\":2,broken")
+        .unwrap();
+    let err = log.append_test_event(
+        "0198b",
+        "records/y.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d"),
+        "t",
+    );
+    assert!(err.is_ok(), "修复尾行后应可继续追加");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.starts_with(&prefix),
+        "先前成功登记的事件字节必须完整保留"
+    );
+    assert_eq!(log.read_log().unwrap().events.len(), 2);
 }
 
 // ---------- 状态三元组 ----------
@@ -114,12 +210,20 @@ fn state_triple_locations() {
     // absent（一等状态）
     assert_eq!(
         event::current_state(&store, rel).unwrap(),
-        StateTriple { location: Location::Absent, version: None, digest: None }
+        StateTriple {
+            location: Location::Absent,
+            version: None,
+            digest: None
+        }
     );
     let d = hand_write(&store, rel, "0198a", "task", 3, "body");
     assert_eq!(
         event::current_state(&store, rel).unwrap(),
-        StateTriple { location: Location::Records, version: Some(3), digest: Some(d) }
+        StateTriple {
+            location: Location::Records,
+            version: Some(3),
+            digest: Some(d)
+        }
     );
     // 移入 attic（受管 tombstone）
     std::fs::create_dir_all(store.abs("attic/task/p")).unwrap();
@@ -127,7 +231,11 @@ fn state_triple_locations() {
     let d2 = digest_of(&store, "attic/task/p/a.md").unwrap();
     assert_eq!(
         event::current_state(&store, rel).unwrap(),
-        StateTriple { location: Location::Attic, version: Some(3), digest: Some(d2) }
+        StateTriple {
+            location: Location::Attic,
+            version: Some(3),
+            digest: Some(d2)
+        }
     );
 }
 
@@ -158,8 +266,28 @@ fn backfill_middle_version_hole_reported_not_faked() {
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
     // v1 create，然后伪造 v3 update（v2 缺失——版本链断裂）。
-    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d1"), "t").unwrap();
-    log.append_test_event("0198a", "records/x.md", Op::Update, Some(3), Some(3), Some("d3"), Some("d3"), "t").unwrap();
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d1"),
+        "t",
+    )
+    .unwrap();
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Update,
+        Some(3),
+        Some(3),
+        Some("d3"),
+        Some("d3"),
+        "t",
+    )
+    .unwrap();
     // 回填无动作（last==cur 稳定——文件与 v3 一致即可；此处文件不存在 → absent≠records → 会 backfill。
     // 为聚焦链审计，手写文件与 v3 状态一致）。
     hand_write(&store, "records/x.md", "0198a", "task", 3, "v3 body");
@@ -201,13 +329,24 @@ fn backfill_external_delete_and_absent_stable_state() {
     std::fs::remove_file(store.abs(rel)).unwrap();
     let report = event::reconcile_backfill(&store, "t", None).unwrap();
     assert_eq!(report.appended.len(), 1);
-    assert_eq!(report.appended[0].op, Op::ExternalDelete, "外部删除产生 external_delete（B1）");
+    assert_eq!(
+        report.appended[0].op,
+        Op::ExternalDelete,
+        "外部删除产生 external_delete（B1）"
+    );
     assert_eq!(report.appended[0].new_digest, None);
     assert_eq!(report.appended[0].new_v, None);
-    assert_eq!(report.appended[0].path, rel, "path = 最后已知路径（ID↔路径映射）");
+    assert_eq!(
+        report.appended[0].path, rel,
+        "path = 最后已知路径（ID↔路径映射）"
+    );
     // absent == absent → 同一次删除只回填一次（稳定态，本轮 B1）。
     let again = event::reconcile_backfill(&store, "t", None).unwrap();
-    assert!(again.appended.is_empty(), "不得重复回填：{:?}", again.appended);
+    assert!(
+        again.appended.is_empty(),
+        "不得重复回填：{:?}",
+        again.appended
+    );
     // 漂移也不再见（absent 已登记）。
     let drift = mem_core::drift::scan_current_drift(&store, 100).unwrap();
     assert!(drift.items.is_empty(), "{:?}", drift.items);
@@ -228,7 +367,10 @@ fn two_reconciles_two_diffs_second_clean() {
     let r2 = event::reconcile_backfill(&store, "t", None).unwrap();
     assert!(r2.appended.is_empty(), "第二次 reconcile 不新增事件");
     let d2 = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
-    assert!(d2.current_drift.items.is_empty(), "不再出现于 current_drift——absent 稳定态");
+    assert!(
+        d2.current_drift.items.is_empty(),
+        "不再出现于 current_drift——absent 稳定态"
+    );
 }
 
 #[test]
@@ -242,7 +384,11 @@ fn backfill_external_rename_moves_path_mapping() {
     std::fs::create_dir_all(store.abs("records/task/p")).unwrap();
     std::fs::rename(store.abs(rel), store.abs(new_rel)).unwrap();
     let report = event::reconcile_backfill(&store, "t", None).unwrap();
-    assert_eq!(report.appended.len(), 1, "重命名必须被检出（路径参与状态比较）");
+    assert_eq!(
+        report.appended.len(),
+        1,
+        "重命名必须被检出（路径参与状态比较）"
+    );
     assert_eq!(report.appended[0].path, new_rel, "事件 path 更新为新路径");
     let again = event::reconcile_backfill(&store, "t", None).unwrap();
     assert!(again.appended.is_empty(), "稳定态");
@@ -260,13 +406,26 @@ fn delete_then_recreate_yields_backfill_not_external_delete() {
     std::fs::create_dir_all(store.abs("attic/task/p")).unwrap();
     std::fs::rename(store.abs(rel), store.abs(attic_rel)).unwrap();
     event::EventLog::new(&store)
-        .append_test_event("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
+        .append_test_event(
+            "0198a",
+            attic_rel,
+            Op::Delete,
+            Some(1),
+            Some(1),
+            Some(&d1),
+            Some(&d1),
+            "t",
+        )
         .unwrap();
     // 重新创建（人手把文件拷回 records/ 同路径）。
     hand_write(&store, rel, "0198a", "task", 1, "recreated");
     let report = event::reconcile_backfill(&store, "t", None).unwrap();
     assert_eq!(report.appended.len(), 1);
-    assert_eq!(report.appended[0].op, Op::Backfill, "重建是 backfill，不是 external_delete");
+    assert_eq!(
+        report.appended[0].op,
+        Op::Backfill,
+        "重建是 backfill，不是 external_delete"
+    );
     assert_eq!(report.appended[0].path, rel);
 }
 
@@ -281,7 +440,10 @@ fn readonly_store_backfill_rejected_drift_still_visible() {
     hand_write(&ro, rel, "0198a", "task", 1, "x");
     let drift = mem_core::drift::scan_current_drift(&ro, 100).unwrap();
     assert_eq!(drift.items.len(), 1);
-    assert!(drift.items[0].readonly_note.is_some(), "B 项标注只读无法登记");
+    assert!(
+        drift.items[0].readonly_note.is_some(),
+        "B 项标注只读无法登记"
+    );
     // 回填是写例程 → 结构化拒绝。
     assert!(matches!(
         event::reconcile_backfill(&ro, "t", None),
@@ -320,7 +482,16 @@ fn paused_backfill_does_not_append_stale_event_after_update() {
     hand_write(&store, rel, "0198a", "task", 3, "v3-by-update");
     let d3 = digest_of(&store, rel).unwrap();
     event::EventLog::new(&store)
-        .append_test_event("0198a", rel, Op::Update, Some(2), Some(3), Some(&d2), Some(&d3), "updater")
+        .append_test_event(
+            "0198a",
+            rel,
+            Op::Update,
+            Some(2),
+            Some(3),
+            Some(&d2),
+            Some(&d3),
+            "updater",
+        )
         .unwrap();
     tx.send(()).unwrap();
     let report = h.join().unwrap();
@@ -352,8 +523,15 @@ fn double_concurrent_backfill_no_duplicates() {
     for h in handles {
         total += h.join().unwrap().appended.len();
     }
-    assert_eq!(event_count(&store), 1, "8 路并发回填，事件日志恰好 1 条 backfill");
-    assert_eq!(total, 1, "并发回填被记录锁串行化，后者锁内重算 last==cur → 无动作");
+    assert_eq!(
+        event_count(&store),
+        1,
+        "8 路并发回填，事件日志恰好 1 条 backfill"
+    );
+    assert_eq!(
+        total, 1,
+        "并发回填被记录锁串行化，后者锁内重算 last==cur → 无动作"
+    );
 }
 
 #[test]
@@ -369,7 +547,16 @@ fn backfill_restore_interleave_no_misordered_events() {
     std::fs::create_dir_all(store.abs("attic/task/p")).unwrap();
     std::fs::rename(store.abs(rel), store.abs(attic_rel)).unwrap();
     event::EventLog::new(&store)
-        .append_test_event("0198a", attic_rel, Op::Delete, Some(1), Some(1), Some(&d1), Some(&d1), "t")
+        .append_test_event(
+            "0198a",
+            attic_rel,
+            Op::Delete,
+            Some(1),
+            Some(1),
+            Some(&d1),
+            Some(&d1),
+            "t",
+        )
         .unwrap();
     // 回填A 启动（会看到漂移：attic 有文件但最后事件是 delete？——delete 事件后状态=attic，
     // cur=attic → last==cur 稳定！要制造漂移：把 attic 文件改一下（保版本手改 tombstone）。
@@ -392,7 +579,16 @@ fn backfill_restore_interleave_no_misordered_events() {
     // 暂停期间：restore 完成——attic 文件移回 records + restore 事件（摘要真实）。
     std::fs::rename(store.abs(attic_rel), store.abs(rel)).unwrap();
     event::EventLog::new(&store)
-        .append_test_event("0198a", rel, Op::Restore, Some(1), Some(1), Some(&d1), Some(&d1), "restorer")
+        .append_test_event(
+            "0198a",
+            rel,
+            Op::Restore,
+            Some(1),
+            Some(1),
+            Some(&d1),
+            Some(&d1),
+            "restorer",
+        )
         .unwrap();
     tx.send(()).unwrap();
     let ra = ha.join().unwrap();
@@ -401,7 +597,10 @@ fn backfill_restore_interleave_no_misordered_events() {
     //（不得追加过时的 attic 事件）。
     assert_eq!(ra.appended.len(), 1, "{:?}", ra.appended);
     assert_eq!(ra.appended[0].op, Op::Backfill);
-    assert_eq!(ra.appended[0].path, rel, "补登的是 records 侧新状态，不是过时的 attic 状态");
+    assert_eq!(
+        ra.appended[0].path, rel,
+        "补登的是 records 侧新状态，不是过时的 attic 状态"
+    );
     // 再一轮 reconcile：稳定态，无新事件；漂移清空。
     let again = event::reconcile_backfill(&store, "t", None).unwrap();
     assert!(again.appended.is_empty());
@@ -419,17 +618,44 @@ fn torn_tail_with_newline_repaired_on_append_path() {
     // 而非截断到最后换行（那样坏行保留、追加后成中部坏行）。
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d"),
+        "t",
+    )
+    .unwrap();
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();
-        f.write_all(b"{\"seq\":999,\"ts\":\"20
-").unwrap(); // 坏行（带换行）
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.abs("events.jsonl"))
+            .unwrap();
+        f.write_all(
+            b"{\"seq\":999,\"ts\":\"20
+",
+        )
+        .unwrap(); // 坏行（带换行）
     }
     let read = log.read_log().unwrap();
     assert!(read.torn_tail);
     // 追加后：坏行被移除，日志完全可用。
-    let e = log.append_test_event("0198b", "records/y.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    let e = log
+        .append_test_event(
+            "0198b",
+            "records/y.md",
+            Op::Create,
+            None,
+            Some(1),
+            None,
+            Some("d"),
+            "t",
+        )
+        .unwrap();
     assert_eq!(e.seq, 2);
     let read2 = log.read_log().unwrap();
     assert!(!read2.torn_tail);
@@ -450,7 +676,10 @@ fn torn_tail_repaired_on_reconcile_path() {
         hand_write(&store, rel, "0198a", "task", 1, "x");
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(store.abs("events.jsonl"))
+                .unwrap();
             f.write_all(bad_line.as_bytes()).unwrap();
         }
         // reconcile（会追加 backfill 事件）——坏行必须被截断而非保留。
@@ -471,10 +700,23 @@ fn mid_file_bad_line_stays_loud_not_silently_repaired() {
     // 中部坏行 = 结构损坏（响亮错误），不被自动修复吞掉——修复只针对**尾行**。
     let (_t, store) = fresh_store();
     let log = event::EventLog::new(&store);
-    log.append_test_event("0198a", "records/x.md", Op::Create, None, Some(1), None, Some("d"), "t").unwrap();
+    log.append_test_event(
+        "0198a",
+        "records/x.md",
+        Op::Create,
+        None,
+        Some(1),
+        None,
+        Some("d"),
+        "t",
+    )
+    .unwrap();
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(store.abs("events.jsonl")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.abs("events.jsonl"))
+            .unwrap();
         f.write_all(b"{ broken mid-file line\n").unwrap();
         f.write_all(b"{\"by\":\"t\",\"id\":\"0198b\",\"kind\":\"op\",\"new_digest\":\"d\",\"new_v\":1,\"old_digest\":null,\"old_v\":null,\"op\":\"create\",\"path\":\"records/y.md\",\"seq\":3,\"ts\":\"2026-01-01T00:00:00Z\"}\n").unwrap();
     }
@@ -493,7 +735,11 @@ fn diff_since_separates_log_filter_and_drift() {
     // 手改 v3（未登记 → drift）。
     hand_write(&store, rel, "0198a", "task", 2, "v3-hand-edit");
     let d = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
-    assert_eq!(d.changes_since.len(), 1, "A：按记录去重（一条记录一组变更史）");
+    assert_eq!(
+        d.changes_since.len(),
+        1,
+        "A：按记录去重（一条记录一组变更史）"
+    );
     assert_eq!(d.changes_since[0].history.len(), 2, "变更史完整");
     assert_eq!(d.current_drift.items.len(), 1, "B：未登记变更独立呈现");
     assert!(d.current_drift.items[0].note.contains("backfill 待执行"));
@@ -523,7 +769,10 @@ fn r16_reused_path_keeps_drift_identity_with_original_tombstone() {
     event::reconcile_backfill(&store, "t", None).unwrap();
 
     let before = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
-    assert!(before.current_drift.items.is_empty(), "A 已在 attic，B 已登记，均应稳定");
+    assert!(
+        before.current_drift.items.is_empty(),
+        "A 已在 attic，B 已登记，均应稳定"
+    );
     let report = event::reconcile_backfill(&store, "t", None).unwrap();
     assert!(report.appended.is_empty());
     let after = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
@@ -540,18 +789,36 @@ fn r16_reused_path_keeps_drift_identity_with_original_tombstone() {
     let drift_a = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
     assert_eq!(drift_a.current_drift.items.len(), 1);
     assert_eq!(drift_a.current_drift.items[0].id, "id-a");
-    assert_eq!(drift_a.current_drift.items[0].cur_path.as_deref(), Some(attic.as_str()));
-    assert_eq!(drift_a.current_drift.items[0].token.as_ref().unwrap().digest,
-        mem_core::token::sha256_hex(&a_bytes));
+    assert_eq!(
+        drift_a.current_drift.items[0].cur_path.as_deref(),
+        Some(attic.as_str())
+    );
+    assert_eq!(
+        drift_a.current_drift.items[0]
+            .token
+            .as_ref()
+            .unwrap()
+            .digest,
+        mem_core::token::sha256_hex(&a_bytes)
+    );
     event::reconcile_backfill(&store, "t", None).unwrap();
 
     let b_bytes = rewrite(rel, b"B changed");
     let drift_b = mem_core::drift::diff_since(&store, 999_999, 200, 100).unwrap();
     assert_eq!(drift_b.current_drift.items.len(), 1);
     assert_eq!(drift_b.current_drift.items[0].id, "id-b");
-    assert_eq!(drift_b.current_drift.items[0].cur_path.as_deref(), Some(rel));
-    assert_eq!(drift_b.current_drift.items[0].token.as_ref().unwrap().digest,
-        mem_core::token::sha256_hex(&b_bytes));
+    assert_eq!(
+        drift_b.current_drift.items[0].cur_path.as_deref(),
+        Some(rel)
+    );
+    assert_eq!(
+        drift_b.current_drift.items[0]
+            .token
+            .as_ref()
+            .unwrap()
+            .digest,
+        mem_core::token::sha256_hex(&b_bytes)
+    );
 }
 
 #[test]
@@ -567,7 +834,11 @@ fn diff_works_without_git() {
     event::reconcile_backfill(&store, "t", None).unwrap();
     let d = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
     assert!(d.current_drift.items.is_empty(), "外部删除已由回填登记");
-    assert_eq!(d.changes_since.len(), 1, "按记录去重：一组变更史（backfill+external_delete）");
+    assert_eq!(
+        d.changes_since.len(),
+        1,
+        "按记录去重：一组变更史（backfill+external_delete）"
+    );
     assert_eq!(d.changes_since[0].history.len(), 2);
 }
 

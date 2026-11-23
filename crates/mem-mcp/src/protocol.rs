@@ -33,10 +33,11 @@ pub fn handle_request(store_root: &Path, req: &Value) -> Option<Value> {
     Some(match result {
         Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
         Err(e) => {
-            let mut error = json!({ "code": -32603, "message": e.to_string() });
+            let mut machine = e.machine_info();
             if let Some(kind) = e.param_kind() {
-                error["data"] = json!({ "kind": kind });
+                machine["kind"] = json!(kind);
             }
+            let error = json!({ "code": -32603, "message": e.to_string(), "data": machine });
             json!({ "jsonrpc": "2.0", "id": id, "error": error })
         }
     })

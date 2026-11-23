@@ -9,7 +9,9 @@
 //!   本文件补齐 freshness 矩阵与"外部 git 提交出现于增量"两条。
 
 use mem_core::event::EventLog;
-use mem_core::freshness::{self, Checkpoint, NullSubscription, ReadMode, Subscription};
+use mem_core::freshness::{self, Checkpoint};
+#[cfg(debug_assertions)]
+use mem_core::freshness::{NullSubscription, ReadMode, Subscription};
 use mem_core::ops;
 use mem_core::session;
 use mem_core::store::{OpenMode, Store};
@@ -28,7 +30,11 @@ fn fresh_store() -> (tempfile::TempDir, Store, TypeSet) {
             let e = e.unwrap();
             let name = e.file_name().to_string_lossy().to_string();
             let p = e.path();
-            let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            let r = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
             if p.is_dir() {
                 walk(&p, &r, out);
             } else {
@@ -73,15 +79,20 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn add_task(store: &Store, types: &TypeSet, slug: &str, body: &str) -> String {
-    let c = ops::WriteContext::new(store, types, "t").with_committer(None).with_session_id(None);
-    ops::add(&c, ops::AddArgs {
-        type_name: "task".into(),
-        payload: serde_json::json!({
-            "project": PROJECT, "slug": slug, "title": slug, "status": "todo"
-        }),
-        body: body.as_bytes().to_vec(),
-        principal: Some(seed_owner(&store, &types)),
-    })
+    let c = ops::WriteContext::new(store, types, "t")
+        .with_committer(None)
+        .with_session_id(None);
+    ops::add(
+        &c,
+        ops::AddArgs {
+            type_name: "task".into(),
+            payload: serde_json::json!({
+                "project": PROJECT, "slug": slug, "title": slug, "status": "todo"
+            }),
+            body: body.as_bytes().to_vec(),
+            principal: Some(seed_owner(&store, &types)),
+        },
+    )
     .unwrap()
     .record
     .envelope
@@ -130,22 +141,34 @@ fn apply_scenario(store: &Store, id: &str, scenario: &Scenario, new_body: &str) 
 
 #[cfg(windows)]
 fn set_mtime(path: &std::path::Path, epoch_secs: u64) {
-    set_mtime_to(path, std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs));
+    set_mtime_to(
+        path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs),
+    );
 }
 
 #[cfg(not(windows))]
 fn set_mtime(path: &std::path::Path, epoch_secs: u64) {
-    set_mtime_to(path, std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs));
+    set_mtime_to(
+        path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs),
+    );
 }
 
 fn set_mtime_to(path: &std::path::Path, t: std::time::SystemTime) {
     #[cfg(unix)]
     {
         // unix: filetime crate 未引入——用 libc utimes 的最小封装。
-        let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let secs = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         unsafe {
             let cpath = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-            let tv = libc::timeval { tv_sec: secs as i64, tv_usec: 0 };
+            let tv = libc::timeval {
+                tv_sec: secs as i64,
+                tv_usec: 0,
+            };
             let mut times = [tv, tv];
             libc::utimes(cpath.as_ptr(), times.as_mut_ptr());
         }
@@ -161,11 +184,11 @@ fn set_mtime_to(path: &std::path::Path, t: std::time::SystemTime) {
 fn crate_win_set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
     // 仅测试使用：SetFileTime 最小封装。
     use std::os::windows::ffi::OsStrExt;
-    
+
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, SetFileTime, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        SetFileTime,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -185,7 +208,10 @@ fn crate_win_set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
         let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         // FILETIME = 100ns since 1601-01-01。
         let ft100 = (dur.as_nanos() / 100) as u64 + 116_444_736_000_000_000u64;
-        let ft = FILETIME { dwLowDateTime: (ft100 & 0xFFFF_FFFF) as u32, dwHighDateTime: (ft100 >> 32) as u32 };
+        let ft = FILETIME {
+            dwLowDateTime: (ft100 & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ft100 >> 32) as u32,
+        };
         SetFileTime(h, std::ptr::null(), std::ptr::null(), &ft);
         CloseHandle(h);
     }
@@ -216,7 +242,11 @@ fn assert_first_read_returns_new_value(scenario: Scenario, force_readonly: bool)
     apply_scenario(&store_ref, &id, &scenario, "new-body-xxxxxx");
     // **第一次读取**必须返回新值（不允许任何"已知可能返回旧值"的快路径）。
     let got = ops::get(&store_ref, &id).unwrap();
-    assert_eq!(got.record.body, "new-body-xxxxxx".as_bytes(), "show 直读新值");
+    assert_eq!(
+        got.record.body,
+        "new-body-xxxxxx".as_bytes(),
+        "show 直读新值"
+    );
     // list/视图层同样直读。
     let filter = mem_core::view::ViewFilter {
         types: vec!["task".into()],
@@ -225,18 +255,26 @@ fn assert_first_read_returns_new_value(scenario: Scenario, force_readonly: bool)
         since: None,
     };
     let list = view::execute_filter(&store_ref, &filter, 100, 0).unwrap();
-    assert!(list.items.iter().any(|i| i.envelope.id == id), "list 直读可见");
+    assert!(
+        list.items.iter().any(|i| i.envelope.id == id),
+        "list 直读可见"
+    );
     if force_readonly {
         // 只读档：写类操作结构化拒绝（§3.4 跨档行）。
-        let c = ops::WriteContext::new(&store_ref, &types, "t").with_committer(None).with_session_id(None);
+        let c = ops::WriteContext::new(&store_ref, &types, "t")
+            .with_committer(None)
+            .with_session_id(None);
         // ReadOnly 在 check_writable（归属解析之前）即返回——归属传 None 即可。
         assert!(matches!(
-            ops::add(&c, ops::AddArgs {
-                type_name: "memory".into(),
-                payload: serde_json::json!({"title": "x"}),
-                body: b"".to_vec(),
-                principal: None,
-            }),
+            ops::add(
+                &c,
+                ops::AddArgs {
+                    type_name: "memory".into(),
+                    payload: serde_json::json!({"title": "x"}),
+                    body: b"".to_vec(),
+                    principal: None,
+                }
+            ),
             Err(mem_core::error::MemError::ReadOnly)
         ));
     }
@@ -273,13 +311,19 @@ fn freshness_restored_mtime_readonly_store() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn freshness_proof_requires_both_conditions() {
     let (_t, store, _types) = fresh_store();
     // 嵌入模式（无检查点）→ 直读。
     let m = freshness::consult(&store, None, None);
     assert!(m.is_direct());
     // 有检查点 + 有订阅 + stat 一致 + 无未消化 → 快路径。
-    let cp = Checkpoint { format_version: store.config().format_version.clone(), ts: mem_core::clock::now_rfc3339(), entries: freshness::stat_snapshot(&store), index_epoch: 0 };
+    let cp = Checkpoint {
+        format_version: store.config().format_version.clone(),
+        ts: mem_core::clock::now_rfc3339(),
+        entries: freshness::stat_snapshot(&store),
+        index_epoch: 0,
+    };
     struct OkSub;
     impl Subscription for OkSub {
         fn undigested_changes_since(&self, _ts: &str) -> Option<u64> {
@@ -290,21 +334,44 @@ fn freshness_proof_requires_both_conditions() {
         }
     }
     let m = freshness::consult(&store, Some(&cp), Some(&OkSub));
-    assert_eq!(m, ReadMode::Indexed { via_subscription: "usn".into() });
+    assert_eq!(
+        m,
+        ReadMode::Indexed {
+            via_subscription: "usn".into()
+        }
+    );
     let cp_path = freshness::checkpoint_path(&store);
     freshness::save_checkpoint_test(&store, &cp).unwrap();
     let checkpoint_bytes = std::fs::read(&cp_path).unwrap();
     let record_stats = freshness::stat_snapshot(&store);
-    let record_bytes: Vec<_> = record_stats.keys().map(|rel| (rel.clone(), std::fs::read(store.abs(rel)).unwrap())).collect();
+    let record_bytes: Vec<_> = record_stats
+        .keys()
+        .map(|rel| (rel.clone(), std::fs::read(store.abs(rel)).unwrap()))
+        .collect();
     let mut legacy_checkpoint = cp.clone();
     legacy_checkpoint.format_version = "1".into();
     let mode = freshness::consult(&store, Some(&legacy_checkpoint), Some(&OkSub));
-    assert!(mode.is_direct(), "新增必需特性后旧检查点不得服务索引读取: {mode:?}");
-    assert_eq!(freshness::stat_snapshot(&store), record_stats, "模拟迁移不得改变记录 stat");
+    assert!(
+        mode.is_direct(),
+        "新增必需特性后旧检查点不得服务索引读取: {mode:?}"
+    );
+    assert_eq!(
+        freshness::stat_snapshot(&store),
+        record_stats,
+        "模拟迁移不得改变记录 stat"
+    );
     for (rel, bytes) in record_bytes {
-        assert_eq!(std::fs::read(store.abs(rel)).unwrap(), bytes, "读取不得改写记录");
+        assert_eq!(
+            std::fs::read(store.abs(rel)).unwrap(),
+            bytes,
+            "读取不得改写记录"
+        );
     }
-    assert_eq!(std::fs::read(&cp_path).unwrap(), checkpoint_bytes, "读取不得清理或改写旧 checkpoint");
+    assert_eq!(
+        std::fs::read(&cp_path).unwrap(),
+        checkpoint_bytes,
+        "读取不得清理或改写旧 checkpoint"
+    );
     // 订阅报告未消化变更 → 直读（索引落后）。
     struct LagSub;
     impl Subscription for LagSub {
@@ -350,28 +417,56 @@ fn diff_two_rounds_with_external_git_commit() {
         .status()
         .unwrap();
     std::process::Command::new("git")
-        .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"])
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ])
         .current_dir(store.root())
         .status()
         .unwrap();
     // 外部手改 + 外部提交（机制路径外）。
     let cur = ops::get(&store, &id).unwrap();
-    let bytes = mem_core::record::serialize_new(&cur.record.envelope, &cur.record.payload, "外部提交的内容".as_bytes());
+    let bytes = mem_core::record::serialize_new(
+        &cur.record.envelope,
+        &cur.record.payload,
+        "外部提交的内容".as_bytes(),
+    );
     std::fs::write(store.abs(&rel), bytes).unwrap();
     std::process::Command::new("git")
-        .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-aqm", "external edit"])
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-aqm",
+            "external edit",
+        ])
         .current_dir(store.root())
         .status()
         .unwrap();
     // 第一轮 diff：外部提交的内容必须出现（与 git 无关——靠状态比较捕获，红线26）。
     let d1 = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
-    assert_eq!(d1.current_drift.items.len(), 1, "{:?}", d1.current_drift.items);
+    assert_eq!(
+        d1.current_drift.items.len(),
+        1,
+        "{:?}",
+        d1.current_drift.items
+    );
     assert!(d1.current_drift.items[0].note.contains("backfill 待执行"));
     // 回填后转正。
     mem_core::event::reconcile_backfill(&store, "t", None).unwrap();
     // 第二轮：不重复入 B；A 里可见。
     let d2 = mem_core::drift::diff_since(&store, 0, 200, 100).unwrap();
-    assert!(d2.current_drift.items.is_empty(), "current_drift 不重复入 B");
+    assert!(
+        d2.current_drift.items.is_empty(),
+        "current_drift 不重复入 B"
+    );
     // 播种的归属身份记录（principal）单独成组，不计入"seed 与 task 各一组"的本意断言。
     let owner_id = seed_owner(&store, &types);
     assert_eq!(
@@ -404,7 +499,10 @@ fn brief_never_creates_or_modifies_ledger() {
     let _ = ops::get(&store, PROJECT).unwrap();
     // sessions/ 无任何台账。
     let (ledgers, _) = session::scan_ledgers(&store).unwrap();
-    assert!(ledgers.is_empty(), "brief 纯读：台账只能由 session start / 写路径创建");
+    assert!(
+        ledgers.is_empty(),
+        "brief 纯读：台账只能由 session start / 写路径创建"
+    );
 }
 
 // 幂等播种归属身份（唯一键路径独占：重复播种返回既有记录——同一 id）。

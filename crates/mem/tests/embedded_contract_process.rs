@@ -406,6 +406,7 @@ fn already_open_store_handle_observes_other_process_writes() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn scan_can_observe_a_valid_mixed_snapshot_during_other_process_updates() {
     let tmp = tempfile::tempdir().unwrap();
     let store_path = tmp.path().join("store");
@@ -506,6 +507,7 @@ fn scan_can_observe_a_valid_mixed_snapshot_during_other_process_updates() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn child_writer_pauses_at_requested_durability_window() {
     let (Ok(root), Ok(ready), Ok(stage)) = (
         std::env::var("SM_KILL_WINDOW_STORE"),
@@ -904,6 +906,7 @@ fn child_installs_missing_feature_for_stale_handle_check() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn child_migration_pauses_at_format_switch() {
     let (Ok(root), Ok(ready), Ok(stage)) = (
         std::env::var("SM_MIGRATION_KILL_STORE"),
@@ -1411,6 +1414,56 @@ fn migrate_command_preserves_unknown_config_and_rejects_unknown_format_without_p
 }
 
 #[test]
+fn cli_and_mcp_expose_structured_compatibility_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+    let store_s = store.to_str().unwrap();
+    let init = mem(&[
+        "--store",
+        store_s,
+        "init",
+        store_s,
+        "--principal",
+        "codex_main",
+    ]);
+    assert!(init.status.success());
+
+    let config_path = store.join("mem.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["event.future/v9"]);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let cli = mem(&["--store", store_s, "reconcile"]);
+    assert!(!cli.status.success());
+    let cli_error: Value = serde_json::from_slice(&cli.stderr).unwrap();
+    assert_eq!(cli_error["machine"]["code"], "missing_features");
+    assert_eq!(
+        cli_error["machine"]["details"]["features"],
+        serde_json::json!(["event.future/v9"])
+    );
+
+    let request = serde_json::json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"mem_reconcile", "arguments":{}}
+    });
+    let response = mem_mcp::handle_request(&store, &request).unwrap();
+    assert_eq!(response["error"]["data"]["code"], "missing_features");
+    assert_eq!(
+        response["error"]["data"]["details"]["features"],
+        serde_json::json!(["event.future/v9"])
+    );
+
+    config["format_version"] = serde_json::json!(1);
+    config.as_object_mut().unwrap().remove("required_features");
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let cli = mem(&["--store", store_s, "list"]);
+    let cli_error: Value = serde_json::from_slice(&cli.stderr).unwrap();
+    assert_eq!(cli_error["machine"]["code"], "requires_migration");
+    assert_eq!(cli_error["machine"]["details"]["current"], "1");
+    assert_eq!(cli_error["machine"]["details"]["target"], "spacememory/2");
+}
+
+#[test]
 fn concurrent_init_processes_publish_one_complete_store() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");
@@ -1453,6 +1506,7 @@ fn concurrent_init_processes_publish_one_complete_store() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn child_restore_body_pauses_at_feature_durability_window() {
     let (Ok(root), Ok(source), Ok(expect), Ok(ready), Ok(stage)) = (
         std::env::var("SM_RESTORE_FEATURE_STORE"),
@@ -1638,6 +1692,7 @@ fn child_registers_existing_feature_after_shared_start_signal() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn child_add_pauses_after_record_publish_until_released() {
     let (Ok(root), Ok(ready), Ok(release)) = (
         std::env::var("SM_FEATURE_RACE_WRITER_STORE"),
@@ -1683,6 +1738,7 @@ fn child_add_pauses_after_record_publish_until_released() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn child_restore_body_starts_after_feature_race_writer_is_paused() {
     let (Ok(root), Ok(id), Ok(expect), Ok(source), Ok(started)) = (
         std::env::var("SM_FEATURE_RACE_RESTORE_STORE"),

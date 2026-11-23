@@ -626,6 +626,104 @@ fn format_migration_rejects_record_event_drift_before_switching_format() {
 }
 
 #[test]
+fn migration_rejects_missing_history_record_duplicate_seq_and_corrupt_target_config() {
+    for case in ["missing", "duplicate-seq", "corrupt-target"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("legacy");
+        Store::create(&root).unwrap();
+        let config_path = root.join("mem.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        if case != "corrupt-target" {
+            let path = root.join("records/task/legacy.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes =
+                mem_core::record::serialize_new(&sample_envelope(), &sample_payload(), b"body");
+            std::fs::write(&path, &bytes).unwrap();
+            let ev = mem_core::event::Event {
+                seq: 1,
+                ts: "2026-11-22T00:00:00Z".into(),
+                id: UUID_A.into(),
+                path: "records/task/legacy.md".into(),
+                op: mem_core::event::Op::Create,
+                old_v: None,
+                new_v: Some(6),
+                old_digest: None,
+                new_digest: Some(mem_core::token::sha256_hex(&bytes)),
+                by: "test".into(),
+                kind: mem_core::event::Kind::Op,
+            };
+            let mut events = ev.to_line();
+            if case == "duplicate-seq" {
+                events.extend_from_slice(&ev.to_line());
+            }
+            std::fs::write(root.join("events.jsonl"), events).unwrap();
+            if case == "missing" {
+                std::fs::remove_file(path).unwrap();
+            }
+        } else {
+            config["created"] = serde_json::Value::Null;
+        }
+        config["format_version"] = serde_json::json!(1);
+        config.as_object_mut().unwrap().remove("required_features");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        assert!(
+            Store::migrate_format_v1(&root, "backup").is_err(),
+            "case={case}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), before, "case={case}");
+    }
+}
+
+#[test]
+fn config_mutations_preserve_arbitrary_precision_unknown_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("precise");
+    Store::create(&root).unwrap();
+    let config_path = root.join("mem.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    raw["opaque"] =
+        serde_json::from_str(r#"{"id":100000000000000000001,"ratio":0.123456789012345678901}"#)
+            .unwrap();
+    std::fs::write(&config_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    let store = Store::open(&root, OpenMode::Auto).unwrap();
+    store
+        .register_required_feature("event.restore_body/v1")
+        .unwrap();
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("100000000000000000001"), "{text}");
+    assert!(text.contains("0.123456789012345678901"), "{text}");
+    store
+        .set_config_value("another", serde_json::json!(true))
+        .unwrap();
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("100000000000000000001"), "{text}");
+    assert!(text.contains("0.123456789012345678901"), "{text}");
+}
+
+#[test]
+fn migration_preserves_arbitrary_precision_unknown_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("precise-legacy");
+    Store::create(&root).unwrap();
+    let path = root.join("mem.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    raw["format_version"] = serde_json::json!(1);
+    raw.as_object_mut().unwrap().remove("required_features");
+    raw["opaque"] =
+        serde_json::from_str(r#"{"id":100000000000000000001,"ratio":0.123456789012345678901}"#)
+            .unwrap();
+    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    Store::migrate_format_v1(&root, "backup").unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("100000000000000000001"), "{text}");
+    assert!(text.contains("0.123456789012345678901"), "{text}");
+}
+
+#[test]
 fn format_migration_refuses_pending_commit_debt_without_switching() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("legacy-pending");
@@ -934,6 +1032,7 @@ fn readonly_store_cannot_turn_external_barrier_into_index_maintenance_permit() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn rust_store_create_does_not_publish_openable_config_before_layout_is_ready() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("atomic-create");
@@ -1160,6 +1259,38 @@ fn init_permit_cannot_create_or_seed_a_different_store() {
     let err = mem_core::gitattrs::seed_at_root(&other, &permit).unwrap_err();
     assert!(matches!(err, mem_core::error::MemError::BadArgument(_)));
     assert!(!other.exists());
+}
+
+#[test]
+fn init_permit_cannot_seed_an_existing_store_outside_bootstrap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("existing");
+    Store::create(&root).unwrap();
+    std::fs::write(root.join(".gitattributes"), b"custom\n").unwrap();
+    let before = snapshot_tree(&root);
+    let permit = Store::acquire_init_lock(&root).unwrap();
+    let err = mem_core::gitattrs::seed_at_root(&root, &permit).unwrap_err();
+    assert!(matches!(err, mem_core::error::MemError::BadArgument(_)));
+    assert_eq!(snapshot_tree(&root), before);
+}
+
+#[test]
+fn maintenance_permit_rejects_read_only_target_handle_for_same_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("store");
+    Store::create(&root).unwrap();
+    let writable = Store::open(&root, OpenMode::Auto).unwrap();
+    let readonly = Store::open(&root, OpenMode::ForceReadOnly).unwrap();
+    let permit = writable.acquire_index_maintenance().unwrap();
+    assert!(matches!(
+        permit.check_store(&readonly),
+        Err(mem_core::error::MemError::ReadOnly)
+    ));
+    let before = snapshot_tree(&root);
+    let err =
+        mem_core::freshness::save_checkpoint(&readonly, &Default::default(), &permit).unwrap_err();
+    assert!(err.to_string().contains("只读"));
+    assert_eq!(snapshot_tree(&root), before);
 }
 
 #[test]

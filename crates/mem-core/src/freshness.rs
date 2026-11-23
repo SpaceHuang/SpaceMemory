@@ -186,6 +186,9 @@ pub fn save_checkpoint(
     permit
         .check_store(store)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    store
+        .check_writable()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     permit
         .check_compatible()
         .map_err(|e| std::io::Error::other(e.to_string()))?;

@@ -1,3 +1,5 @@
+#![cfg(debug_assertions)]
+
 //! §8-4d 写路径测试：add（唯一键原子独占）/ update（全摘要令牌 CAS）/ link / delete /
 //! restore / merge / git 同批提交（commit-pending）。锚点：D3/D11/D17、红线19/22/24、R3.3。
 
@@ -125,7 +127,9 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext::new(store, types, "0198f7b2(zcode_main)").with_committer(None).with_session_id(None)
+    WriteContext::new(store, types, "0198f7b2(zcode_main)")
+        .with_committer(None)
+        .with_session_id(None)
 }
 
 fn task_payload(project: &str, slug: &str, status: &str) -> serde_json::Value {
@@ -207,7 +211,9 @@ fn concurrent_double_add_single_winner() {
         handles.push(std::thread::spawn(move || {
             let s = Store::open(&root, OpenMode::Auto).unwrap();
             let ts = TypeSet::load_dir(&types_dir).unwrap();
-            let c = WriteContext::new(&s, &ts, format!("w{i}")).with_committer(None).with_session_id(None);
+            let c = WriteContext::new(&s, &ts, format!("w{i}"))
+                .with_committer(None)
+                .with_session_id(None);
             ops::add(
                 &c,
                 AddArgs {
@@ -393,7 +399,8 @@ fn update_rechecks_disk_features_after_acquiring_write_barrier() {
     let added = add_task(&store, &types, "feature-gate-update");
     let before = std::fs::read(store.abs(&added.rel)).unwrap();
     let config_path = store.abs("mem.json");
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["record.future/v1"]);
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
@@ -401,11 +408,18 @@ fn update_rechecks_disk_features_after_acquiring_write_barrier() {
         &ctx(&store, &types),
         &added.record.envelope.id,
         &added.token,
-        task_payload("0198f7a9-0000-7cd2-9e3f-000000000001", "feature-gate-update", "done"),
+        task_payload(
+            "0198f7a9-0000-7cd2-9e3f-000000000001",
+            "feature-gate-update",
+            "done",
+        ),
         None,
-    ).unwrap_err();
+    )
+    .unwrap_err();
 
-    assert!(matches!(error, MemError::MissingFeatures(features) if features == vec!["record.future/v1"]));
+    assert!(
+        matches!(error, MemError::MissingFeatures(features) if features == vec!["record.future/v1"])
+    );
     assert_eq!(std::fs::read(store.abs(&added.rel)).unwrap(), before);
 }
 
@@ -847,7 +861,9 @@ fn concurrent_payload_updates_cannot_create_a_dag_cycle() {
         std::thread::spawn(move || {
             let store = Store::open(&root, OpenMode::Auto).unwrap();
             let types = TypeSet::load_dir(&store.abs("types")).unwrap();
-            let ctx = WriteContext::new(&store, &types, "race").with_committer(None).with_session_id(None);
+            let ctx = WriteContext::new(&store, &types, "race")
+                .with_committer(None)
+                .with_session_id(None);
             start.wait();
             ops::update(
                 &ctx,
@@ -1589,7 +1605,9 @@ fn r15_get_rejects_paths_that_escape_store_root() {
 fn commits_include_record_and_events_same_batch() {
     let (_t, store, types) = fresh_store();
     let sink = RecordingSink::default();
-    let c = WriteContext::new(&store, &types, "w").with_committer(Some(&sink)).with_session_id(None);
+    let c = WriteContext::new(&store, &types, "w")
+        .with_committer(Some(&sink))
+        .with_session_id(None);
     let out = ops::add(
         &c,
         AddArgs {
@@ -1614,7 +1632,9 @@ fn commit_failure_becomes_pending_not_rollback() {
         batches: Default::default(),
         fail: true,
     };
-    let c = WriteContext::new(&store, &types, "w").with_committer(Some(&sink)).with_session_id(None);
+    let c = WriteContext::new(&store, &types, "w")
+        .with_committer(Some(&sink))
+        .with_session_id(None);
     let out = ops::add(
         &c,
         AddArgs {

@@ -298,6 +298,7 @@ impl Index {
         permit: &mem_core::store::IndexMaintenancePermit<'_>,
     ) -> MemResult<Index> {
         permit.check_store(store)?;
+        store.check_writable()?;
         permit.check_compatible()?;
         let path = validate_store_index_paths(store)?;
         let mut index = Self::open_store_validated_under_maintenance(store, permit, &path)?;
@@ -311,6 +312,7 @@ impl Index {
         path: &Path,
     ) -> MemResult<Index> {
         permit.check_store(store)?;
+        store.check_writable()?;
         permit.check_compatible()?;
         Self::open(path)
     }

@@ -21,7 +21,9 @@ pub enum MemError {
         source: std::io::Error,
     },
 
-    #[error("frontmatter 不是合法 JSON（{path}）：{reason}——解析失败必须响亮（D18），修复通道 mem fix（R6.3）")]
+    #[error(
+        "frontmatter 不是合法 JSON（{path}）：{reason}——解析失败必须响亮（D18），修复通道 mem fix（R6.3）"
+    )]
     FrontmatterJson { path: String, reason: String },
 
     #[error("frontmatter 结构非法（{path}）：{reason}")]
@@ -46,7 +48,9 @@ pub enum MemError {
     #[error("唯一键字段不得修改（{fields:?}）：移动语义 v1 拒收，转维护例程")]
     UniqueKeyImmut { fields: Vec<String> },
 
-    #[error("payload 不合类型声明（{type_name}，strict）：{violations:?}——修复通道 mem fix（R6.3）")]
+    #[error(
+        "payload 不合类型声明（{type_name}，strict）：{violations:?}——修复通道 mem fix（R6.3）"
+    )]
     SchemaReject {
         type_name: String,
         violations: Vec<Violation>,
@@ -71,7 +75,10 @@ pub enum MemError {
     ReadOnly,
 
     #[error("不支持的数据格式 {found}；当前支持 {supported:?}")]
-    UnsupportedFormat { found: String, supported: Vec<String> },
+    UnsupportedFormat {
+        found: String,
+        supported: Vec<String>,
+    },
 
     #[error("数据目录须先迁移：当前格式 {current}，目标格式 {target}")]
     RequiresMigration { current: String, target: String },
@@ -88,7 +95,9 @@ pub enum MemError {
     #[error("git 提交失败（可重试资源，事件已生效）：{0}")]
     Git(String),
 
-    #[error("受管写入被拒（{path}）：.gitattributes 内容与默认不符——建立并核验后才允许受管写入（BD5 ③）；恢复默认内容 `* -text` 即解锁，读路径不受影响")]
+    #[error(
+        "受管写入被拒（{path}）：.gitattributes 内容与默认不符——建立并核验后才允许受管写入（BD5 ③）；恢复默认内容 `* -text` 即解锁，读路径不受影响"
+    )]
     GitAttributesConflict { path: String },
 
     #[error("计划/文件损坏（{path}）：{reason}")]
@@ -107,7 +116,10 @@ pub type MemResult<T> = Result<T, MemError>;
 
 impl MemError {
     pub fn io(path: impl Into<String>, e: std::io::Error) -> Self {
-        MemError::Io { path: path.into(), source: e }
+        MemError::Io {
+            path: path.into(),
+            source: e,
+        }
     }
 
     /// 机判错误 kind（R10 §2.7）：仅 ParamRejected 携带；两前端据此同码透出。
@@ -116,5 +128,79 @@ impl MemError {
             MemError::ParamRejected { kind, .. } => Some(kind),
             _ => None,
         }
+    }
+
+    /// 稳定的跨前端错误码与已有结构化字段。人读消息仍由 `Display` 提供。
+    pub fn machine_info(&self) -> serde_json::Value {
+        use serde_json::json;
+        let (code, details) = match self {
+            MemError::Io { path, .. } => ("io_error", json!({"path": path})),
+            MemError::FrontmatterJson { path, reason } => {
+                ("frontmatter_json", json!({"path": path, "reason": reason}))
+            }
+            MemError::FrontmatterShape { path, reason } => {
+                ("frontmatter_shape", json!({"path": path, "reason": reason}))
+            }
+            MemError::EnvelopeInvalid { path, reason } => {
+                ("envelope_invalid", json!({"path": path, "reason": reason}))
+            }
+            MemError::Corrupt { path, reason } => {
+                ("corrupt", json!({"path": path, "reason": reason}))
+            }
+            MemError::Conflict { expected, current } => (
+                "conflict",
+                json!({"expected": {"version": expected.version, "digest": expected.digest}, "current": {"version": current.version, "digest": current.digest}}),
+            ),
+            MemError::MissingRecord { id_or_path } => {
+                ("missing_record", json!({"id_or_path": id_or_path}))
+            }
+            MemError::CreateConflict { path, existing_id } => (
+                "create_conflict",
+                json!({"path": path, "existing_id": existing_id}),
+            ),
+            MemError::UniqueKeyImmut { fields } => {
+                ("unique_key_immutable", json!({"fields": fields}))
+            }
+            MemError::SchemaReject {
+                type_name,
+                violations,
+            } => (
+                "schema_reject",
+                json!({"type_name": type_name, "violations": violations.iter().map(|v| json!({"path": v.path, "message": v.message})).collect::<Vec<_>>()}),
+            ),
+            MemError::UnknownType(name) => ("unknown_type", json!({"type_name": name})),
+            MemError::RefTargetMissing { rel, target } => {
+                ("ref_target_missing", json!({"rel": rel, "target": target}))
+            }
+            MemError::CycleDetected(detail) => ("cycle_detected", json!({"detail": detail})),
+            MemError::LockTimeout { lock_path, holder } => (
+                "lock_timeout",
+                json!({"lock_path": lock_path, "holder": holder}),
+            ),
+            MemError::ReadOnly => ("read_only", json!({})),
+            MemError::UnsupportedFormat { found, supported } => (
+                "unsupported_format",
+                json!({"found": found, "supported": supported}),
+            ),
+            MemError::RequiresMigration { current, target } => (
+                "requires_migration",
+                json!({"current": current, "target": target}),
+            ),
+            MemError::MigrationState(reason) => ("migration_state", json!({"reason": reason})),
+            MemError::InvalidFeature(feature) => ("invalid_feature", json!({"feature": feature})),
+            MemError::MissingFeatures(features) => {
+                ("missing_features", json!({"features": features}))
+            }
+            MemError::Git(detail) => ("git_error", json!({"detail": detail})),
+            MemError::GitAttributesConflict { path } => {
+                ("git_attributes_conflict", json!({"path": path}))
+            }
+            MemError::PlanCorrupt { path, reason } => {
+                ("plan_corrupt", json!({"path": path, "reason": reason}))
+            }
+            MemError::BadArgument(detail) => ("bad_argument", json!({"detail": detail})),
+            MemError::ParamRejected { kind, .. } => ("param_rejected", json!({"kind": kind})),
+        };
+        json!({"code": code, "details": details})
     }
 }

@@ -436,13 +436,32 @@ impl<'a> EventLog<'a> {
 /// 撕裂尾行修复：把文件截断到**最后一个完整合法行界**（`good_bytes`）再由调用方
 /// 追加——坏行无论是否自带换行都被移除（序列锁内调用；规范 §4.2）。
 fn repair_torn_tail(p: &std::path::Path, read: &ReadLog) -> MemResult<()> {
+    repair_torn_tail_with(p, read, |file, len| {
+        file.set_len(len).and_then(|_| file.sync_all())
+    })
+}
+
+fn repair_torn_tail_with(
+    p: &std::path::Path,
+    read: &ReadLog,
+    truncate: impl FnOnce(&std::fs::File, u64) -> std::io::Result<()>,
+) -> MemResult<()> {
     if !read.torn_tail {
         return Ok(());
     }
-    let bytes = std::fs::read(p).map_err(|e| MemError::io(p.display().to_string(), e))?;
-    let cut = read.good_bytes.min(bytes.len());
-    if cut < bytes.len() {
-        std::fs::write(p, &bytes[..cut]).map_err(|e| MemError::io(p.display().to_string(), e))?;
+    // 截短只改文件长度，不重写已成功登记的前缀。`fs::write` 会先清空原文件，
+    // 因而修复过程被中断时可能连完整历史一起丢失。
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(p)
+        .map_err(|e| MemError::io(p.display().to_string(), e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| MemError::io(p.display().to_string(), e))?
+        .len();
+    let cut = (read.good_bytes as u64).min(len);
+    if cut < len {
+        truncate(&file, cut).map_err(|e| MemError::io(p.display().to_string(), e))?;
     }
     Ok(())
 }
@@ -1084,5 +1103,34 @@ mod r11_op_tests {
             },
         ];
         assert!(chain_audit(&events).is_empty(), "未知操作值不断言为空洞");
+    }
+}
+
+#[cfg(test)]
+mod torn_tail_failure_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_io_error_leaves_existing_prefix_and_tail_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let prefix = b"{\"seq\":1}\n";
+        let mut original = prefix.to_vec();
+        original.extend_from_slice(b"{\"seq\":2,broken");
+        std::fs::write(&path, &original).unwrap();
+        let read = ReadLog {
+            events: Vec::new(),
+            torn_tail: true,
+            good_bytes: prefix.len(),
+        };
+        let err = repair_torn_tail_with(&path, &read, |_file, _len| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected truncate failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected truncate failure"));
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }

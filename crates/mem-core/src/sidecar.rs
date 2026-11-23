@@ -199,11 +199,9 @@ pub fn serve_with_maintainer(
                 report.rebuilds += 1;
             }
         }
-        // 握手（非阻塞尝试）。B4：应答前**再次新鲜查询**——若仍有未消化变更则
-        // 先经收敛原语维护再应答（Hello.undigested 恒为咨询时刻的新鲜值——r4 B3：
-        // 收敛原语保证"维护后二次查询为 0"才发布检查点，维护期间二次写入不会被
-        // 提前确认）。
-        if listener.try_accept_and_reply(store, sub.as_mut(), maintainer) {
+        // 握手只报告新鲜度状态。所有持久化收敛留给维护 tick，避免读前端握手
+        // 持有整店独占门闩或触发索引/检查点写入。
+        if listener.try_accept_and_reply(store, sub.as_mut()) {
             report.handshakes += 1;
             last_activity = Instant::now();
         }
@@ -225,6 +223,8 @@ pub fn serve_with_maintainer(
 enum Subscription {
     #[cfg(windows)]
     Rdc(Vec<crate::platform::RdcWatcher>), // records/ + attic/ 各一
+    #[cfg(test)]
+    Test(std::sync::Arc<std::sync::atomic::AtomicU64>),
 }
 
 impl Subscription {
@@ -232,7 +232,9 @@ impl Subscription {
         match self {
             #[cfg(windows)]
             Subscription::Rdc(_) => "rdc",
-            #[cfg(not(windows))]
+            #[cfg(test)]
+            Subscription::Test(_) => "test",
+            #[cfg(all(not(windows), not(test)))]
             _ => "unavailable",
         }
     }
@@ -251,7 +253,11 @@ impl Subscription {
                 }
                 Some(total)
             }
-            #[cfg(not(windows))]
+            #[cfg(test)]
+            Subscription::Test(pending) => {
+                Some(pending.swap(0, std::sync::atomic::Ordering::SeqCst))
+            }
+            #[cfg(all(not(windows), not(test)))]
             _ => None,
         }
     }
@@ -267,7 +273,11 @@ impl Subscription {
                     w.reinject(_n);
                 }
             }
-            #[cfg(not(windows))]
+            #[cfg(test)]
+            Subscription::Test(pending) => {
+                pending.fetch_add(_n, std::sync::atomic::Ordering::SeqCst);
+            }
+            #[cfg(all(not(windows), not(test)))]
             _ => {}
         }
     }
@@ -391,35 +401,19 @@ impl Listener {
     /// B4：`undigested` 在**应答时刻**新鲜取得——仍有未消化变更时先执行维护
     ///（经收敛原语，r4 B3：维护后二次查询为 0 才算消化），Hello 恒反映咨询
     /// 时刻的真实订阅状态；未收敛/gap → 如实报告未消化（读路径直读）。
-    fn try_accept_and_reply(
-        &mut self,
-        store: &Store,
-        sub: Option<&mut Subscription>,
-        maintainer: Option<Maintainer<'_>>,
-    ) -> bool {
+    fn try_accept_and_reply(&mut self, store: &Store, sub: Option<&mut Subscription>) -> bool {
         let backend = sub
             .as_ref()
             .map(|s| s.backend())
             .unwrap_or("none")
             .to_string();
         let undigested = match sub {
+            // `fresh_undigested` 会消费通知；握手只读，因此把观察到的数量立即回注，
+            // 后续维护 tick 仍能据此收敛派生索引。
             Some(s) => match s.fresh_undigested() {
                 Some(n) if n > 0 => {
-                    // 咨询时刻仍有未消化：立即消化（收敛原语维护）再应答。
-                    match run_maintenance(store, maintainer, Some(&mut *s)) {
-                        Ok((_, true)) => Some(0),
-                        Ok((ran, false)) => {
-                            // M12/r4 B3：维护执行了但未收敛（或不可证明）→ 信号
-                            // 回注（不丢失）；如实报告未消化（读路径将直读）。
-                            let _ = ran;
-                            s.reinject(n);
-                            Some(n)
-                        }
-                        Err(_) => {
-                            s.reinject(n);
-                            Some(n)
-                        }
-                    }
+                    s.reinject(n);
+                    Some(n)
                 }
                 other => other,
             },
@@ -465,6 +459,29 @@ mod tests {
         let c = endpoint_name(Path::new("C:\\stores\\two"));
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn handshake_reports_pending_change_without_running_maintenance_or_consuming_it() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        Store::create(&root).unwrap();
+        let store = Store::open(&root, crate::store::OpenMode::Auto).unwrap();
+        let mut listener = Listener::bind(&store).unwrap();
+        let pending = std::sync::Arc::new(AtomicU64::new(3));
+        let mut sub = Subscription::Test(pending.clone());
+        let before_checkpoint = crate::freshness::load_checkpoint(&store);
+        let before_index = std::fs::read(store.abs("index/index.sqlite")).ok();
+
+        // 无客户端连接时仍会构造握手视图；路径没有 maintainer 参数，不能触发维护。
+        assert!(!listener.try_accept_and_reply(&store, Some(&mut sub)));
+        assert_eq!(pending.load(Ordering::SeqCst), 3, "握手必须保留变更信号");
+        assert_eq!(crate::freshness::load_checkpoint(&store), before_checkpoint);
+        assert_eq!(
+            std::fs::read(store.abs("index/index.sqlite")).ok(),
+            before_index
+        );
     }
 
     #[test]

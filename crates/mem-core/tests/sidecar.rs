@@ -19,6 +19,7 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn handshake_probe_and_idle_exit() {
     let (_t, store) = fresh_store();
     let store2 = {
@@ -67,13 +68,14 @@ fn single_instance_enforced() {
         let root = store.root().to_path_buf();
         Store::open(&root, OpenMode::Auto).unwrap()
     };
-    let h = std::thread::spawn(move || {
-        sidecar::serve(&store2, Duration::from_secs(30), || false)
-    });
+    let h = std::thread::spawn(move || sidecar::serve(&store2, Duration::from_secs(30), || false));
     // 等 serve 持锁。
     std::thread::sleep(Duration::from_millis(300));
     let err = sidecar::serve(&store3, Duration::from_secs(30), || true).unwrap_err();
-    assert!(matches!(err, mem_core::error::MemError::LockTimeout { .. }), "{err}");
+    assert!(
+        matches!(err, mem_core::error::MemError::LockTimeout { .. }),
+        "{err}"
+    );
     // 清理：stop 标志让第一个退出。
     std::thread::sleep(Duration::from_millis(1200));
     drop(h);
@@ -99,11 +101,23 @@ fn maintenance_rebuilds_checkpoint_on_change() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(saw_checkpoint, "sidecar 初始物化刷新检查点（D5 条件 (a) 原料）");
+    assert!(
+        saw_checkpoint,
+        "sidecar 初始物化刷新检查点（D5 条件 (a) 原料）"
+    );
     // 追加变更（写例程之外的直接事件）→ 维护循环检测 → 检查点时间戳前进。
     let cp1 = mem_core::freshness::load_checkpoint(&store).unwrap();
     mem_core::event::EventLog::new(&store)
-        .append_test_event("x", "records/x.md", mem_core::event::Op::Create, None, Some(1), None, Some("d"), "t")
+        .append_test_event(
+            "x",
+            "records/x.md",
+            mem_core::event::Op::Create,
+            None,
+            Some(1),
+            None,
+            Some("d"),
+            "t",
+        )
         .unwrap();
     std::fs::write(
         store.abs("records/x.md"),

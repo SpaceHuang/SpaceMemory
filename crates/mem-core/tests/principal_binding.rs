@@ -1,3 +1,5 @@
+#![cfg(debug_assertions)]
+
 //! 写路径归属绑定验收（方案 principal-binding-design.md §4.2 十组；决策①–⑦）。
 //!
 //! 覆盖：台账继承、锁外拒绝（全店逐字节一致 + "有 .git 缺 .gitattributes"反例）、
@@ -83,7 +85,9 @@ fn write_principal(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet, session_id: Option<&'a str>) -> WriteContext<'a> {
-    WriteContext::new(store, types, "t").with_committer(None).with_session_id(session_id)
+    WriteContext::new(store, types, "t")
+        .with_committer(None)
+        .with_session_id(session_id)
 }
 
 fn add_memory(
@@ -152,7 +156,10 @@ fn ledger_principal_is_inherited_on_add() {
     )
     .unwrap();
     let out = add_memory(&store, &types, Some(&o.ledger.id), None).unwrap();
-    assert_eq!(out.record.envelope.principal.as_deref(), Some(owner.as_str()));
+    assert_eq!(
+        out.record.envelope.principal.as_deref(),
+        Some(owner.as_str())
+    );
 }
 
 // ---------- 2. 锁外拒绝：全店逐字节一致（含 .gitattributes 反例） ----------
@@ -178,7 +185,10 @@ fn reject_leaves_store_tree_byte_identical_including_gitattrs_counterexample() {
     // 全店文件树前后逐字节一致；.gitattributes 未被创建。
     let after = truth_snapshot(&root);
     assert_eq!(before, after, "锁外拒绝：全店逐字节一致");
-    assert!(!root.join(".gitattributes").exists(), "写前核验不得先于预检");
+    assert!(
+        !root.join(".gitattributes").exists(),
+        "写前核验不得先于预检"
+    );
 }
 
 // ---------- 3. 显式胜出 + 中性告警（决策③） ----------
@@ -268,7 +278,10 @@ fn serial_dangling_ownership_rejected_then_restored_succeeds() {
     // 恢复身份 → 创建成功。
     ops::restore_record(&ctx(&store, &types, None), &owner, None).unwrap();
     let out = add_memory(&store, &types, Some(&o.ledger.id), None).unwrap();
-    assert_eq!(out.record.envelope.principal.as_deref(), Some(owner.as_str()));
+    assert_eq!(
+        out.record.envelope.principal.as_deref(),
+        Some(owner.as_str())
+    );
 }
 
 // ---------- 6/8. 悬空归属并发反例·删除先完成（r2 B4）+ 真相层净零 ----------
@@ -309,7 +322,9 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
             tx.send(()).unwrap();
             rx.lock().unwrap().recv().unwrap();
         });
-        let c = WriteContext::new(&s2, &t2, "add").with_committer(None).with_session_id(Some(&add_session));
+        let c = WriteContext::new(&s2, &t2, "add")
+            .with_committer(None)
+            .with_session_id(Some(&add_session));
         ops::add_with_pause_hook_test(
             &c,
             AddArgs {
@@ -333,7 +348,9 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
     std::thread::spawn(move || {
         let s2 = Store::open(&del_root, OpenMode::Auto).unwrap();
         let t2 = TypeSet::load_dir(&del_types).unwrap();
-        let c = WriteContext::new(&s2, &t2, "del").with_committer(None).with_session_id(None);
+        let c = WriteContext::new(&s2, &t2, "del")
+            .with_committer(None)
+            .with_session_id(None);
         ops::delete_record(&c, &del_owner, &del_tok, false).unwrap();
     })
     .join()
@@ -367,7 +384,10 @@ fn concurrent_delete_wins_branch_add_rejected_with_truth_net_zero() {
     // 真相层净零：前后快照一致（锁文件豁免，决策⑥）；.gitattributes 未被创建。
     let after = truth_snapshot(&root);
     assert_eq!(before, after, "锁内复核拒绝：真相层净零（决策⑥）");
-    assert!(!gitattrs.exists(), "写前核验位于锁内复核之后，拒绝路径不得创建");
+    assert!(
+        !gitattrs.exists(),
+        "写前核验位于锁内复核之后，拒绝路径不得创建"
+    );
 }
 
 // ---------- 7. 悬空归属并发反例·创建先完成（r3 B5）+ 删除侧回归 ----------
@@ -382,13 +402,9 @@ fn concurrent_create_wins_branch_delete_blocked_then_force_warns_and_verify_repo
     let err = ops::delete_record(&ctx(&store, &types, None), &owner, &tok, false).unwrap_err();
     assert!(err.to_string().contains("归属"), "{err}");
     // force 越过：显式告警。
-    let deleted =
-        ops::delete_record(&ctx(&store, &types, None), &owner, &tok, true).unwrap();
+    let deleted = ops::delete_record(&ctx(&store, &types, None), &owner, &tok, true).unwrap();
     assert!(
-        deleted
-            .warnings
-            .iter()
-            .any(|w| w.contains("归属悬空")),
+        deleted.warnings.iter().any(|w| w.contains("归属悬空")),
         "{:?}",
         deleted.warnings
     );
@@ -506,10 +522,7 @@ fn duplicate_principal_self_ownership_returns_loser_protocol() {
     )
     .unwrap();
     assert!(!out.created, "输者协议：created=false");
-    assert_eq!(
-        out.record.envelope.id, owner,
-        "输者返回既有记录"
-    );
+    assert_eq!(out.record.envelope.id, owner, "输者返回既有记录");
     // 正常（非同路径）对照：创建第二个身份并归属第一个 → 走豁免+显式校验路径，
     // 归属锁（owner 的记录）与新记录锁（other）不同路径，正常获取并创建成功。
     let out2 = ops::add(
@@ -523,5 +536,8 @@ fn duplicate_principal_self_ownership_returns_loser_protocol() {
     )
     .unwrap();
     assert!(out2.created, "不同路径：正常创建");
-    assert_eq!(out2.record.envelope.principal.as_deref(), Some(owner.as_str()));
+    assert_eq!(
+        out2.record.envelope.principal.as_deref(),
+        Some(owner.as_str())
+    );
 }
