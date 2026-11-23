@@ -237,11 +237,11 @@ fn show_text_body_multipage_assembly_identity() {
     assert_eq!(joined, body_text, "文本通道跨页拼装恒等（G2 码点对齐修复）");
 }
 
-// ---------- 验收 5：检索对二进制正文的排除边界（直读与快路径两执行器） ----------
+// ---------- 验收 5：Windows RDC 在场时仍由生产直读执行器处理二进制正文 ----------
 
 #[test]
 #[cfg(windows)]
-fn acceptance5_find_excludes_binary_body_coincidence_both_executors() {
+fn acceptance5_find_excludes_binary_body_coincidence_with_rdc_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     init_store(&dir);
@@ -292,29 +292,29 @@ fn acceptance5_find_excludes_binary_body_coincidence_both_executors() {
     assert!(hits.contains(&payload_id), "载荷命中仍在（仅正文区排除）：{f1}");
     assert!(hits.contains(&svg_id), "SVG 文本正文照常命中：{f1}");
 
-    // 快路径执行器（启动 sidecar 物化索引后）同样过验收 5。
+    // 启动 sidecar 后会后台物化索引，但 RDC 不给查询新鲜度证明；生产查询仍直读。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "6"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let mut indexed = false;
+    let mut saw_direct = false;
     for _ in 0..50 {
         let o = mem().args(["--store", s, "find", "abs"]).output().unwrap();
         let v = j(&o);
-        if v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false) {
-            indexed = true;
+        if v["read_mode"].as_object().map(|m| m.contains_key("direct")).unwrap_or(false) {
+            saw_direct = true;
             let hits: Vec<String> = v["hits"].as_array().unwrap()
                 .iter().map(|h| h["id"].as_str().unwrap().to_string()).collect();
-            assert!(!hits.contains(&img_id), "快路径同样排除正文编码巧合：{v}");
-            assert!(hits.contains(&payload_id), "快路径载荷命中仍在：{v}");
-            assert!(hits.contains(&svg_id), "快路径 SVG 正文照常命中：{v}");
+            assert!(!hits.contains(&img_id), "RDC sidecar 在场时仍排除正文编码巧合：{v}");
+            assert!(hits.contains(&payload_id), "RDC sidecar 在场时载荷命中仍在：{v}");
+            assert!(hits.contains(&svg_id), "RDC sidecar 在场时 SVG 文本正文照常命中：{v}");
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    assert!(indexed, "快路径窗口内必须出现 indexed（两执行器同过验收 5）");
+    assert!(saw_direct, "RDC sidecar 在场时查询必须明确标注直读");
     let _ = serve.kill();
 }
 

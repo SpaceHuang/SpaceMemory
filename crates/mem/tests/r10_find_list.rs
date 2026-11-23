@@ -271,28 +271,22 @@ fn cli_number_filter_exact_beyond_f64_safe_range() {
     let same = list(&s, "9007199254740992");
     assert_eq!(ids(&same), ids(&vf), "同一实数互认（决策④的精确承担）");
 
-    // indexed（sidecar 物化后）：**显式确认 read_mode=indexed**（实施评审非阻断
-    // 改进——不确认则 sidecar 证明失败时断言退化为 direct 空转），再断言与 direct
-    // 命中一致。
+    // Windows RDC 只负责后台维护。sidecar 已物化索引后，生产查询仍必须直读。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().unwrap();
     assert!(wait_for(&dir), "sidecar 物化");
-    assert!(
-        wait_until_mode(&s, "indexed", 50, 100),
-        "sidecar 收敛后 list 必须走 indexed（否则本测试的 indexed 断言空转）"
-    );
     let vi2 = list(&s, "9007199254740993");
     let vf2 = list(&s, "9007199254740992.0");
     for v in [&vi2, &vf2] {
         assert!(
-            v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false),
-            "indexed 回归必须真走 indexed（评审非阻断项）：{v}"
+            v["read_mode"].as_object().map(|m| m.contains_key("direct")).unwrap_or(false),
+            "Windows RDC 存在时仍必须走直读：{v}"
         );
     }
-    assert_eq!(ids(&vf2), ids(&vf), "indexed 与 direct 一致（B1 修复后）");
-    assert_eq!(ids(&vi2), ids(&vi), "indexed 与 direct 一致（B1 修复后）");
+    assert_eq!(ids(&vf2), ids(&vf), "sidecar 在场时精确浮点过滤保持一致");
+    assert_eq!(ids(&vi2), ids(&vi), "sidecar 在场时精确整数过滤保持一致");
     serve.kill().ok();
 }
 
@@ -304,27 +298,6 @@ fn wait_for(dir: &std::path::Path) -> bool {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
-
-/// 轮询直到读命令的 read_mode 达到期望（indexed/direct）。
-#[cfg(windows)]
-fn wait_until_mode(s: &str, mode: &str, tries: usize, ms: u64) -> bool {
-    for _ in 0..tries {
-        let v = {
-            let out = mem().args(["--store", s, "list", "--type", "doc"]).output().unwrap();
-            j(&out)
-        };
-        let actual = if v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false) {
-            "indexed"
-        } else {
-            "direct"
-        };
-        if actual == mode {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
     false
 }

@@ -82,8 +82,38 @@ fn single_instance_enforced() {
 }
 
 #[test]
-#[cfg(windows)] // 无 FSEvents 实现的平台不能证明新鲜性，也不会发布索引检查点
-fn maintenance_rebuilds_checkpoint_on_change() {
+fn old_rdc_zero_count_hello_cannot_authorize_indexed_reads() {
+    let (_tmp, store) = fresh_store();
+    let checkpoint = mem_core::freshness::Checkpoint {
+        format_version: store.config().format_version.clone(),
+        ts: "2026-11-24T00:00:00.000Z".into(),
+        entries: mem_core::freshness::stat_snapshot(&store),
+        index_epoch: 1,
+    };
+    let permit = store.acquire_index_maintenance().unwrap();
+    mem_core::freshness::save_checkpoint(&store, &checkpoint, &permit).unwrap();
+    let old_sidecar_hello = sidecar::Hello {
+        version: sidecar::SIDECAR_VERSION,
+        backend: "rdc".into(),
+        undigested: Some(0),
+        max_seq: 0,
+        last_rebuild: String::new(),
+    };
+
+    let mode = mem_core::freshness::consult_with_hello(
+        &store,
+        Some(&checkpoint),
+        Some(&old_sidecar_hello),
+    );
+    assert!(
+        mode.is_direct(),
+        "旧 sidecar 的 RDC 零计数不能授权索引查询：{mode:?}"
+    );
+}
+
+#[test]
+#[cfg(windows)] // RDC 只触发后台物化；无法证明查询新鲜度，故不发布检查点。
+fn rdc_sidecar_does_not_publish_freshness_checkpoint() {
     let (_t, store) = fresh_store();
     let store2 = {
         let root = store.root().to_path_buf();
@@ -92,21 +122,26 @@ fn maintenance_rebuilds_checkpoint_on_change() {
     let h = std::thread::spawn(move || {
         sidecar::serve(&store2, Duration::from_secs(4), || false).unwrap()
     });
-    // sidecar 初始物化 → 检查点存在。
-    let mut saw_checkpoint = false;
+    // 等 sidecar 启动；RDC 可以负责通知后台维护，但不能签发新鲜度检查点。
+    let mut hello = None;
     for _ in 0..40 {
-        if mem_core::freshness::load_checkpoint(&store).is_some() {
-            saw_checkpoint = true;
+        if let Some(reply) = sidecar::probe(&store) {
+            hello = Some(reply);
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(hello.is_some(), "sidecar 应成功启动并响应握手");
+    if let Some(reply) = hello {
+        if reply.backend == "rdc" {
+            assert_eq!(reply.undigested, None, "RDC 不能作为查询新鲜度证明");
+        }
+    }
     assert!(
-        saw_checkpoint,
-        "sidecar 初始物化刷新检查点（D5 条件 (a) 原料）"
+        mem_core::freshness::load_checkpoint(&store).is_none(),
+        "RDC 不能发布新鲜度检查点"
     );
-    // 追加变更（写例程之外的直接事件）→ 维护循环检测 → 检查点时间戳前进。
-    let cp1 = mem_core::freshness::load_checkpoint(&store).unwrap();
+    // 追加变化后，sidecar 仍可触发后台维护；无论维护是否已完成，都不能签发证明。
     std::fs::write(
         store.abs("records/x.md"),
         mem_core::record::serialize_new(
@@ -128,17 +163,11 @@ fn maintenance_rebuilds_checkpoint_on_change() {
         ),
     )
     .unwrap();
-    let mut advanced = false;
-    for _ in 0..40 {
-        if let Some(cp2) = mem_core::freshness::load_checkpoint(&store) {
-            if cp2.ts > cp1.ts {
-                advanced = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(advanced, "维护循环检测变更并刷新检查点");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        mem_core::freshness::load_checkpoint(&store).is_none(),
+        "后台维护不能把 RDC 零计数转换成新鲜度证明"
+    );
     drop(h);
 }
 

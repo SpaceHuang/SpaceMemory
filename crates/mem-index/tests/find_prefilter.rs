@@ -81,7 +81,9 @@ fn publish(store: &Store, epoch: u64, entries: BTreeMap<String, (u128, u64)>) {
 fn hello0() -> Hello {
     Hello {
         version: 1,
-        backend: "rdc".into(),
+        // 这里用具备查询时点证明语义的假定后端测试索引门禁；RDC 的拒绝行为由
+        // mem-core/tests/sidecar.rs 单独覆盖。
+        backend: "usn".into(),
         undigested: Some(0),
         max_seq: 0,
         last_rebuild: "2026-11-10T00:00:00Z".into(),

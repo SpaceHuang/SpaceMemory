@@ -61,7 +61,7 @@ fn seed_memory(dir: &std::path::Path, id_tail: &str, aliases: Vec<&str>, title: 
 
 #[test]
 #[cfg(windows)]
-fn r12_literal_lf_and_backslash_direct_indexed_equal() {
+fn r12_literal_lf_and_backslash_remain_correct_with_rdc_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
@@ -126,7 +126,7 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         direct_hits.push((q.to_string(), ids));
     }
 
-    // sidecar 物化 → indexed 模式。
+    // sidecar 物化索引；Windows RDC 不能证明查询时点新鲜，因此生产查询仍直读。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
         .stdout(std::process::Stdio::null())
@@ -134,50 +134,37 @@ fn r12_literal_lf_and_backslash_direct_indexed_equal() {
         .spawn()
         .unwrap();
     assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    // 数据库文件会在首次物化开始时创建；文件存在不代表索引与真相层已收敛。
-    // principal 已在前面移除；等待四条手写记录都已进入索引读取的列表，再验证快路径。
+    // 等待 sidecar 在场且生产查询依然直读，列表应看到四条手写记录。
     assert!(
         wait_until(
             || {
                 let o = mem().args(["--store", &s, "list", "--limit", "50"]).output().unwrap();
                 let v = j(&o);
                 v["items"].as_array().map(|items| items.len() == 4).unwrap_or(false)
-                    && v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false)
+                    && v["read_mode"].as_object().map(|m| m.contains_key("direct")).unwrap_or(false)
             },
             50,
             100
         ),
-        "sidecar 应先将四条手写记录全部物化到索引"
-    );
-    assert!(
-        wait_until(
-            || {
-                let o = mem().args(["--store", &s, "find", "alpha"]).output().unwrap();
-                let v = j(&o);
-                v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false)
-            },
-            50, 100
-        ),
-        "sidecar 收敛后 find 应走 indexed 模式"
+        "sidecar 在场时生产查询应保持直读，并看到四条手写记录"
     );
 
-    // 逐查询：indexed 命中面 == direct 命中面 == 期望集合（逐 ID 相等，B7-1 关闭条件；
-    // 词项永不含空白 → 折叠列 LF 分隔符不可能被词项跨越——假命中结构性消除）。
+    // 逐查询：RDC sidecar 在场时生产直读命中集合仍与预期一致。
     for (i, (q, _)) in queries.iter().enumerate() {
         let o = mem().args(["--store", &s, "find", q]).output().unwrap();
         let v = j(&o);
         assert!(
-            v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false),
-            "查询 {q:?} 应走 indexed：{v}"
+            v["read_mode"].as_object().map(|m| m.contains_key("direct")).unwrap_or(false),
+            "查询 {q:?} 在 RDC sidecar 在场时仍须直读：{v}"
         );
-        let mut idx_ids: Vec<String> = v["hits"].as_array().unwrap()
+        let mut got_ids: Vec<String> = v["hits"].as_array().unwrap()
             .iter().map(|h| h["id"].as_str().unwrap().to_string()).collect();
-        idx_ids.sort();
+        got_ids.sort();
         let (dq, dref) = &direct_hits[i];
         assert_eq!(dq, q);
         let mut dir_ids = dref.clone();
         dir_ids.sort();
-        assert_eq!(idx_ids, dir_ids, "查询 {q:?} indexed 与 direct 逐 ID 不等（B7-1）\n{v}");
+        assert_eq!(got_ids, dir_ids, "查询 {q:?} 在 RDC sidecar 在场时命中集合变化\n{v}");
     }
     serve.kill().ok();
 }

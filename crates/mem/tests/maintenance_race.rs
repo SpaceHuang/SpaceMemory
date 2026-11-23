@@ -8,8 +8,8 @@
 //!
 //! 修复前：检查点包含新文件状态而索引是旧内容 → Hello 宣称无未消化 + stat 一致
 //! → 旧索引被判新鲜（indexed 返回旧令牌）。
-//! 修复后（收敛原语）：维护后**再次新鲜查询**，>0 继续维护直至收敛；收敛时检查
-//! 点与索引同代（index_epoch 核对）→ indexed 模式的令牌 == 磁盘当前令牌。
+//! Windows RDC 不承担新鲜度证明。sidecar 可以继续后台物化，但生产查询必须直读；
+//! 本测试确认竞态写入后的首次查询直接读到磁盘当前令牌。
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -125,12 +125,15 @@ fn maintenance_race_second_write_not_confirmed_early() {
     let injected = Arc::new(AtomicBool::new(false));
     let injected2 = injected.clone();
     let target2 = target_path.clone();
-    let maintainer = move |store: &mem_core::store::Store|
+    let maintainer = move |
+        store: &mem_core::store::Store,
+        permit: &mem_core::store::IndexMaintenancePermit<'_>,
+    |
         -> mem_core::error::MemResult<mem_core::freshness::MaintainOutcome>
     {
-        let mut idx = mem_index::Index::open_store(store)?;
-        let (_, _, scan_entries) = idx.rebuild_with_entries(store)?;
-        idx.set_body_texts(store)?;
+        let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
+        let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
+        idx.set_body_texts_under_maintenance(permit)?;
         if !injected2.swap(true, Ordering::SeqCst) {
             // 竞态窗口注入：索引扫描完成之后。同尺寸（r→R 等长，摘要必变）
             // + mtime 纳秒还原（绕过 stat 条件）。
@@ -160,30 +163,30 @@ fn maintenance_race_second_write_not_confirmed_early() {
         )
     });
 
-    // 等收敛：注入发生后，收敛原语必须再维护一轮（fresh 查询 >0 → continue）。
-    // 收敛后检查点 index_epoch >= 2（注入轮 + 收敛轮）。
-    let mut converged = false;
+    // 等注入完成。RDC 不发布检查点，因此不以 index_epoch 判断查询是否可用。
+    let mut write_injected = false;
     for _ in 0..80 {
-        let store3 = mem_core::store::Store::open(&dir, mem_core::store::OpenMode::Auto).unwrap();
-        if let Some(cp) = mem_core::freshness::load_checkpoint(&store3) {
-            if cp.index_epoch >= 2 {
-                converged = true;
-                break;
-            }
+        if injected.load(Ordering::SeqCst) {
+            write_injected = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        converged,
-        "维护期间二次写入必须触发再维护（收敛原语），不得被检查点提前确认"
+        write_injected,
+        "测试维护器应完成索引扫描后的竞态写入"
     );
 
-    // 断言：indexed 模式第一次读取的令牌 == 磁盘现状令牌（修复前：旧索引令牌）。
+    // 断言：生产 Windows 查询明确直读，返回的令牌与磁盘当前令牌一致。
     let out = mem()
         .args(["--store", &s, "find", "race-target", "--limit", "5"])
         .output()
         .unwrap();
     let v = j(&out);
+    assert!(
+        v["read_mode"].as_object().is_some_and(|m| m.contains_key("direct")),
+        "RDC 不提供查询新鲜度证明，生产查询必须直读：{v}"
+    );
     let hit_token = v["hits"][0]["token"].as_str().unwrap_or("").to_string();
     let fresh = mem_core::ops::get(&store, &target_id).unwrap();
     assert_eq!(

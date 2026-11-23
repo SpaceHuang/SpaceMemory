@@ -20,7 +20,7 @@ Windows `ReadDirectoryChangesW`（RDC）把目录变化异步交给 watcher。si
 - **理由**：本仓库要求首次读取不能返回旧内容。暂时变慢可接受；返回错误内容不可接受。
 - **依据强度**：微软文档说明 RDC 可异步完成，结果需要在该 I/O 完成后读取；本轮 Windows 实机时序尚未运行。静态边界足以否定“独立探测事件能证明 RDC 已完成”的假设。
 - **可逆性**：以后若接入覆盖完整、权限条件明确且通过 Windows 时序验收的变更日志，可以恢复 indexed；当前数据格式和记录文件不变。
-- **代码护栏**：`Subscription::can_prove_query_freshness` 对 RDC 返回 `false`；Hello 的 `undigested` 为 `null`；RDC 不向检查点发布器提供新鲜度证明。RDC 仍保留，用于驱动后台重建。
+- **代码护栏**：`Subscription::can_prove_query_freshness` 对 RDC 返回 `false`；Hello 的 `undigested` 为 `null`；RDC 不向检查点发布器提供新鲜度证明。两前端共用的 `consult_with_hello` 也会拒绝 `backend=rdc`，因此即使只升级 CLI/MCP、仍连接旧版 sidecar 并收到旧的零计数应答，也只能直读。RDC 仍保留，用于驱动后台重建。
 - **验证护栏**：Windows 测试需确认 sidecar 在场时 CLI/MCP 仍直读并返回等长改写后的新内容；另需覆盖 watcher 取消、等待 I/O 完成及 worker join。
 - **未收口项**：调查 Windows 目标环境可用的强证明来源（包括所需权限、文件系统和网络卷覆盖）；来源不支持或覆盖缺口时继续直读。
 

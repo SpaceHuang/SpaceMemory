@@ -499,7 +499,9 @@ mod tests {
     #[test]
     fn rdc_handshake_does_not_claim_a_query_time_freshness_proof() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::create(tmp.path().join("store")).unwrap();
+        let root = tmp.path().join("store");
+        Store::create(&root).unwrap();
+        let store = Store::open(&root, crate::store::OpenMode::Auto).unwrap();
         let watchers = ["records", "attic"]
             .into_iter()
             .map(|path| {

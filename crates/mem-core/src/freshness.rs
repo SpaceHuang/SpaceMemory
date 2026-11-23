@@ -254,6 +254,13 @@ pub fn consult_with_hello(
             reason: "卷不支持变更日志订阅（永久直读形态）".into(),
         };
     }
+    // RDC 的通知异步交付，旧版 sidecar 即使报告零计数也不能证明查询时点新鲜。
+    // 在共享读门禁拒绝该后端，避免新 CLI/MCP 继续信任仍运行的旧 sidecar。
+    if h.backend == "rdc" {
+        return ReadMode::Direct {
+            reason: "RDC 通知不能证明查询时点新鲜".into(),
+        };
+    }
     if h.undigested != Some(0) {
         return ReadMode::Direct {
             reason: format!("订阅存在未消化变更（{:?}）——索引落后于真相", h.undigested),
