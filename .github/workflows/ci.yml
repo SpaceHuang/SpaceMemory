@@ -16,6 +16,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # 常规全程约 5 分钟；上限只为把环境性挂死变成可见失败（曾遇 runner
+    # 测试步骤静默卡 2 小时）。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
