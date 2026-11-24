@@ -1010,23 +1010,7 @@ impl Store {
     /// 重读磁盘并判定当前句柄可读的缺项。若任一缺项未声明只读兼容则拒绝；
     /// 返回非空缺项时调用方必须走真相层直读，不得使用可能含新语义的派生索引。
     pub fn read_compatible_missing_features(&self) -> MemResult<Vec<String>> {
-        let disk_config = self.read_disk_config()?;
-        let mut missing: Vec<String> = disk_config
-            .required_features
-            .iter()
-            .filter(|feature| !self.supported_features.contains(feature))
-            .cloned()
-            .collect();
-        missing.sort();
-        let unreadable: Vec<String> = missing
-            .iter()
-            .filter(|feature| !Self::read_compatible_features().contains(&feature.as_str()))
-            .cloned()
-            .collect();
-        if !unreadable.is_empty() {
-            return Err(MemError::MissingFeatures(unreadable));
-        }
-        Ok(missing)
+        read_compatible_missing_features_at(self.root())
     }
 
     fn read_disk_config(&self) -> MemResult<StoreConfig> {
@@ -1120,6 +1104,38 @@ impl Store {
     pub fn abs(&self, rel: impl AsRef<std::path::Path>) -> PathBuf {
         self.root.join(rel)
     }
+}
+
+/// 磁盘兼容复核的无句柄形态（评审 B2）：索引等长活对象在**查询返回边界**
+/// 重读磁盘配置用——构造期检查不能撤权，另一进程可在句柄存续期间登记本构建
+/// 不认识的特性。语义与 [`Store::read_compatible_missing_features`] 逐行一致
+///（双入口单源）：未声明只读兼容的缺项 → `Err(MissingFeatures)`；仅有只读
+/// 兼容缺项 → `Ok(missing)`（调用方须转真相层直读）；无缺项 → `Ok(vec![])`。
+pub fn read_compatible_missing_features_at(root: &Path) -> MemResult<Vec<String>> {
+    let path = root.join("mem.json");
+    let bytes = std::fs::read(&path).map_err(|e| MemError::io(path.display().to_string(), e))?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| MemError::Corrupt {
+        path: "mem.json".into(),
+        reason: e.to_string(),
+    })?;
+    let disk_config = Store::parse_disk_config_value(raw)?;
+    let supported = Store::supported_features();
+    let mut missing: Vec<String> = disk_config
+        .required_features
+        .iter()
+        .filter(|feature| !supported.contains(&feature.as_str()))
+        .cloned()
+        .collect();
+    missing.sort();
+    let unreadable: Vec<String> = missing
+        .iter()
+        .filter(|feature| !Store::read_compatible_features().contains(&feature.as_str()))
+        .cloned()
+        .collect();
+    if !unreadable.is_empty() {
+        return Err(MemError::MissingFeatures(unreadable));
+    }
+    Ok(missing)
 }
 
 fn validate_legacy_store(root: &Path) -> MemResult<Vec<String>> {

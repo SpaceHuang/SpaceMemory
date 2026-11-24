@@ -696,6 +696,7 @@ impl Index {
             .map_err(sq_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sq_err)?;
+        self.recheck_compat_at_return()?;
         Ok(rows)
     }
 
@@ -714,6 +715,7 @@ impl Index {
             .map_err(sq_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sq_err)?;
+        self.recheck_compat_at_return()?;
         Ok(rows)
     }
 
@@ -741,7 +743,26 @@ impl Index {
             .map_err(sq_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sq_err)?;
+        self.recheck_compat_at_return()?;
         Ok(rows)
+    }
+
+    /// 查询返回边界的磁盘兼容复核（评审 B2）：构造期检查不能撤权——另一进程
+    /// 可在索引句柄存续期间向 mem.json 登记本构建不认识的特性。store_root 已知
+    /// 时在**返回行之前**重读：未声明只读兼容的缺项 → Err(MissingFeatures)；
+    /// 仅有只读兼容缺项 → 同样拒绝（调用方按既有兜底转真相层直读，如 brief/
+    /// view 快路径的 `.ok()` → 直读分支）。裸索引（无店上下文，仅测试构造）
+    /// 无从复核，跳过。
+    fn recheck_compat_at_return(&self) -> MemResult<()> {
+        let root = match &self.store_root {
+            Some(root) => root,
+            None => return Ok(()),
+        };
+        match mem_core::store::read_compatible_missing_features_at(root) {
+            Err(e) => Err(e),
+            Ok(missing) if !missing.is_empty() => Err(MemError::MissingFeatures(missing)),
+            Ok(_) => Ok(()),
+        }
     }
 
     /// 对账诊断（永不拒收——差异仅报告，红线8）：索引 vs 直读。

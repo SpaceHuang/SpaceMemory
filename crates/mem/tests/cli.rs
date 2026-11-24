@@ -898,3 +898,46 @@ fn cli_truth_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<Stri
     walk(root, "", &mut out);
     out
 }
+
+#[test]
+fn brief_never_returns_indexed_results_when_disk_features_incompatible() {
+    // 评审 B2 端到端：磁盘登记未知特性后，brief 不得输出 indexed 快路径结果。
+    // 本构建未声明只读兼容缺项，故打开阶段即整体拒绝（§4.2 打开表）——结构化
+    // 错误含完整缺项标识；进程内「登记落在返回边界之后」的窗口由索引层回归
+    // （readonly_index_query_rejects_after_disk_feature_registered）确定性覆盖。
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    init_store(&dir);
+    let s = dir.to_str().unwrap();
+    mem()
+        .args([
+            "--store",
+            s,
+            "add",
+            "task",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"slug":"brief-race","title":"B","status":"todo"}"#,
+        ])
+        .output()
+        .unwrap();
+    // 另一进程登记未知特性（直接改写磁盘配置）。
+    let config_path = dir.join("mem.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["brief.future/v1"]);
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let out = mem().args(["--store", s, "brief"]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "未知特性未声明只读兼容时必须拒绝：{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("brief.future/v1"),
+        "结构化错误须含完整缺项标识：{stderr}"
+    );
+}

@@ -679,3 +679,39 @@ fn readonly_store_index_rejects_external_lock_and_open_proved_falls_back_to_dire
     assert!(proved.index.is_none(), "非法店索引不可进入查询路径");
     assert_eq!(std::fs::read(&target).unwrap(), sentinel);
 }
+
+#[test]
+fn readonly_index_query_rejects_after_disk_feature_registered() {
+    // 评审 B2 回归：构造期检查不能撤权——只读索引句柄存续期间，另一进程向
+    // mem.json 登记本构建不认识的特性后，query_all / query_by_type / neighbors
+    // 必须在**返回边界**拒绝（MissingFeatures），调用方按既有兜底转真相层直读。
+    let (_tmp, store) = fresh_store();
+    seed_records(&store, 3, 8);
+    let mut setup = mem_index::Index::open_store(&store).unwrap();
+    setup.rebuild(&store).unwrap();
+    drop(setup);
+
+    let index = mem_index::Index::open_store_readonly(&store).unwrap();
+    assert_eq!(index.query_all(10, 0).unwrap().len(), 3, "登记前索引可读");
+    assert_eq!(index.query_by_type("task", 10, 0).unwrap().len(), 3);
+
+    // 另一进程的登记动作：直接改写磁盘配置（与 scan 交错测试同法）。
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    config["required_features"] = serde_json::json!(["index.future/v1"]);
+    std::fs::write(store.abs("mem.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let err = index.query_all(10, 0).unwrap_err();
+    assert!(
+        matches!(err, mem_core::error::MemError::MissingFeatures(ref f) if f == &vec!["index.future/v1".to_string()]),
+        "query_all 必须在返回边界拒绝：{err:?}"
+    );
+    assert!(index.query_by_type("task", 10, 0).is_err());
+    let err_n = index
+        .neighbors("0198f7a9-0000-7cd2-9e3f-000000000000", "up")
+        .unwrap_err();
+    assert!(matches!(
+        err_n,
+        mem_core::error::MemError::MissingFeatures(_)
+    ));
+}
