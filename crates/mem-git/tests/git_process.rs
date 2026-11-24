@@ -18,7 +18,11 @@ fn run(dir: &std::path::Path, args: &[&str]) {
         .args(args)
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?} 失败：{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?} 失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// 隔离全局/系统 git 配置（证明 -c 标志自身足以提交——干净环境兜底）。
@@ -58,7 +62,10 @@ fn commit_batch_contains_exactly_the_given_paths() {
     let names = String::from_utf8_lossy(&tree.stdout);
     assert!(names.contains("a.md"), "{names}");
     assert!(names.contains("events.jsonl"), "{names}");
-    assert!(!names.contains("untracked.txt"), "path-scoped 提交不得卷入树外路径：{names}");
+    assert!(
+        !names.contains("untracked.txt"),
+        "path-scoped 提交不得卷入树外路径：{names}"
+    );
 }
 
 #[test]
@@ -66,9 +73,12 @@ fn nothing_to_commit_returns_none() {
     let tmp = git_dir();
     let root = tmp.path();
     let g = GitProcess::new(root);
-    g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "first").unwrap();
+    g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "first")
+        .unwrap();
     // 无新变更：第二次提交 → Ok(None)（提交滞后合法，不是错误）。
-    let out = g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "second").unwrap();
+    let out = g
+        .commit_paths(root, &["a.md".into(), "events.jsonl".into()], "second")
+        .unwrap();
     assert!(out.is_none(), "nothing to commit 必须为 Ok(None)");
 }
 
@@ -85,7 +95,9 @@ fn stale_index_lock_exhausts_retries_and_errors() {
     assert!(err.to_string().contains("index.lock"), "{err}");
     // 清掉陈旧锁后可重试成功（可重试资源语义）。
     std::fs::remove_file(root.join(".git/index.lock")).unwrap();
-    let sha = g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "after").unwrap();
+    let sha = g
+        .commit_paths(root, &["a.md".into(), "events.jsonl".into()], "after")
+        .unwrap();
     assert!(sha.is_some());
 }
 
@@ -99,8 +111,12 @@ fn previous_file_reads_head_and_reports_missing() {
     let g2 = GitProcess::new(nogit.path());
     assert!(g2.previous_file("a.md").unwrap().is_none());
     // HEAD 中存在 → 字节精确。
-    g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "base").unwrap();
-    assert_eq!(g.previous_file("a.md").unwrap(), Some(b"record bytes".to_vec()));
+    g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "base")
+        .unwrap();
+    assert_eq!(
+        g.previous_file("a.md").unwrap(),
+        Some(b"record bytes".to_vec())
+    );
     // HEAD 中不存在（未提交/已删除路径）→ None，不报错。
     assert!(g.previous_file("records/task/never.md").unwrap().is_none());
 }
@@ -136,7 +152,13 @@ fn commit_succeeds_without_global_git_identity() {
         String::from_utf8_lossy(&out.stderr)
     );
     let g = GitProcess::new(root);
-    let sha = g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "with -c flags").unwrap();
+    let sha = g
+        .commit_paths(
+            root,
+            &["a.md".into(), "events.jsonl".into()],
+            "with -c flags",
+        )
+        .unwrap();
     assert!(sha.is_some(), "GitProcess 的 -c 兜底必须在无全局身份时成功");
 }
 
@@ -163,8 +185,14 @@ mod r11_history {
             .unwrap();
         let versions = g.list_versions("a.md").unwrap();
         assert_eq!(versions, vec![sha2.clone(), sha1.clone()], "自新至旧");
-        assert_eq!(g.file_bytes_at("a.md", &sha1).unwrap(), Some(b"record bytes".to_vec()));
-        assert_eq!(g.file_bytes_at("a.md", &sha2).unwrap(), Some(b"record bytes v2".to_vec()));
+        assert_eq!(
+            g.file_bytes_at("a.md", &sha1).unwrap(),
+            Some(b"record bytes".to_vec())
+        );
+        assert_eq!(
+            g.file_bytes_at("a.md", &sha2).unwrap(),
+            Some(b"record bytes v2".to_vec())
+        );
     }
 
     #[test]
@@ -174,7 +202,11 @@ mod r11_history {
         let g = GitProcess::new(root);
         g.commit_paths(root, &["a.md".into()], "v1").unwrap();
         // 路径在该版本不存在 → Ok(None)（history 锚定扫描逐版本取文件的合法分支）。
-        assert!(g.file_bytes_at("records/never.md", "HEAD").unwrap().is_none());
+        assert!(
+            g.file_bytes_at("records/never.md", "HEAD")
+                .unwrap()
+                .is_none()
+        );
         // 坏版本引用 → Err（响亮，不静默当 None——错误信息区分成因）。
         assert!(g.file_bytes_at("a.md", "deadbeef-not-a-rev").is_err());
     }
@@ -199,9 +231,11 @@ mod r11_history {
         let tmp = git_dir();
         let root = tmp.path();
         let g = GitProcess::new(root);
-        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v1").unwrap();
+        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v1")
+            .unwrap();
         std::fs::write(root.join("a.md"), b"v2 bytes").unwrap();
-        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v2").unwrap();
+        g.commit_paths(root, &["a.md".into(), "events.jsonl".into()], "v2")
+            .unwrap();
         let versions = g.list_versions("a.md").unwrap();
         // 环境注记：判据为退出码后，子进程消息文本（含本地化形态）不再参与分支
         // 判定——本测试以三分支语义重跑锁定；git 子进程的 locale 环境继承自
@@ -286,18 +320,37 @@ fn r11_clone_byte_direct_with_gitattributes() {
         .expect("源机提交");
     let _ = sha;
     // 断言规则已在提交树且内容恰为 `* -text`（完成标记 = 提交树核验）。
-    let ls = std::process::Command::new("git").arg("-C").arg(&src)
-        .args(["show", "HEAD:.gitattributes"]).output().unwrap();
-    assert!(ls.status.success() && ls.stdout == b"* -text\n",
-        ".gitattributes 必须在提交树且内容恰为 `* -text\\n`");
+    let ls = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&src)
+        .args(["show", "HEAD:.gitattributes"])
+        .output()
+        .unwrap();
+    assert!(
+        ls.status.success() && ls.stdout == b"* -text\n",
+        ".gitattributes 必须在提交树且内容恰为 `* -text\\n`"
+    );
 
     // 克隆机：强制 core.autocrlf=true（行尾激进配置——BD5 的立法场景）。
     let dst = tmp.path().join("dst");
-    run(tmp.path(), &["clone", "-q", "-c", "core.autocrlf=true", src.to_str().unwrap(), dst.to_str().unwrap()]);
+    run(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "core.autocrlf=true",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ],
+    );
     let cloned_bin = std::fs::read(dst.join("records/memory/bin.md")).unwrap();
     let cloned_lf = std::fs::read(dst.join("records/memory/lf.md")).unwrap();
     assert_eq!(cloned_bin, record_bin, "非法 UTF-8 正文逐字节直通");
-    assert_eq!(cloned_lf, record_lf, "LF 正文逐字节直通（autocrlf=true 不改字节）");
+    assert_eq!(
+        cloned_lf, record_lf,
+        "LF 正文逐字节直通（autocrlf=true 不改字节）"
+    );
     // 事件最后登记摘要 == 克隆机磁盘摘要（深档审计跨机一致，R11.1 迁移语义）。
     assert_eq!(mem_core::token::sha256_hex(&cloned_bin), digest_bin);
     assert_eq!(mem_core::token::sha256_hex(&cloned_lf), digest_lf);

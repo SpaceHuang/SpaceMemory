@@ -15,5 +15,5 @@ pub mod checkpoint;
 pub mod proved;
 pub mod sqlite;
 
-pub use proved::{open_proved, Proved, ProvedIndex};
+pub use proved::{Proved, ProvedIndex, open_proved};
 pub use sqlite::{Index, IndexRow, RefRow};

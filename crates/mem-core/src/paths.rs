@@ -19,7 +19,9 @@ use crate::store::Store;
 /// 锁文件引到店外；最后以 canonicalize 的最近存在祖先再次确认实际落点。
 pub fn validate_store_record_path(store: &Store, rel: &str) -> MemResult<()> {
     let mut parts = std::path::Path::new(rel).components();
-    let expected = if rel.starts_with("records/") { "records" } else if rel.starts_with("attic/") {
+    let expected = if rel.starts_with("records/") {
+        "records"
+    } else if rel.starts_with("attic/") {
         "attic"
     } else {
         return Err(MemError::BadArgument(format!("记录路径非法：{rel}")));
@@ -40,7 +42,9 @@ pub fn validate_store_record_path(store: &Store, rel: &str) -> MemResult<()> {
 pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
     let components: Vec<_> = std::path::Path::new(rel).components().collect();
     if components.is_empty()
-        || components.iter().any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || components
+            .iter()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
         return Err(MemError::BadArgument(format!("店内路径非法：{rel}")));
     }
@@ -48,11 +52,15 @@ pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
         .map_err(|_| MemError::BadArgument(format!("无法确认路径位于店内：{rel}")))?;
     let mut current = store.root().to_path_buf();
     for component in &components {
-        let std::path::Component::Normal(part) = component else { unreachable!() };
+        let std::path::Component::Normal(part) = component else {
+            unreachable!()
+        };
         current.push(part);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if is_link_or_reparse_point(&metadata) => {
-                return Err(MemError::BadArgument(format!("店内路径不能经过符号链接：{rel}")));
+                return Err(MemError::BadArgument(format!(
+                    "店内路径不能经过符号链接：{rel}"
+                )));
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -65,9 +73,9 @@ pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
         if let Ok(path) = std::fs::canonicalize(ancestor) {
             break path;
         }
-        ancestor = ancestor.parent().ok_or_else(|| {
-            MemError::BadArgument(format!("无法确认路径位于店内：{rel}"))
-        })?;
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| MemError::BadArgument(format!("无法确认路径位于店内：{rel}")))?;
     };
     if !canonical_target.starts_with(&root) {
         return Err(MemError::BadArgument(format!("路径越出店目录：{rel}")));
@@ -77,7 +85,10 @@ pub fn validate_store_relative_path(store: &Store, rel: &str) -> MemResult<()> {
 
 /// 校验 store 根目录中的机制锁文件；只允许列明的固定文件名。
 pub fn validate_store_root_lock(store: &Store, rel: &str) -> MemResult<()> {
-    if !matches!(rel, "barrier.lock" | "events.lock" | "serve.lock" | "migration.lock") {
+    if !matches!(
+        rel,
+        "barrier.lock" | "events.lock" | "serve.lock" | "migration.lock"
+    ) {
         return Err(MemError::BadArgument(format!("机制锁路径非法：{rel}")));
     }
     let root = std::fs::canonicalize(store.root())
@@ -85,7 +96,9 @@ pub fn validate_store_root_lock(store: &Store, rel: &str) -> MemResult<()> {
     let target = store.abs(rel);
     match std::fs::symlink_metadata(&target) {
         Ok(metadata) if is_link_or_reparse_point(&metadata) => {
-            return Err(MemError::BadArgument(format!("锁文件不能是符号链接：{rel}")));
+            return Err(MemError::BadArgument(format!(
+                "锁文件不能是符号链接：{rel}"
+            )));
         }
         Ok(_) => {
             let canonical = std::fs::canonicalize(&target)
@@ -116,16 +129,26 @@ fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
 
 /// 店级保留名（envelope-format.md §1.2；大小写折叠后精确匹配）。
 const RESERVED: &[&str] = &[
-    "conventions", "types", "records", "attic", "sessions", "agenda", "index",
-    "events", "tmp", ".git", "mem.json", "events.jsonl", "barrier.lock",
+    "conventions",
+    "types",
+    "records",
+    "attic",
+    "sessions",
+    "agenda",
+    "index",
+    "events",
+    "tmp",
+    ".git",
+    "mem.json",
+    "events.jsonl",
+    "barrier.lock",
     "events.lock",
 ];
 
 /// Windows 保留设备名（stem 匹配，大小写折叠；con.txt 同样拒收）。
 const WIN_DEVICES: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6",
-    "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6",
-    "lpt7", "lpt8", "lpt9",
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
 /// 单个键成分的长度上限（UTF-8 字节；envelope-format.md §2.4）。
@@ -180,11 +203,15 @@ pub fn validate_component(s: &str) -> MemResult<()> {
     }
     let f = fold(&n);
     if RESERVED.contains(&f.as_str()) {
-        return Err(MemError::BadArgument(format!("键成分命中店级保留名：{s:?}")));
+        return Err(MemError::BadArgument(format!(
+            "键成分命中店级保留名：{s:?}"
+        )));
     }
     let stem = f.split('.').next().unwrap_or(&f);
     if WIN_DEVICES.contains(&stem) {
-        return Err(MemError::BadArgument(format!("键成分命中 Windows 设备名：{s:?}")));
+        return Err(MemError::BadArgument(format!(
+            "键成分命中 Windows 设备名：{s:?}"
+        )));
     }
     Ok(())
 }
@@ -199,9 +226,8 @@ pub fn derive_record_rel(
     key_components: &[String],
     id: &str,
 ) -> MemResult<String> {
-    validate_component(type_name).map_err(|_| {
-        MemError::BadArgument(format!("类型名非法：{type_name:?}"))
-    })?;
+    validate_component(type_name)
+        .map_err(|_| MemError::BadArgument(format!("类型名非法：{type_name:?}")))?;
     if key_components.is_empty() {
         return Ok(format!("records/{type_name}/{id}.md"));
     }
@@ -209,9 +235,8 @@ pub fn derive_record_rel(
     for k in key_components {
         let folded = fold(k);
         // 折叠后校验（拒绝注入敌对字符）。
-        validate_component(&folded).map_err(|e| {
-            MemError::BadArgument(format!("唯一键成分非法 {k:?}：{e}"))
-        })?;
+        validate_component(&folded)
+            .map_err(|e| MemError::BadArgument(format!("唯一键成分非法 {k:?}：{e}")))?;
         parts.push(folded);
     }
     let last = parts.len() - 1;
@@ -289,7 +314,9 @@ pub fn path_is_inside_with_cwd(
     }
     // 第二判：规范化兜底（大小写/符号链接/junction；仅父链存在时可行）。
     let canon_root = std::fs::canonicalize(&root_abs).ok();
-    let Some(canon_root) = canon_root else { return false };
+    let Some(canon_root) = canon_root else {
+        return false;
+    };
     if let Ok(canon_path) = std::fs::canonicalize(&path_abs) {
         return canonically_within(&canon_root, &canon_path);
     }
@@ -320,9 +347,7 @@ fn normalize_lexical(p: &std::path::Path) -> String {
                     parts.push("..".into());
                 }
             }
-            std::path::Component::Normal(c) => {
-                parts.push(c.to_string_lossy().to_lowercase())
-            }
+            std::path::Component::Normal(c) => parts.push(c.to_string_lossy().to_lowercase()),
         }
     }
     let sep = std::path::MAIN_SEPARATOR;
@@ -374,10 +399,18 @@ mod r3_path_tests {
         let root = store("s1");
         let cwd = root.clone();
         assert!(path_is_inside_with_cwd(&root, Path::new("x.png"), &cwd));
-        assert!(path_is_inside_with_cwd(&root, Path::new("records/a.md"), &cwd));
+        assert!(path_is_inside_with_cwd(
+            &root,
+            Path::new("records/a.md"),
+            &cwd
+        ));
         // cwd=店外：同一路径落店外 → 判外。
         let outside_cwd = root.parent().unwrap().parent().unwrap().to_path_buf();
-        assert!(!path_is_inside_with_cwd(&root, Path::new("x.png"), &outside_cwd));
+        assert!(!path_is_inside_with_cwd(
+            &root,
+            Path::new("x.png"),
+            &outside_cwd
+        ));
     }
 
     #[test]
@@ -385,18 +418,32 @@ mod r3_path_tests {
         // 店根相对（--store .）：与目标同 cwd 折叠后比较。
         let root = store("s2");
         let cwd = root.clone();
-        assert!(path_is_inside_with_cwd(Path::new("."), Path::new("x.png"), &cwd));
-        assert!(!path_is_inside_with_cwd(Path::new("."), Path::new("../out.png"), &cwd));
+        assert!(path_is_inside_with_cwd(
+            Path::new("."),
+            Path::new("x.png"),
+            &cwd
+        ));
+        assert!(!path_is_inside_with_cwd(
+            Path::new("."),
+            Path::new("../out.png"),
+            &cwd
+        ));
         // cwd=店外、店根为 cwd 下子目录（相对店根形态，含 ./ 折叠）：
         // 店内目标判内、兄弟/上级目标判外（L1b 误拒修正）。
         let parent = root.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(parent.join("store-x/sub")).unwrap();
-        assert!(path_is_inside_with_cwd(Path::new("./store-x/."),
-            Path::new("./store-x/sub/b.md"), &parent),
-            "相对店根（含 ./ 折叠）下的目标判内");
-        assert!(!path_is_inside_with_cwd(Path::new("./store-x"),
-            Path::new("./other/c.md"), &parent),
-            "兄弟目录判外（L1a/L1b 误拒修正）");
+        assert!(
+            path_is_inside_with_cwd(
+                Path::new("./store-x/."),
+                Path::new("./store-x/sub/b.md"),
+                &parent
+            ),
+            "相对店根（含 ./ 折叠）下的目标判内"
+        );
+        assert!(
+            !path_is_inside_with_cwd(Path::new("./store-x"), Path::new("./other/c.md"), &parent),
+            "兄弟目录判外（L1a/L1b 误拒修正）"
+        );
     }
 
     #[test]
@@ -407,8 +454,10 @@ mod r3_path_tests {
         let root = parent.join("store");
         std::fs::create_dir_all(&root).unwrap();
         let sibling = parent.join("store-backup").join("out.png");
-        assert!(!path_is_inside_with_cwd(&root, &sibling, &parent),
-            "兄弟目录不得判店内：{sibling:?}");
+        assert!(
+            !path_is_inside_with_cwd(&root, &sibling, &parent),
+            "兄弟目录不得判店内：{sibling:?}"
+        );
         // 店根带尾分隔符的变体同样边界感知。
         let root_trail = parent.join("store").join("");
         assert!(!path_is_inside_with_cwd(&root_trail, &sibling, &parent));
@@ -419,9 +468,17 @@ mod r3_path_tests {
         let root = store("s3");
         let cwd = root.clone();
         // cwd=店根：../out.png 落上级（店外）→ 判外（原词法 "." 前缀误判内）。
-        assert!(!path_is_inside_with_cwd(&root, Path::new("../out.png"), &cwd));
+        assert!(!path_is_inside_with_cwd(
+            &root,
+            Path::new("../out.png"),
+            &cwd
+        ));
         // 深层 ../：仍外。
-        assert!(!path_is_inside_with_cwd(&root, Path::new("../other/x.png"), &cwd));
+        assert!(!path_is_inside_with_cwd(
+            &root,
+            Path::new("../other/x.png"),
+            &cwd
+        ));
         // ./out.png 落店内 → 判内（正确语义，非误拒）。
         assert!(path_is_inside_with_cwd(&root, Path::new("./out.png"), &cwd));
     }
@@ -440,13 +497,24 @@ mod r3_path_tests {
         assert!(path_is_inside_with_cwd(&root, &inside, &cwd));
         assert!(!path_is_inside_with_cwd(&root, &outside, &cwd));
         // 尚不存在的目标：最近已存在祖先链兜底（词法折叠已先行覆盖常规形态）。
-        assert!(path_is_inside_with_cwd(&root, &root.join("deep").join("missing.md"), &cwd));
-        assert!(!path_is_inside_with_cwd(&root, &tmp.path().join("missing2.md"), &cwd));
+        assert!(path_is_inside_with_cwd(
+            &root,
+            &root.join("deep").join("missing.md"),
+            &cwd
+        ));
+        assert!(!path_is_inside_with_cwd(
+            &root,
+            &tmp.path().join("missing2.md"),
+            &cwd
+        ));
         // 大小写变体（Windows 不敏感；规范化兜底承担）。
         #[cfg(windows)]
         {
             let upper = tmp.path().join("S4").join("deep").join("u.md");
-            assert!(path_is_inside_with_cwd(&root, &upper, &cwd), "大小写变体判内（Windows）");
+            assert!(
+                path_is_inside_with_cwd(&root, &upper, &cwd),
+                "大小写变体判内（Windows）"
+            );
         }
     }
 
@@ -454,7 +522,9 @@ mod r3_path_tests {
     fn cwd_unavailable_conservatively_inside() {
         // 生产入口拿不到 cwd（目录被删等）→ 保守判内（响亮拒绝优于旁挂写入）。
         let root = store("s5");
-        assert!(path_is_inside(&root, Path::new("x.png")) == path_is_inside(&root, Path::new("x.png")));
+        assert!(
+            path_is_inside(&root, Path::new("x.png")) == path_is_inside(&root, Path::new("x.png"))
+        );
         // 生产入口自 env::current_dir 取 cwd——此处仅锁定"入口不 panic、返回布尔"。
         let _ = path_is_inside(&root, Path::new("x.png"));
     }

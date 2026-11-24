@@ -25,9 +25,9 @@ pub mod pipe_windows;
 pub mod macos;
 
 #[cfg(windows)]
-pub use windows::*;
-#[cfg(windows)]
 pub use pipe_windows::*;
+#[cfg(windows)]
+pub use windows::*;
 
 #[cfg(target_os = "macos")]
 pub use macos::*;

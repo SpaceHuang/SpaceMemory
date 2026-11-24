@@ -100,7 +100,9 @@ fn seed_project(store: &Store, id: &str, slug: &str) {
 }
 
 fn ctx<'a>(store: &'a Store, types: &'a TypeSet) -> WriteContext<'a> {
-    WriteContext::new(store, types, "w").with_committer(None).with_session_id(None)
+    WriteContext::new(store, types, "w")
+        .with_committer(None)
+        .with_session_id(None)
 }
 
 fn add_principal(store: &Store, types: &TypeSet, slug: &str) -> String {
@@ -191,7 +193,10 @@ fn start_creates_ledger_with_watermark_and_is_idempotent() {
         },
     )
     .unwrap();
-    assert_eq!(o1.ledger.watermark, 1, "水位 = 正式 principal 写入的事件序号");
+    assert_eq!(
+        o1.ledger.watermark, 1,
+        "水位 = 正式 principal 写入的事件序号"
+    );
     assert_eq!(o1.ledger.status, session::Status::Active);
     assert!(o1.resumed_from.is_none());
     // 幂等键 = principal + view + task_ref：同键 start 返回既有台账。
@@ -516,27 +521,52 @@ fn existing_session_handle_rejects_session_writes_after_disk_features_change() {
         idle_secs: 86_400,
     };
     let started = session::start(&store, args.clone()).unwrap();
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.abs("mem.json")).unwrap()).unwrap();
     config["required_features"] = serde_json::json!(["session.future/v1"]);
-    std::fs::write(store.abs("mem.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    std::fs::write(
+        store.abs("mem.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
     let before_sessions = dir_snapshot(&store.abs("sessions"));
     let before_events = std::fs::read(store.abs("events.jsonl")).unwrap();
 
-    let start_error = session::start(&store, StartArgs { task_ref: Some("after-change".into()), ..args }).unwrap_err();
-    let flush_error = session::flush(&store, &started.ledger.id, vec!["read-id".into()], None).unwrap_err();
+    let start_error = session::start(
+        &store,
+        StartArgs {
+            task_ref: Some("after-change".into()),
+            ..args
+        },
+    )
+    .unwrap_err();
+    let flush_error =
+        session::flush(&store, &started.ledger.id, vec!["read-id".into()], None).unwrap_err();
     let close_error = session::close(&store, &started.ledger.id).unwrap_err();
     for err in [start_error, flush_error, close_error] {
-        assert!(matches!(err, mem_core::error::MemError::MissingFeatures(_)), "{err}");
+        assert!(
+            matches!(err, mem_core::error::MemError::MissingFeatures(_)),
+            "{err}"
+        );
     }
     assert_eq!(dir_snapshot(&store.abs("sessions")), before_sessions);
-    assert_eq!(std::fs::read(store.abs("events.jsonl")).unwrap(), before_events);
+    assert_eq!(
+        std::fs::read(store.abs("events.jsonl")).unwrap(),
+        before_events
+    );
 }
 
 fn dir_snapshot(path: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    std::fs::read_dir(path).unwrap().map(|entry| {
-        let path = entry.unwrap().path();
-        (path.file_name().unwrap().into(), std::fs::read(&path).unwrap())
-    }).collect()
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().into(),
+                std::fs::read(&path).unwrap(),
+            )
+        })
+        .collect()
 }
 
 // ---------- 视图：声明式查询模板（D10，只依赖信封 R8.4） ----------

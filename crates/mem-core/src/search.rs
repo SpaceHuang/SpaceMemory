@@ -63,7 +63,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const BIN: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF];
+    const BIN: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'a', b'b', b's', 0x00, 0xFF,
+    ];
 
     #[test]
     fn r11_body_gate_non_utf8_never_matches() {
@@ -78,17 +80,41 @@ mod tests {
     fn r11_body_gate_valid_utf8_body_still_matches() {
         // (iii) 合法 UTF-8 正文（SVG 文本）照常命中。
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg">abstract-geometry</svg>"#;
-        assert!(record_matches("0198-id", &[], &json!({}), svg, &fold("abstract")));
+        assert!(record_matches(
+            "0198-id",
+            &[],
+            &json!({}),
+            svg,
+            &fold("abstract")
+        ));
     }
 
     #[test]
     fn r11_other_domains_still_hit_on_binary_record() {
         // (ii) 非文本记录的 id 前缀 / 别名 / 载荷值照常参与。
         let bin = BIN;
-        assert!(record_matches("img-abs-01", &[], &json!({}), bin, &fold("img")));
-        assert!(record_matches("0198-id", &["abs-alias".into()], &json!({}), bin, &fold("abs-ali")));
+        assert!(record_matches(
+            "img-abs-01",
+            &[],
+            &json!({}),
+            bin,
+            &fold("img")
+        ));
+        assert!(record_matches(
+            "0198-id",
+            &["abs-alias".into()],
+            &json!({}),
+            bin,
+            &fold("abs-ali")
+        ));
         assert!(
-            record_matches("0198-id", &[], &json!({"filename":"abs.png"}), bin, &fold("abs.png")),
+            record_matches(
+                "0198-id",
+                &[],
+                &json!({"filename":"abs.png"}),
+                bin,
+                &fold("abs.png")
+            ),
             "锁定『仅正文区排除』边界"
         );
     }
@@ -96,7 +122,19 @@ mod tests {
     #[test]
     fn legacy_body_matching_unchanged_for_utf8() {
         // 既有语义回归：合法 UTF-8 正文子串匹配不受门槛影响。
-        assert!(record_matches("id", &[], &json!({}), b"hello world", &fold("world")));
-        assert!(!record_matches("id", &[], &json!({}), b"hello world", &fold("xyz")));
+        assert!(record_matches(
+            "id",
+            &[],
+            &json!({}),
+            b"hello world",
+            &fold("world")
+        ));
+        assert!(!record_matches(
+            "id",
+            &[],
+            &json!({}),
+            b"hello world",
+            &fold("xyz")
+        ));
     }
 }

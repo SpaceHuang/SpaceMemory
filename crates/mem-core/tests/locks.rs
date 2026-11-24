@@ -35,13 +35,22 @@ fn barrier_exclusive_excludes_shared_and_exclusive() {
     let (_t, store) = fresh_store();
     {
         let s = lock::barrier_shared(&store).unwrap();
-        assert!(lock::try_barrier_exclusive(&store).is_err(), "共享持有期间独占必须失败");
+        assert!(
+            lock::try_barrier_exclusive(&store).is_err(),
+            "共享持有期间独占必须失败"
+        );
         drop(s);
     }
     {
         let x = lock::barrier_exclusive(&store).unwrap();
-        assert!(lock::try_barrier_exclusive(&store).is_err(), "独占持有期间第二个独占必须失败");
-        assert!(lock::try_barrier_shared(&store).is_err(), "独占持有期间共享必须失败");
+        assert!(
+            lock::try_barrier_exclusive(&store).is_err(),
+            "独占持有期间第二个独占必须失败"
+        );
+        assert!(
+            lock::try_barrier_shared(&store).is_err(),
+            "独占持有期间共享必须失败"
+        );
         drop(x);
     }
     let s = lock::barrier_shared(&store).unwrap();
@@ -67,7 +76,10 @@ fn barrier_is_held_not_probed() {
         drop(g);
     });
     std::thread::sleep(Duration::from_millis(150));
-    assert!(rx.try_recv().is_err(), "独占屏障持有期间，共享写不得进入（持有而非探测）");
+    assert!(
+        rx.try_recv().is_err(),
+        "独占屏障持有期间，共享写不得进入（持有而非探测）"
+    );
     drop(x);
     h.join().unwrap();
     // 子线程已成功进入并退出。
@@ -81,7 +93,10 @@ fn record_lock_works_when_record_file_missing() {
     // 记录文件不存在（待创建/absent），锁文件独立存在。
     assert!(!store.abs(REC).exists());
     let g = lock::record_lock(&store, REC, Duration::from_secs(2)).unwrap();
-    assert!(store.abs(format!("{REC}.lock")).is_file(), "锁文件独立于记录存在");
+    assert!(
+        store.abs(format!("{REC}.lock")).is_file(),
+        "锁文件独立于记录存在"
+    );
     // 锁文件内容 JSON：pid/host/ts。
     let content = std::fs::read_to_string(store.abs(format!("{REC}.lock"))).unwrap();
     let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -93,7 +108,10 @@ fn record_lock_works_when_record_file_missing() {
 fn record_lock_is_exclusive_within_process() {
     let (_t, store) = fresh_store();
     let g = lock::record_lock(&store, REC, Duration::from_secs(2)).unwrap();
-    assert!(lock::try_record_lock(&store, REC).unwrap().is_none(), "同进程重入必须忙");
+    assert!(
+        lock::try_record_lock(&store, REC).unwrap().is_none(),
+        "同进程重入必须忙"
+    );
     // 不同路径互不影响。
     let other = lock::try_record_lock(&store, "records/task/p2/other.md").unwrap();
     assert!(other.is_some());
@@ -127,7 +145,10 @@ fn stale_lock_with_dead_pid_is_stealable() {
     std::fs::create_dir_all(lock_file.parent().unwrap()).unwrap();
     std::fs::write(
         &lock_file,
-        format!("{{\"pid\":{},\"host\":\"ghost\",\"ts\":\"2020-01-01T00:00:00Z\"}}", u32::MAX - 7),
+        format!(
+            "{{\"pid\":{},\"host\":\"ghost\",\"ts\":\"2020-01-01T00:00:00Z\"}}",
+            u32::MAX - 7
+        ),
     )
     .unwrap();
     let g = lock::record_lock(&store, REC, Duration::from_millis(500)).unwrap();
@@ -146,17 +167,28 @@ fn live_holder_is_never_stolen() {
     let t0 = std::time::Instant::now();
     let err = lock::record_lock(&store, REC, Duration::from_millis(150)).unwrap_err();
     assert!(matches!(err, mem_core::error::MemError::LockTimeout { .. }));
-    assert!(t0.elapsed() >= Duration::from_millis(140), "必须等待到超时而不是立即放弃或抢锁");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(140),
+        "必须等待到超时而不是立即放弃或抢锁"
+    );
     drop(g);
 }
 
 #[test]
 fn r15_child_lock_probe() {
-    let Ok(root) = std::env::var("MEM_R15_LOCK_PROBE_ROOT") else { return };
+    let Ok(root) = std::env::var("MEM_R15_LOCK_PROBE_ROOT") else {
+        return;
+    };
     let store = Store::open(std::path::Path::new(&root), OpenMode::Auto).unwrap();
     match std::env::var("MEM_R15_LOCK_PROBE_KIND").as_deref() {
-        Ok("barrier") => { lock::try_barrier_exclusive(&store).expect("跨进程独占门闩可获取"); }
-        _ => { lock::try_record_lock(&store, REC).unwrap().expect("跨进程记录锁可获取"); }
+        Ok("barrier") => {
+            lock::try_barrier_exclusive(&store).expect("跨进程独占门闩可获取");
+        }
+        _ => {
+            lock::try_record_lock(&store, REC)
+                .unwrap()
+                .expect("跨进程记录锁可获取");
+        }
     }
 }
 
@@ -165,7 +197,8 @@ fn child_probe(store: &Store, kind: &str) -> std::process::Output {
         .args(["--exact", "r15_child_lock_probe", "--nocapture"])
         .env("MEM_R15_LOCK_PROBE_ROOT", store.root())
         .env("MEM_R15_LOCK_PROBE_KIND", kind)
-        .output().unwrap()
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -175,13 +208,19 @@ fn r15_macos_lock_guards_remain_cross_process_until_last_drop() {
     let g2 = lock::barrier_shared(&store).unwrap();
     assert!(!child_probe(&store, "barrier").status.success());
     drop(g1);
-    assert!(!child_probe(&store, "barrier").status.success(), "g2 仍活跃时子进程仍不得取得独占");
+    assert!(
+        !child_probe(&store, "barrier").status.success(),
+        "g2 仍活跃时子进程仍不得取得独占"
+    );
     drop(g2);
     assert!(child_probe(&store, "barrier").status.success());
 
     let g = lock::record_lock(&store, REC, Duration::from_secs(2)).unwrap();
     assert!(lock::record_lock(&store, REC, Duration::from_millis(40)).is_err());
-    assert!(!child_probe(&store, "record").status.success(), "超时诊断不能关闭/释放原 guard 的跨进程锁");
+    assert!(
+        !child_probe(&store, "record").status.success(),
+        "超时诊断不能关闭/释放原 guard 的跨进程锁"
+    );
     drop(g);
     assert!(child_probe(&store, "record").status.success());
 }
@@ -257,8 +296,14 @@ fn foreign_host_lock_is_never_stolen() {
     let _os_lock = mem_core::platform::LockFile::acquire_exclusive(&lock_file).unwrap();
     let t0 = std::time::Instant::now();
     let err = lock::record_lock(&store, REC, Duration::from_millis(200)).unwrap_err();
-    assert!(matches!(err, mem_core::error::MemError::LockTimeout { .. }), "{err}");
-    assert!(t0.elapsed() >= Duration::from_millis(190), "跨主机持有者只等待不抢");
+    assert!(
+        matches!(err, mem_core::error::MemError::LockTimeout { .. }),
+        "{err}"
+    );
+    assert!(
+        t0.elapsed() >= Duration::from_millis(190),
+        "跨主机持有者只等待不抢"
+    );
     // owner 文件未被污染（LockTimeout 报告的持有者 = 他机信息）。
     let content = std::fs::read_to_string(&lock_file).unwrap();
     assert!(content.contains("some-other-host"), "{content}");

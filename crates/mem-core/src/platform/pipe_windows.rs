@@ -4,20 +4,17 @@
 //! `try_serve_one` 非阻塞尝试：无客户端连接 → false；有 → 读请求、写应答、断开、
 //! 重建监听实例。客户端见 `pipe_client_exchange`。
 
-
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, HANDLE, WAIT_OBJECT_0,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+};
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, ResetEvent, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 
 const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
 const PIPE_WAIT: u32 = 0x0000_0000;
@@ -72,14 +69,20 @@ impl PipeServer {
             let mut ov: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
             ov.hEvent = event;
             let rc = ConnectNamedPipe(handle, &mut ov);
-            let pending = rc == 0 && (last_err() == ERROR_IO_PENDING || last_err() == ERROR_PIPE_LISTENING);
+            let pending =
+                rc == 0 && (last_err() == ERROR_IO_PENDING || last_err() == ERROR_PIPE_LISTENING);
             if rc == 0 && !pending && last_err() != ERROR_PIPE_CONNECTED {
                 CloseHandle(handle);
                 CloseHandle(event);
                 return Err(std::io::Error::last_os_error());
             }
             let connected = rc == 0 && last_err() == ERROR_PIPE_CONNECTED;
-            Ok(PipeServer { handle, event, name: name.to_string(), pending_connect: pending || connected })
+            Ok(PipeServer {
+                handle,
+                event,
+                name: name.to_string(),
+                pending_connect: pending || connected,
+            })
         }
     }
 
@@ -104,7 +107,13 @@ impl PipeServer {
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = self.event;
             ResetEvent(self.event);
-            let ok = ReadFile(self.handle, buf.as_mut_ptr() as _, buf.len() as u32, std::ptr::null_mut(), &mut ov);
+            let ok = ReadFile(
+                self.handle,
+                buf.as_mut_ptr() as _,
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                &mut ov,
+            );
             if ok == 0 && last_err() != ERROR_IO_PENDING && last_err() != ERROR_BROKEN_PIPE {
                 return self.recreate();
             }
@@ -112,7 +121,9 @@ impl PipeServer {
                 return self.recreate();
             }
             let mut got = 0u32;
-            if GetOverlappedResult(self.handle, &ov, &mut got, 0) == 0 && last_err() != ERROR_BROKEN_PIPE {
+            if GetOverlappedResult(self.handle, &ov, &mut got, 0) == 0
+                && last_err() != ERROR_BROKEN_PIPE
+            {
                 return self.recreate();
             }
             // 只在请求已读完后构造应答，避免使用接受连接前的旧新鲜度快照。
@@ -120,7 +131,13 @@ impl PipeServer {
             // 写应答（重叠 I/O）。
             ResetEvent(self.event);
             let mut written = 0u32;
-            let okw = WriteFile(self.handle, reply.as_ptr() as _, reply.len() as u32, &mut written, &mut ov);
+            let okw = WriteFile(
+                self.handle,
+                reply.as_ptr() as _,
+                reply.len() as u32,
+                &mut written,
+                &mut ov,
+            );
             if okw == 0 && last_err() == ERROR_IO_PENDING {
                 if WaitForSingleObject(self.event, IO_TIMEOUT_MS) != WAIT_OBJECT_0 {
                     return self.recreate();
@@ -178,14 +195,26 @@ pub fn pipe_client_exchange(name: &str, request: &[u8]) -> Option<Vec<u8>> {
             return None; // 管道不存在：sidecar 不在
         }
         let mut written = 0u32;
-        let okw = WriteFile(h, request.as_ptr() as _, request.len() as u32, &mut written, std::ptr::null_mut());
+        let okw = WriteFile(
+            h,
+            request.as_ptr() as _,
+            request.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
         if okw == 0 {
             CloseHandle(h);
             return None;
         }
         let mut buf = [0u8; 1024];
         let mut got = 0u32;
-        let okr = ReadFile(h, buf.as_mut_ptr() as _, buf.len() as u32, &mut got, std::ptr::null_mut());
+        let okr = ReadFile(
+            h,
+            buf.as_mut_ptr() as _,
+            buf.len() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        );
         CloseHandle(h);
         if okr == 0 || got == 0 {
             return None;

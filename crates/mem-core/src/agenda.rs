@@ -463,8 +463,7 @@ pub fn apply(
                 .as_ref()
                 .expect("步骤检查点已持久化")
                 .clone();
-            let ctx = ops::WriteContext::new(store, types, "mem apply")
-                .with_committer(committer);
+            let ctx = ops::WriteContext::new(store, types, "mem apply").with_committer(committer);
             match step {
                 PlanStep::Merge { dup, canonical } => {
                     ops::merge_locked(

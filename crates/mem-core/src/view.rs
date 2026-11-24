@@ -33,7 +33,11 @@ impl ViewFilter {
         let types = f
             .get("types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let refs = f
             .get("refs")
@@ -51,10 +55,19 @@ impl ViewFilter {
         let principals = f
             .get("principals")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let since = f.get("since").and_then(|v| v.as_str()).map(String::from);
-        Ok(ViewFilter { types, refs, principals, since })
+        Ok(ViewFilter {
+            types,
+            refs,
+            principals,
+            since,
+        })
     }
 
     pub fn matches(&self, env: &Envelope) -> bool {
@@ -69,7 +82,11 @@ impl ViewFilter {
             }
         }
         for (rel, target) in &self.refs {
-            if !env.refs.iter().any(|e| &e.rel == rel && &e.target == target) {
+            if !env
+                .refs
+                .iter()
+                .any(|e| &e.rel == rel && &e.target == target)
+            {
                 return false;
             }
         }
@@ -108,7 +125,12 @@ pub fn execute(store: &Store, view_id: &str, limit: usize) -> MemResult<ViewResu
 }
 
 /// 执行视图（自 offset 续读）。
-pub fn execute_from(store: &Store, view_id: &str, limit: usize, offset: usize) -> MemResult<ViewResult> {
+pub fn execute_from(
+    store: &Store,
+    view_id: &str,
+    limit: usize,
+    offset: usize,
+) -> MemResult<ViewResult> {
     let v = ops::get(store, view_id)?;
     if v.record.envelope.r#type != "view" {
         return Err(MemError::BadArgument(format!("{view_id} 不是 view 记录")));
@@ -118,7 +140,12 @@ pub fn execute_from(store: &Store, view_id: &str, limit: usize, offset: usize) -
 }
 
 /// 按过滤器执行（brief/list 的底层入口）。
-pub fn execute_filter(store: &Store, filter: &ViewFilter, limit: usize, offset: usize) -> MemResult<ViewResult> {
+pub fn execute_filter(
+    store: &Store,
+    filter: &ViewFilter,
+    limit: usize,
+    offset: usize,
+) -> MemResult<ViewResult> {
     store.read_compatible_missing_features()?;
     let scan = ops::scan_all(store)?;
     let mut matched: Vec<Scanned> = scan
@@ -139,12 +166,22 @@ pub fn execute_filter(store: &Store, filter: &ViewFilter, limit: usize, offset: 
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|s| ListItem { rel: s.rel, envelope: s.record.envelope, token: s.token })
+        .map(|s| ListItem {
+            rel: s.rel,
+            envelope: s.record.envelope,
+            token: s.token,
+        })
         .collect();
     let remaining = total.saturating_sub(offset + page.len());
     let result = ViewResult {
         truncated: remaining > 0,
-        resume_hint: if remaining > 0 { Some(ResumeHint { offset: offset + page.len() }) } else { None },
+        resume_hint: if remaining > 0 {
+            Some(ResumeHint {
+                offset: offset + page.len(),
+            })
+        } else {
+            None
+        },
         items: page,
     };
     store.read_compatible_missing_features()?;

@@ -73,7 +73,10 @@ fn load_rejects_wrong_draft_and_non_object() {
         TypeDecl::load("x", b"[1,2,3]"),
         Err(LoadError::NotObject)
     ));
-    assert!(matches!(TypeDecl::load("x", b"not json"), Err(LoadError::Json(_))));
+    assert!(matches!(
+        TypeDecl::load("x", b"not json"),
+        Err(LoadError::Json(_))
+    ));
 }
 
 #[test]
@@ -121,22 +124,37 @@ fn grade_policy_decides_reject_vs_warn() {
     let bad = json!({ "slug": "x", "title": "x", "status": "nope" });
     let v = d.validate_payload(&bad);
     assert_eq!(d.policy(&v), mem_schema::Policy::Reject, "strict → 拒收");
-    let d2 = TypeDecl::load("memory", r#"{
+    let d2 = TypeDecl::load(
+        "memory",
+        r#"{
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": { "title": { "type": "string" } },
       "required": ["title"]
-    }"#.as_bytes()).unwrap();
+    }"#
+        .as_bytes(),
+    )
+    .unwrap();
     let v2 = d2.validate_payload(&json!({"title": 7}));
-    assert_eq!(d2.policy(&v2), mem_schema::Policy::Warn, "lenient → 降级告警");
+    assert_eq!(
+        d2.policy(&v2),
+        mem_schema::Policy::Warn,
+        "lenient → 降级告警"
+    );
 }
 
 #[test]
 fn ref_specs_extracted_and_existence_checked() {
     let d = TypeDecl::load("task", TASK_SCHEMA.as_bytes()).unwrap();
     let refs = d.ref_specs();
-    assert_eq!(refs.get("project").map(|r| r.target_type.as_str()), Some("project"));
-    assert_eq!(refs.get("area").map(|r| r.target_type.as_str()), Some("topic"));
+    assert_eq!(
+        refs.get("project").map(|r| r.target_type.as_str()),
+        Some("project")
+    );
+    assert_eq!(
+        refs.get("area").map(|r| r.target_type.as_str()),
+        Some("topic")
+    );
 
     // 存在性回调：null 跳过；合法 uuid 查表；查无 → 违例。
     let known = |t: &str, id: &str| t == "project" && id == "0198f7a9-0000-7cd2-9e3f-000000000001";
@@ -165,11 +183,15 @@ fn typeset_loads_dir_and_isolates_broken_decls() {
     std::fs::create_dir_all(types.join("memory")).unwrap();
     std::fs::create_dir_all(types.join("broken")).unwrap();
     std::fs::write(types.join("task/schema.json"), TASK_SCHEMA).unwrap();
-    std::fs::write(types.join("memory/schema.json"), r#"{
+    std::fs::write(
+        types.join("memory/schema.json"),
+        r#"{
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object", "x-grade": "lenient",
       "properties": { "title": { "type": "string" } }
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
     std::fs::write(types.join("broken/schema.json"), b"{ not json").unwrap();
 
     let set = TypeSet::load_dir(&types).expect("目录可加载");
@@ -204,15 +226,24 @@ fn builtin_assets_load_through_the_real_loader() {
 // 红线1：测试直接消费仓库文件（构建期外），不经机制 parse 语义。
 mod mem_assets_shim {
     pub fn assets() -> Vec<(String, Vec<u8>)> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/builtin-types");
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/builtin-types");
         let mut out = Vec::new();
         fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
             for e in std::fs::read_dir(dir).unwrap() {
                 let e = e.unwrap();
                 let name = e.file_name().to_string_lossy().to_string();
                 let p = e.path();
-                let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-                if p.is_dir() { walk(&p, &r, out); } else { out.push((r, std::fs::read(p).unwrap())); }
+                let r = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if p.is_dir() {
+                    walk(&p, &r, out);
+                } else {
+                    out.push((r, std::fs::read(p).unwrap()));
+                }
             }
         }
         walk(&root, "", &mut out);

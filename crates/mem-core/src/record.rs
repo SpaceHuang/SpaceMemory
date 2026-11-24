@@ -56,10 +56,15 @@ impl Record {
                     path: "(record)".into(),
                     reason: "缺 payload 块".into(),
                 })?;
-        let envelope = Envelope::from_json(env_v).map_err(|reason| {
-            MemError::EnvelopeInvalid { path: "(record)".into(), reason }
+        let envelope = Envelope::from_json(env_v).map_err(|reason| MemError::EnvelopeInvalid {
+            path: "(record)".into(),
+            reason,
         })?;
-        Ok(Record { envelope, payload, body: body.to_vec() })
+        Ok(Record {
+            envelope,
+            payload,
+            body: body.to_vec(),
+        })
     }
 
     /// 机制再生成字节（frontmatter 重写 + 正文按字节保持）。
@@ -85,11 +90,10 @@ pub fn find_body_after_first_delimiter(bytes: &[u8]) -> MemResult<Vec<u8>> {
             reason: "文件带 UTF-8 BOM——规范禁止（响亮拒绝，R6.1）".into(),
         });
     }
-    let first_line_end =
-        find_line_end(bytes, 0).ok_or_else(|| MemError::FrontmatterShape {
-            path: "(record)".into(),
-            reason: "空文件或无首行".into(),
-        })?;
+    let first_line_end = find_line_end(bytes, 0).ok_or_else(|| MemError::FrontmatterShape {
+        path: "(record)".into(),
+        reason: "空文件或无首行".into(),
+    })?;
     if trim_cr(&bytes[..first_line_end]) != b"---" {
         return Err(MemError::FrontmatterShape {
             path: "(record)".into(),
@@ -159,15 +163,23 @@ pub fn split_frontmatter(bytes: &[u8]) -> MemResult<(serde_json::Value, &[u8])> 
     let fm_json = &bytes[fm_start..fm_close_line_start];
     // 正文从闭合行的换行之后开始（字节领土，逐字节保持）。
     let body_start = fm_close_line_end + 1;
-    let body = if body_start <= bytes.len() { &bytes[body_start..] } else { &[][..] };
+    let body = if body_start <= bytes.len() {
+        &bytes[body_start..]
+    } else {
+        &[][..]
+    };
 
-    let value: serde_json::Value = serde_json::from_slice(fm_json).map_err(|e| {
-        MemError::FrontmatterJson { path: PATH.into(), reason: e.to_string() }
-    })?;
-    let obj = value.as_object().ok_or_else(|| MemError::FrontmatterShape {
-        path: PATH.into(),
-        reason: "frontmatter 顶层必须是 JSON object（恰含 envelope/payload 两键）".into(),
-    })?;
+    let value: serde_json::Value =
+        serde_json::from_slice(fm_json).map_err(|e| MemError::FrontmatterJson {
+            path: PATH.into(),
+            reason: e.to_string(),
+        })?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| MemError::FrontmatterShape {
+            path: PATH.into(),
+            reason: "frontmatter 顶层必须是 JSON object（恰含 envelope/payload 两键）".into(),
+        })?;
     if obj.len() != 2 || !obj.contains_key("envelope") || !obj.contains_key("payload") {
         return Err(MemError::FrontmatterShape {
             path: PATH.into(),
@@ -186,7 +198,11 @@ fn find_line_end(bytes: &[u8], from: usize) -> Option<usize> {
         .iter()
         .position(|&b| b == b'\n')
         .map(|i| from + i)
-        .or(if from < bytes.len() { Some(bytes.len()) } else { None })
+        .or(if from < bytes.len() {
+            Some(bytes.len())
+        } else {
+            None
+        })
 }
 
 /// 去掉行尾 \r（规范允许分隔符行带 \r）。

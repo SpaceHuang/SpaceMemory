@@ -15,7 +15,7 @@ use mem_core::freshness::{self, Checkpoint, ReadMode};
 use mem_core::sidecar::Hello;
 use mem_core::store::{OpenMode, Store};
 use mem_index::ProvedIndex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------- 夹具 ----------
 
@@ -103,7 +103,14 @@ fn ids(out: &find::FindOutcome) -> Vec<String> {
 #[test]
 fn bad_records_same_tx_and_stat_covers_all_files() {
     let (_tmp, store) = fresh_store();
-    seed(&store, "doc", "g001", "2026-11-02T00:00:00Z", json!({"title":"fine"}), "good text");
+    seed(
+        &store,
+        "doc",
+        "g001",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"fine"}),
+        "good text",
+    );
     std::fs::write(store.abs("records/doc/bad-1.md"), b"not a record").unwrap();
     std::fs::write(store.abs("records/doc/bad-2.md"), b"---\nbroken").unwrap();
 
@@ -112,7 +119,11 @@ fn bad_records_same_tx_and_stat_covers_all_files() {
 
     // 检查点 stat 集覆盖全部 records/ 文件（含坏文件）——评审 B1：坏文件的任何
     // 后续外部变化都造成 stat 失配 → 回退 direct → 告警如实反映。
-    for rel in ["records/doc/bad-1.md", "records/doc/bad-2.md", "records/doc/01f2e000-0000-7000-8000-0000000000g001.md"] {
+    for rel in [
+        "records/doc/bad-1.md",
+        "records/doc/bad-2.md",
+        "records/doc/01f2e000-0000-7000-8000-0000000000g001.md",
+    ] {
         assert!(entries.contains_key(rel), "stat 集必须覆盖 {rel}");
     }
 
@@ -122,8 +133,16 @@ fn bad_records_same_tx_and_stat_covers_all_files() {
     let (bad, more) = pf.bad_records(1).unwrap();
     assert_eq!(bad.len(), 1, "cap=1 截断");
     assert!(more, "还有更多");
-    assert!(bad[0].0.starts_with("records/doc/bad-"), "rel 升序第一 = bad-1：{:?}", bad);
-    assert!(bad[0].1.contains("跳过坏条目"), "告警行模板前段：{:?}", bad[0]);
+    assert!(
+        bad[0].0.starts_with("records/doc/bad-"),
+        "rel 升序第一 = bad-1：{:?}",
+        bad
+    );
+    assert!(
+        bad[0].1.contains("跳过坏条目"),
+        "告警行模板前段：{:?}",
+        bad[0]
+    );
 
     let (bad_all, more_all) = pf.bad_records(10).unwrap();
     assert_eq!(bad_all.len(), 2);
@@ -138,24 +157,59 @@ fn bad_records_same_tx_and_stat_covers_all_files() {
 fn candidates_multiterm_conjunctive_superset_and_narrowing() {
     let (_tmp, store) = fresh_store();
     // r1：alpha(title) + one/two(tags，LF 分隔) → 两词项 LIKE 都命中（真命中）。
-    let r1 = seed(&store, "doc", "r001", "2026-11-02T00:00:00Z",
-        json!({"title":"alpha","tags":["one","two"]}), "");
+    let r1 = seed(
+        &store,
+        "doc",
+        "r001",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"alpha","tags":["one","two"]}),
+        "",
+    );
     // r2：仅 gamma → 词项 "alpha" LIKE 不命中（被合取排除）。
-    seed(&store, "doc", "r002", "2026-11-03T00:00:00Z", json!({"title":"gamma"}), "");
+    seed(
+        &store,
+        "doc",
+        "r002",
+        "2026-11-03T00:00:00Z",
+        json!({"title":"gamma"}),
+        "",
+    );
     // r3：单值 "alpha two"（跨值假命中形态的候选——精筛会裁定，粗筛只多不漏）。
-    let r3 = seed(&store, "doc", "r003", "2026-11-04T00:00:00Z", json!({"title":"alpha two"}), "");
+    let r3 = seed(
+        &store,
+        "doc",
+        "r003",
+        "2026-11-04T00:00:00Z",
+        json!({"title":"alpha two"}),
+        "",
+    );
     // r4：alt 类型（类型收窄用）。
-    seed(&store, "alt", "r004", "2026-11-05T00:00:00Z", json!({"title":"alpha"}), "");
+    seed(
+        &store,
+        "alt",
+        "r004",
+        "2026-11-05T00:00:00Z",
+        json!({"title":"alpha"}),
+        "",
+    );
 
     let (epoch, entries) = materialize(&store).unwrap();
     publish(&store, epoch, entries);
     let pf = proven(&store).index.expect("证明成立");
 
     // 多词项 AND：r1/r3 保留，r2 排除（粗筛超集 ⊇ 真命中集）。
-    let rows = pf.candidates(&["alpha".to_string(), "two".to_string()], None).unwrap();
+    let rows = pf
+        .candidates(&["alpha".to_string(), "two".to_string()], None)
+        .unwrap();
     let got: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-    assert!(got.contains(&r1.as_str()) && got.contains(&r3.as_str()), "超集候选含真命中：{got:?}");
-    assert!(!got.contains(&"01f2e000-0000-7000-8000-0000000000r002"), "词项合取排除不含 alpha 的记录：{got:?}");
+    assert!(
+        got.contains(&r1.as_str()) && got.contains(&r3.as_str()),
+        "超集候选含真命中：{got:?}"
+    );
+    assert!(
+        !got.contains(&"01f2e000-0000-7000-8000-0000000000r002"),
+        "词项合取排除不含 alpha 的记录：{got:?}"
+    );
 
     // 单词项 = 既有单串 LIKE 语义的超集（id 前缀 ∨ 三折叠列）。
     let rows = pf.candidates(&["gamma".to_string()], None).unwrap();
@@ -163,9 +217,14 @@ fn candidates_multiterm_conjunctive_superset_and_narrowing() {
     assert_eq!(rows[0].id, "01f2e000-0000-7000-8000-0000000000r002");
 
     // 类型收窄：Some(["doc"]) 排除 alt；空类型集 → 空候选（正确性无害）。
-    let rows = pf.candidates(&["alpha".to_string()], Some(&["doc".to_string()])).unwrap();
+    let rows = pf
+        .candidates(&["alpha".to_string()], Some(&["doc".to_string()]))
+        .unwrap();
     assert!(rows.iter().all(|r| r.type_name == "doc"), "类型收窄生效");
-    assert!(pf.candidates(&[], Some(&[])).unwrap().is_empty(), "空类型集 → 空候选");
+    assert!(
+        pf.candidates(&[], Some(&[])).unwrap().is_empty(),
+        "空类型集 → 空候选"
+    );
 
     // LIKE 转义：字面 % 不匹配全部（r7 语义保持）。
     assert!(pf.candidates(&["%".to_string()], None).unwrap().is_empty());
@@ -185,20 +244,46 @@ fn r15_nul_does_not_hide_text_after_it_from_like_prefilter() {
     let (_tmp, store) = fresh_store();
     std::fs::create_dir_all(store.abs("types/doc")).unwrap();
     std::fs::write(store.abs("types/doc/schema.json"), r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"title":{"type":"string"}}}"#).unwrap();
-    let id = seed(&store, "doc", "nul01", "2026-11-02T00:00:00Z", json!({"title":"before\0needle-after"}), "");
+    let id = seed(
+        &store,
+        "doc",
+        "nul01",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"before\0needle-after"}),
+        "",
+    );
     let (epoch, entries) = materialize(&store).unwrap();
     publish(&store, epoch, entries);
     let proved = proven(&store);
     let pf = proved.index.as_ref().expect("构造并证明");
     let rows = pf.candidates(&["needle".to_string()], None).unwrap();
-    assert!(rows.iter().any(|r| r.id == id), "NUL 后的文本仍须进入候选超集");
+    assert!(
+        rows.iter().any(|r| r.id == id),
+        "NUL 后的文本仍须进入候选超集"
+    );
     let types = mem_schema::TypeSet::load_dir(&store.abs("types")).unwrap();
-    let run = |prefilter, mode| find::execute(FindParams {
-        store: &store, types: &types, query: Some("needle"), filters: &[], type_narrow: None,
-        view: None, limit: 20, offset: 0, mode, prefilter,
-    }).unwrap();
+    let run = |prefilter, mode| {
+        find::execute(FindParams {
+            store: &store,
+            types: &types,
+            query: Some("needle"),
+            filters: &[],
+            type_narrow: None,
+            view: None,
+            limit: 20,
+            offset: 0,
+            mode,
+            prefilter,
+        })
+        .unwrap()
+    };
     let indexed = run(Some(pf), proved.mode.clone());
-    let direct = run(None, ReadMode::Direct { reason: "r15 对照".into() });
+    let direct = run(
+        None,
+        ReadMode::Direct {
+            reason: "r15 对照".into(),
+        },
+    );
     assert_eq!(ids(&indexed), vec![id]);
     assert_eq!(ids(&indexed), ids(&direct), "直读与索引检索必须同命中");
 }
@@ -208,7 +293,14 @@ fn r15_nul_does_not_hide_text_after_it_from_like_prefilter() {
 #[test]
 fn open_proved_gates_all_or_nothing() {
     let (_tmp, store) = fresh_store();
-    let r1 = seed(&store, "doc", "g001", "2026-11-02T00:00:00Z", json!({"title":"alpha"}), "");
+    let r1 = seed(
+        &store,
+        "doc",
+        "g001",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"alpha"}),
+        "",
+    );
 
     // 1) 无检查点 → None（sidecar 从未维护过）。
     assert!(proven(&store).index.is_none(), "无检查点不可证明");
@@ -217,26 +309,51 @@ fn open_proved_gates_all_or_nothing() {
     publish(&store, epoch, entries.clone());
 
     // 2) sidecar 不在 → None。
-    assert!(mem_index::open_proved(&store, None).index.is_none(), "sidecar 不在不可证明");
+    assert!(
+        mem_index::open_proved(&store, None).index.is_none(),
+        "sidecar 不在不可证明"
+    );
     // 3) 订阅存在未消化变更 → None（索引落后于真相）。
     let mut hello1 = hello0();
     hello1.undigested = Some(3);
-    assert!(mem_index::open_proved(&store, Some(&hello1)).index.is_none());
+    assert!(
+        mem_index::open_proved(&store, Some(&hello1))
+            .index
+            .is_none()
+    );
     // 4) 卷不支持订阅（backend=none）→ None（永久直读形态）。
     let mut hello_none = hello0();
     hello_none.backend = "none".into();
-    assert!(mem_index::open_proved(&store, Some(&hello_none)).index.is_none());
+    assert!(
+        mem_index::open_proved(&store, Some(&hello_none))
+            .index
+            .is_none()
+    );
 
     // 5) 全门禁通过 → Some（mode = Indexed）。（作用域内结束句柄——Windows 上
     //    打开的连接会锁住 index.sqlite，后续门禁场景需要文件级操作。）
     {
         let proved = proven(&store);
-        assert!(proved.index.is_some(), "stat 一致 ∧ 订阅覆盖 ∧ schema 完整 ∧ 同代 → 证明成立");
-        assert!(matches!(proved.mode, ReadMode::Indexed { .. }), "mode 如实标注 Indexed：{:?}", proved.mode);
+        assert!(
+            proved.index.is_some(),
+            "stat 一致 ∧ 订阅覆盖 ∧ schema 完整 ∧ 同代 → 证明成立"
+        );
+        assert!(
+            matches!(proved.mode, ReadMode::Indexed { .. }),
+            "mode 如实标注 Indexed：{:?}",
+            proved.mode
+        );
     }
 
     // 6) stat 失配（检查点之后新增文件）→ None。
-    seed(&store, "doc", "g002", "2026-11-06T00:00:00Z", json!({"title":"new"}), "");
+    seed(
+        &store,
+        "doc",
+        "g002",
+        "2026-11-06T00:00:00Z",
+        json!({"title":"new"}),
+        "",
+    );
     assert!(proven(&store).index.is_none(), "stat 失配不可证明");
     // 还原：重新物化 + 发布（供后续门禁场景）。
     let (epoch, entries) = materialize(&store).unwrap();
@@ -245,7 +362,10 @@ fn open_proved_gates_all_or_nothing() {
     // 7) epoch 代际核对：再物化一次（epoch+1）而不更新检查点 → None
     //   （既有 CLI 快路径的"索引删除重建但检查点仍指旧代"回归随下沉完整收进）。
     let (_e2, _en2) = materialize(&store).unwrap();
-    assert!(proven(&store).index.is_none(), "检查点与索引代际不匹配不可证明");
+    assert!(
+        proven(&store).index.is_none(),
+        "检查点与索引代际不匹配不可证明"
+    );
 
     // 8) 只读 schema 门禁扩展（含 bad_records）：手工删除表（旧代索引形态）→ None，
     //    回退 direct 而不是"空告警的 indexed"。
@@ -257,7 +377,10 @@ fn open_proved_gates_all_or_nothing() {
     let proved = proven(&store);
     assert!(proved.index.is_none(), "bad_records 缺表 → 门禁不通过");
     match &proved.mode {
-        ReadMode::Direct { reason } => assert!(reason.contains("schema") || reason.contains("索引"), "reason 如实：{reason}"),
+        ReadMode::Direct { reason } => assert!(
+            reason.contains("schema") || reason.contains("索引"),
+            "reason 如实：{reason}"
+        ),
         other => panic!("必须标注 Direct：{other:?}"),
     }
     drop(proved); // 释放只读连接（Windows：句柄在则文件不可删）
@@ -274,44 +397,93 @@ fn open_proved_gates_all_or_nothing() {
 fn indexed_via_prefilter_equals_direct() {
     let (_tmp, store) = fresh_store();
     let types = mem_schema::TypeSet::load_dir(&store.abs("types")).unwrap();
-    let a = seed(&store, "doc", "e001", "2026-11-02T00:00:00Z",
-        json!({"title":"alpha geometry"}), "quadratic body");
-    seed(&store, "doc", "e002", "2026-11-03T00:00:00Z",
-        json!({"title":"beta"}), "gamma body");
+    let a = seed(
+        &store,
+        "doc",
+        "e001",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"alpha geometry"}),
+        "quadratic body",
+    );
+    seed(
+        &store,
+        "doc",
+        "e002",
+        "2026-11-03T00:00:00Z",
+        json!({"title":"beta"}),
+        "gamma body",
+    );
     std::fs::write(store.abs("records/doc/bad-1.md"), b"corrupt").unwrap();
 
     let (epoch, entries) = materialize(&store).unwrap();
     publish(&store, epoch, entries);
     let proved = proven(&store);
-    let pf = proved.index.as_ref().map(|p| p as &dyn FindPrefilter).expect("证明成立");
+    let pf = proved
+        .index
+        .as_ref()
+        .map(|p| p as &dyn FindPrefilter)
+        .expect("证明成立");
 
     // 词项 + 否定词项：indexed 与 direct 命中面逐 ID 相等。
     let mk = |pf: Option<&dyn FindPrefilter>, mode: ReadMode| {
         find::execute(FindParams {
-            store: &store, types: &types, query: Some("quadratic -beta"),
-            filters: &[], type_narrow: None, view: None, limit: 50, offset: 0,
-            mode, prefilter: pf,
+            store: &store,
+            types: &types,
+            query: Some("quadratic -beta"),
+            filters: &[],
+            type_narrow: None,
+            view: None,
+            limit: 50,
+            offset: 0,
+            mode,
+            prefilter: pf,
         })
         .unwrap()
     };
     let indexed = mk(Some(pf), proved.mode.clone());
-    let direct = mk(None, ReadMode::Direct { reason: "测试".into() });
-    assert_eq!(ids(&indexed), vec![a], "indexed 命中面 == direct：{:?} vs {:?}", ids(&indexed), ids(&direct));
+    let direct = mk(
+        None,
+        ReadMode::Direct {
+            reason: "测试".into(),
+        },
+    );
+    assert_eq!(
+        ids(&indexed),
+        vec![a],
+        "indexed 命中面 == direct：{:?} vs {:?}",
+        ids(&indexed),
+        ids(&direct)
+    );
     assert!(matches!(indexed.mode, ReadMode::Indexed { .. }));
 
     // 告警面等价（同模板、rel 升序、三要素）——两执行器同库同告警集。
-    assert_eq!(indexed.warnings, direct.warnings, "告警集合与文本一致（决策⑦）");
+    assert_eq!(
+        indexed.warnings, direct.warnings,
+        "告警集合与文本一致（决策⑦）"
+    );
     assert_eq!(indexed.warnings_truncated, direct.warnings_truncated);
     assert!(indexed.warnings[0].contains("修复入口：mem fix records/doc/bad-1.md"));
 
     // 过滤 + 词项组合走 indexed（过滤不下推，只在精筛施加）。
     let out = find::execute(FindParams {
-        store: &store, types: &types, query: Some("quadratic"),
-        filters: &[FilterCond { field: "nosuch".into(), text: "1".into() }],
-        type_narrow: None, view: None, limit: 50, offset: 0,
-        mode: proved.mode.clone(), prefilter: Some(pf),
+        store: &store,
+        types: &types,
+        query: Some("quadratic"),
+        filters: &[FilterCond {
+            field: "nosuch".into(),
+            text: "1".into(),
+        }],
+        type_narrow: None,
+        view: None,
+        limit: 50,
+        offset: 0,
+        mode: proved.mode.clone(),
+        prefilter: Some(pf),
     });
-    assert!(out.is_err(), "过滤声明检查在 indexed 路径同样生效（unknown_filter_field）");
+    assert!(
+        out.is_err(),
+        "过滤声明检查在 indexed 路径同样生效（unknown_filter_field）"
+    );
     assert_eq!(out.unwrap_err().param_kind(), Some("unknown_filter_field"));
 }
 
@@ -337,7 +509,14 @@ fn proved_index_only_constructible_via_open_proved() {
 #[test]
 fn post_scan_new_file_never_enters_checkpoint_entries() {
     let (_tmp, store) = fresh_store();
-    seed(&store, "doc", "w001", "2026-11-02T00:00:00Z", json!({"title":"before"}), "");
+    seed(
+        &store,
+        "doc",
+        "w001",
+        "2026-11-02T00:00:00Z",
+        json!({"title":"before"}),
+        "",
+    );
 
     let injected = std::sync::Arc::new(std::sync::Mutex::new(false));
     let root = store.root().to_path_buf();
@@ -349,9 +528,13 @@ fn post_scan_new_file_never_enters_checkpoint_entries() {
     };
 
     let mut idx = mem_index::Index::open_store(&store).unwrap();
-    let (_, _, entries) =
-        idx.rebuild_with_entries_with_hook(&store, Some(&hook)).unwrap();
-    assert!(*injected.lock().unwrap(), "钩子必须已注入（护栏有效性自证）");
+    let (_, _, entries) = idx
+        .rebuild_with_entries_with_hook(&store, Some(&hook))
+        .unwrap();
+    assert!(
+        *injected.lock().unwrap(),
+        "钩子必须已注入（护栏有效性自证）"
+    );
 
     // 1) X 不在本次扫描的 stat 集——实时枚举含 X → stat 失配 → 读路径直读。
     assert!(
@@ -383,7 +566,10 @@ fn post_scan_new_file_never_enters_checkpoint_entries() {
     // 3) 失配信号在：实时 stat（含 X）≠ entries（不含 X）→ 读路径必直读。
     let realtime = mem_core::freshness::stat_snapshot(&store);
     assert!(realtime.contains_key("records/doc/post-scan.md"));
-    assert_ne!(realtime, entries, "实时 stat 与检查点必须失配（直读信号，红线21）");
+    assert_ne!(
+        realtime, entries,
+        "实时 stat 与检查点必须失配（直读信号，红线21）"
+    );
 }
 
 /// 中段/后段子串语义回归（自 index.rs 的 Index::search 测试迁移——L2：search 已删，
@@ -391,8 +577,14 @@ fn post_scan_new_file_never_enters_checkpoint_entries() {
 #[test]
 fn candidates_mid_substring_semantics() {
     let (_tmp, store) = fresh_store();
-    seed(&store, "memory", "ss01", "2026-11-05T00:00:00Z",
-        json!({"title": "shared-alpha"}), "hello world");
+    seed(
+        &store,
+        "memory",
+        "ss01",
+        "2026-11-05T00:00:00Z",
+        json!({"title": "shared-alpha"}),
+        "hello world",
+    );
 
     let (epoch, entries) = materialize(&store).unwrap();
     publish(&store, epoch, entries);
@@ -400,7 +592,12 @@ fn candidates_mid_substring_semantics() {
 
     // payload 中段子串命中（"shared-alpha" 的中段）。
     let rows = pf.candidates(&["hared-al".to_string()], None).unwrap();
-    assert_eq!(rows.len(), 1, "payload 中段子串命中：{:?}", rows.iter().map(|r| r.rel.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        rows.len(),
+        1,
+        "payload 中段子串命中：{:?}",
+        rows.iter().map(|r| r.rel.clone()).collect::<Vec<_>>()
+    );
     // 正文后段子串命中（"hello world" 的后段）。
     let rows = pf.candidates(&["ello".to_string()], None).unwrap();
     assert_eq!(rows.len(), 1, "正文后段子串命中");

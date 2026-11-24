@@ -10,7 +10,7 @@
 //!   同序同子集 + warnings_truncated。
 
 use assert_cmd::Command;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Command as PCommand, Stdio};
 
@@ -19,8 +19,12 @@ fn mem() -> Command {
 }
 
 fn j(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("输出不是 JSON：{e}\n{}", String::from_utf8_lossy(&out.stdout)))
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "输出不是 JSON：{e}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }
 
 fn wait_until(mut cond: impl FnMut() -> bool, tries: usize, ms: u64) -> bool {
@@ -58,7 +62,9 @@ fn mcp_session(s: &str, requests: &[Value]) -> Vec<Value> {
 }
 
 fn tool_result(resp: &Value) -> Value {
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
     serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出非 JSON：{e}\n{text}"))
 }
 
@@ -70,7 +76,11 @@ fn call(id: i64, name: &str, args: Value) -> Value {
 }
 
 fn mode_of(v: &Value) -> &'static str {
-    if v["read_mode"].as_object().map(|m| m.contains_key("indexed")).unwrap_or(false) {
+    if v["read_mode"]
+        .as_object()
+        .map(|m| m.contains_key("indexed"))
+        .unwrap_or(false)
+    {
         "indexed"
     } else {
         "direct"
@@ -100,29 +110,59 @@ const ALT_SCHEMA: &str = r#"{
 
 fn init(dir: &std::path::Path) -> String {
     let s = dir.to_str().unwrap().to_string();
-    let out = mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
-    assert!(out.status.success(), "init：{}", String::from_utf8_lossy(&out.stderr));
+    let out = mem()
+        .args(["--store", &s, "init", &s, "--principal", "codex_main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     s
 }
 
 fn add(s: &str, payload: &str) -> String {
-    let out = mem().args(["--store", s, "add", "doc",
-"--principal",
-"codex_main", "--payload", payload]).output().unwrap();
-    assert!(out.status.success(), "add {payload}：{}", String::from_utf8_lossy(&out.stderr));
+    let out = mem()
+        .args([
+            "--store",
+            s,
+            "add",
+            "doc",
+            "--principal",
+            "codex_main",
+            "--payload",
+            payload,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add {payload}：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     j(&out)["id"].as_str().unwrap().to_string()
 }
 
 fn hit_ids(v: &Value, key: &str) -> Vec<String> {
-    let mut ids: Vec<String> = v[key].as_array().unwrap()
-        .iter().map(|h| h["id"].as_str().unwrap().to_string()).collect();
+    let mut ids: Vec<String> = v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap().to_string())
+        .collect();
     ids.sort();
     ids
 }
 
 /// CLI find（带可选过滤）。
 fn cli_find(s: &str, query: &str, filter: Option<(&str, &str)>) -> Value {
-    let mut args = vec!["--store".to_string(), s.to_string(), "find".to_string(), query.to_string()];
+    let mut args = vec![
+        "--store".to_string(),
+        s.to_string(),
+        "find".to_string(),
+        query.to_string(),
+    ];
     if let Some((k, v)) = filter {
         args.push("--filter".to_string());
         args.push(format!("{k}={v}"));
@@ -137,10 +177,13 @@ fn mcp_find(s: &str, query: &str, filter: Option<(&str, &str)>) -> Value {
     if let Some((k, v)) = filter {
         args["filters"] = json!({ k: v });
     }
-    let resps = mcp_session(s, &[
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-        call(2, "mem_find", args),
-    ]);
+    let resps = mcp_session(
+        s,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            call(2, "mem_find", args),
+        ],
+    );
     tool_result(&resps[1])
 }
 
@@ -161,28 +204,52 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
     let only_b = add(&s, r#"{"title":"beta","status":"x"}"#);
     let both = add(&s, r#"{"title":"alpha beta","status":"1"}"#);
     let _neither = add(&s, r#"{"title":"gamma","status":"x"}"#);
-    let out = mem().args(["--store", &s, "add", "alt", "--principal", "codex_main", "--payload", r#"{"status":1}"#]).output().unwrap();
+    let out = mem()
+        .args([
+            "--store",
+            &s,
+            "add",
+            "alt",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"status":1}"#,
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let alt1 = j(&out)["id"].as_str().unwrap().to_string();
 
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "alpha", None)) == "direct", 50, 100),
-        "RDC 没有查询时点屏障时，sidecar 在场仍须直读");
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
+    assert!(
+        wait_until(
+            || mode_of(&cli_find(&s, "alpha", None)) == "direct",
+            50,
+            100
+        ),
+        "RDC 没有查询时点屏障时，sidecar 在场仍须直读"
+    );
 
     // 查询矩阵：多词与 / 与位排除 / 单词项 / 异形过滤合并。
     // （"x" 词项命中三条 status="x" 的记录，被 status=1 过滤全部排除——词项 ∧
     // 过滤同时生效；alt 记录不含 "x" 词项，天然不在命中。）
     let cases: Vec<(&str, Option<(&str, &str)>, Vec<String>)> = vec![
-        ("alpha beta", None, vec![both.clone()]),                       // 验收 6：仅 AB 命中
-        ("alpha -beta", None, vec![only_a.clone()]),                    // 验收 7：含 A 不含 B
+        ("alpha beta", None, vec![both.clone()]), // 验收 6：仅 AB 命中
+        ("alpha -beta", None, vec![only_a.clone()]), // 验收 7：含 A 不含 B
         ("alpha", None, vec![only_a.clone(), both.clone()]),
         ("beta -alpha", None, vec![only_b.clone()]),
         ("geometry", None, vec![]),
-        ("x", Some(("status", "1")), vec![]),                           // 异形同名：全集空（doc "x" 不等值）
+        ("x", Some(("status", "1")), vec![]), // 异形同名：全集空（doc "x" 不等值）
     ];
 
     // 空查询/纯否定双前端拒收（验收 7 后半）。
@@ -190,10 +257,13 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
     assert!(!out_e.status.success());
     let e: Value = serde_json::from_slice(&out_e.stderr).unwrap();
     assert_eq!(e["kind"], json!("query_invalid"));
-    let resps = mcp_session(&s, &[
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-        call(2, "mem_find", json!({"query": "-x"})),
-    ]);
+    let resps = mcp_session(
+        &s,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            call(2, "mem_find", json!({"query": "-x"})),
+        ],
+    );
     assert_eq!(resps[1]["error"]["data"]["kind"], json!("query_invalid"));
 
     // sidecar 在场时的安全回退：CLI 与 MCP 都必须走 direct 并返回相同集合。
@@ -202,10 +272,18 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
             continue;
         }
         let cli_v = cli_find(&s, query, *filter);
-        assert_eq!(mode_of(&cli_v), "direct", "RDC 只能触发维护，不能证明查询新鲜度：{cli_v}");
+        assert_eq!(
+            mode_of(&cli_v),
+            "direct",
+            "RDC 只能触发维护，不能证明查询新鲜度：{cli_v}"
+        );
         let mcp_v = mcp_find(&s, query, *filter);
         assert_eq!(mode_of(&mcp_v), "direct", "MCP 必须同样退回直读：{mcp_v}");
-        assert_eq!(hit_ids(&cli_v, "hits"), hit_ids(&mcp_v, "hits"), "CLI≡MCP（sidecar 在场）：{query:?} {filter:?}");
+        assert_eq!(
+            hit_ids(&cli_v, "hits"),
+            hit_ids(&mcp_v, "hits"),
+            "CLI≡MCP（sidecar 在场）：{query:?} {filter:?}"
+        );
         let mut got = hit_ids(&cli_v, "hits");
         got.sort();
         assert_eq!(got, *expected, "命中集：{query:?} {filter:?}\n{cli_v}");
@@ -220,10 +298,24 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
     let mut seen = Vec::new();
     let mut off = 0usize;
     for _ in 0..10 {
-        let args = ["--store", &s, "find", "alpha", "--limit", "1", "--offset", &off.to_string()];
+        let args = [
+            "--store",
+            &s,
+            "find",
+            "alpha",
+            "--limit",
+            "1",
+            "--offset",
+            &off.to_string(),
+        ];
         let v = j(&mem().args(&args).output().unwrap());
-        seen.extend(v["hits"].as_array().unwrap().iter()
-            .map(|h| h["id"].as_str().unwrap().to_string()));
+        seen.extend(
+            v["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["id"].as_str().unwrap().to_string()),
+        );
         match v["resume"]["offset"].as_u64() {
             Some(n) => off = n as usize,
             None => break,
@@ -236,8 +328,14 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
 
     // direct 阶段：sidecar 退出 → 同一矩阵再对账（四面的另两 face）。
     serve.kill().ok();
-    assert!(wait_until(|| mode_of(&cli_find(&s, "alpha", None)) == "direct", 50, 100),
-        "sidecar 退出后回落直读");
+    assert!(
+        wait_until(
+            || mode_of(&cli_find(&s, "alpha", None)) == "direct",
+            50,
+            100
+        ),
+        "sidecar 退出后回落直读"
+    );
     for (query, filter, expected) in &cases {
         if query.is_empty() {
             continue;
@@ -245,21 +343,40 @@ fn r10_frontend_equivalence_stays_direct_with_async_rdc() {
         let cli_v = cli_find(&s, query, *filter);
         assert_eq!(mode_of(&cli_v), "direct", "direct 阶段：{cli_v}");
         let mcp_v = mcp_find(&s, query, *filter);
-        assert_eq!(hit_ids(&cli_v, "hits"), hit_ids(&mcp_v, "hits"), "CLI≡MCP（direct）：{query:?} {filter:?}");
+        assert_eq!(
+            hit_ids(&cli_v, "hits"),
+            hit_ids(&mcp_v, "hits"),
+            "CLI≡MCP（direct）：{query:?} {filter:?}"
+        );
         let mut got = hit_ids(&cli_v, "hits");
         got.sort();
         assert_eq!(got, *expected, "direct 命中集正确：{query:?} {filter:?}");
     }
     let seq1d = cli_find(&s, "alpha", None);
     let seq2d = cli_find(&s, "alpha", None);
-    assert_eq!(seq1d["hits"], seq2d["hits"], "两次检索序列一致（direct，验收 5）");
+    assert_eq!(
+        seq1d["hits"], seq2d["hits"],
+        "两次检索序列一致（direct，验收 5）"
+    );
 
     // 子集表达（验收 8）：--type 收窄得单形态子集——status=1 全集 = {both, alt1}，
     // --type doc 子集 = {both}（alt 不在候选类型集，其记录不命中不报错）。
-    let out = mem().args(["--store", &s, "list", "--type", "doc", "--filter", "status=1"]).output().unwrap();
+    let out = mem()
+        .args([
+            "--store", &s, "list", "--type", "doc", "--filter", "status=1",
+        ])
+        .output()
+        .unwrap();
     let v = j(&out);
-    assert_eq!(hit_ids(&v, "items"), vec![both.clone()], "--type doc 收窄子集：{v}");
-    let out = mem().args(["--store", &s, "list", "--filter", "status=1"]).output().unwrap();
+    assert_eq!(
+        hit_ids(&v, "items"),
+        vec![both.clone()],
+        "--type doc 收窄子集：{v}"
+    );
+    let out = mem()
+        .args(["--store", &s, "list", "--filter", "status=1"])
+        .output()
+        .unwrap();
     let v = j(&out);
     let mut got = hit_ids(&v, "items");
     got.sort();
@@ -278,10 +395,19 @@ fn r10_acceptance_10_async_rdc_direct_warnings_stay_fresh_and_fixable() {
     let s = init(&dir);
     std::fs::create_dir_all(dir.join("types/doc")).unwrap();
     std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
-    let out = mem().args(["--store", &s, "add", "doc",
-"--principal",
-"codex_main", "--payload",
-        r#"{"title":"target"}"#]).output().unwrap();
+    let out = mem()
+        .args([
+            "--store",
+            &s,
+            "add",
+            "doc",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"title":"target"}"#,
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let target = j(&out)["id"].as_str().unwrap().to_string();
     // 坏文件**先于**物化存在（文件名以查询词开头构造——验收 10 的查询无关化口径：
@@ -290,10 +416,20 @@ fn r10_acceptance_10_async_rdc_direct_warnings_stay_fresh_and_fixable() {
 
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "30"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "direct", 50, 100));
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
+    assert!(wait_until(
+        || mode_of(&cli_find(&s, "target", None)) == "direct",
+        50,
+        100
+    ));
 
     // RDC 不能为查询提供同步证明；direct 仍应如实报告坏记录。
     let v = cli_find(&s, "target", None);
@@ -301,40 +437,87 @@ fn r10_acceptance_10_async_rdc_direct_warnings_stay_fresh_and_fixable() {
     let warnings = v["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1, "直读告警承接：{v}");
     let w = warnings[0].as_str().unwrap();
-    assert!(w.starts_with("跳过坏条目 records/doc/target-broken.md："), "三要素·位置+原因：{w}");
-    assert!(w.contains("修复入口：mem fix records/doc/target-broken.md"), "三要素·修复入口：{w}");
-    let rels: Vec<&str> = v["hits"].as_array().unwrap()
-        .iter().filter_map(|h| h["rel"].as_str()).collect();
-    assert!(!rels.contains(&"records/doc/target-broken.md"), "坏记录不进命中：{v}");
+    assert!(
+        w.starts_with("跳过坏条目 records/doc/target-broken.md："),
+        "三要素·位置+原因：{w}"
+    );
+    assert!(
+        w.contains("修复入口：mem fix records/doc/target-broken.md"),
+        "三要素·修复入口：{w}"
+    );
+    let rels: Vec<&str> = v["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["rel"].as_str())
+        .collect();
+    assert!(
+        !rels.contains(&"records/doc/target-broken.md"),
+        "坏记录不进命中：{v}"
+    );
 
     // 坏文件外部变化（追加字节）→ stat 失配 → 直读 → 告警如实反映（新鲜，B1）。
     std::fs::write(dir.join("records/doc/target-broken.md"), b"corrupt-more").unwrap();
     let v2 = cli_find(&s, "target", None);
-    assert_eq!(v2["warnings"].as_array().unwrap().len(), 1, "坏文件变化后告警仍在（直读如实）：{v2}");
+    assert_eq!(
+        v2["warnings"].as_array().unwrap().len(),
+        1,
+        "坏文件变化后告警仍在（直读如实）：{v2}"
+    );
 
     // fix（修复 = 写入合法记录）→ 恢复参与检索（验收 10 收尾）。
     let fixed = format!(r#"{{"title":"target-fixed"}}"#);
-    let out = mem().args(["--store", &s, "add", "doc",
-"--principal",
-"codex_main", "--payload", &fixed]).output().unwrap();
+    let out = mem()
+        .args([
+            "--store",
+            &s,
+            "add",
+            "doc",
+            "--principal",
+            "codex_main",
+            "--payload",
+            &fixed,
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     // 坏文件重写为合法记录（模拟 mem fix 的落盘结果——fix 命令本身已在 R6.3 覆盖）。
     let env_id = "01f9a000-0000-7000-8000-0000000000fx1";
     let env = mem_core::envelope::Envelope {
-        id: env_id.into(), r#type: "doc".into(),
-        created: "2026-11-10T00:00:00Z".into(), modified: "2026-11-10T00:00:00Z".into(),
-        version: 1, principal: None, refs: vec![], aliases: vec![],
-        evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+        id: env_id.into(),
+        r#type: "doc".into(),
+        created: "2026-11-10T00:00:00Z".into(),
+        modified: "2026-11-10T00:00:00Z".into(),
+        version: 1,
+        principal: None,
+        refs: vec![],
+        aliases: vec![],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
     };
     let bytes = mem_core::record::serialize_new(&env, &json!({"title":"target-fixed"}), b"");
     std::fs::write(dir.join("records/doc/target-broken.md"), bytes).unwrap();
     // 变更可触发后台维护；查询仍走 direct 并命中修复后的记录。
-    assert!(wait_until(|| mode_of(&cli_find(&s, "target", None)) == "direct", 80, 150),
-        "sidecar 在场时仍安全回退直读");
+    assert!(
+        wait_until(
+            || mode_of(&cli_find(&s, "target", None)) == "direct",
+            80,
+            150
+        ),
+        "sidecar 在场时仍安全回退直读"
+    );
     let v3 = cli_find(&s, "target", None);
-    assert_eq!(v3["warnings"].as_array().unwrap().len(), 0, "修复后告警清空：{v3}");
+    assert_eq!(
+        v3["warnings"].as_array().unwrap().len(),
+        0,
+        "修复后告警清空：{v3}"
+    );
     let ids = hit_ids(&v3, "hits");
-    assert!(ids.contains(&target) && ids.contains(&env_id.to_string()), "恢复参与：{v3}");
+    assert!(
+        ids.contains(&target) && ids.contains(&env_id.to_string()),
+        "恢复参与：{v3}"
+    );
     serve.kill().ok();
 }
 
@@ -347,10 +530,19 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     let s = init(&dir);
     std::fs::create_dir_all(dir.join("types/doc")).unwrap();
     std::fs::write(dir.join("types/doc/schema.json"), DOC_SCHEMA).unwrap();
-    let out = mem().args(["--store", &s, "add", "doc",
-"--principal",
-"codex_main", "--payload",
-        r#"{"title":"cap-target"}"#]).output().unwrap();
+    let out = mem()
+        .args([
+            "--store",
+            &s,
+            "add",
+            "doc",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"title":"cap-target"}"#,
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     for i in 0..201 {
         std::fs::write(dir.join(format!("records/doc/bad-{i:03}.md")), b"corrupt").unwrap();
@@ -359,22 +551,53 @@ fn r10_acceptance_10_warning_cap_dual_path_same_subset() {
     // 无 sidecar：200 条 rel 升序 + truncated。
     let v = cli_find(&s, "cap", None);
     let warnings = v["warnings"].as_array().unwrap();
-    assert_eq!(warnings.len(), 200, "上限 200（list_limit_max）：{}", warnings.len());
+    assert_eq!(
+        warnings.len(),
+        200,
+        "上限 200（list_limit_max）：{}",
+        warnings.len()
+    );
     assert_eq!(v["warnings_truncated"], json!(true));
-    assert!(warnings[0].as_str().unwrap().contains("records/doc/bad-000.md"));
-    assert!(warnings[199].as_str().unwrap().contains("records/doc/bad-199.md"));
-    assert!(v["note"].as_str().unwrap_or("").contains("mem verify"), "note 注明完整清单经 verify：{v}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("records/doc/bad-000.md")
+    );
+    assert!(
+        warnings[199]
+            .as_str()
+            .unwrap()
+            .contains("records/doc/bad-199.md")
+    );
+    assert!(
+        v["note"].as_str().unwrap_or("").contains("mem verify"),
+        "note 注明完整清单经 verify：{v}"
+    );
 
     // sidecar 在场时仍走 direct：告警顺序与截断子集保持一致。
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "cap", None)) == "direct", 60, 100));
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
+    assert!(wait_until(
+        || mode_of(&cli_find(&s, "cap", None)) == "direct",
+        60,
+        100
+    ));
     let v2 = cli_find(&s, "cap", None);
     assert_eq!(mode_of(&v2), "direct", "{v2}");
-    assert_eq!(v2["warnings"], v["warnings"], "双路径同序同子集（201 条截断口径）");
+    assert_eq!(
+        v2["warnings"], v["warnings"],
+        "双路径同序同子集（201 条截断口径）"
+    );
     assert_eq!(v2["warnings_truncated"], json!(true));
     serve.kill().ok();
 }
@@ -393,10 +616,20 @@ fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
 
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "30"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
-    assert!(wait_until(|| mode_of(&cli_find(&s, "anchor", None)) == "direct", 50, 100));
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
+    assert!(wait_until(
+        || mode_of(&cli_find(&s, "anchor", None)) == "direct",
+        50,
+        100
+    ));
 
     // 扫描后新落盘的合法记录 X（外部放置形态）。
     let env = mem_core::envelope::Envelope {
@@ -405,27 +638,43 @@ fn r10_b2_new_file_first_read_never_lost_cli_and_mcp() {
         created: "2026-11-10T00:00:00Z".into(),
         modified: "2026-11-10T00:00:00Z".into(),
         version: 1,
-        principal: None, refs: vec![], aliases: vec![],
-        evidence_cutoff_seq: None, commit: None, extra: Default::default(),
+        principal: None,
+        refs: vec![],
+        aliases: vec![],
+        evidence_cutoff_seq: None,
+        commit: None,
+        extra: Default::default(),
     };
     let bytes = mem_core::record::serialize_new(&env, &json!({"title":"b2newx marker"}), b"");
     std::fs::write(dir.join("records/doc/b2-new.md"), bytes).unwrap();
 
     // 第一次读取（CLI）：X 必须在命中清单（落盘后 stat 失配 → direct 直读真相层）。
     let v1 = cli_find(&s, "b2newx", None);
-    assert!(hit_ids(&v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
-        "新文件第一次读取不得漏（B2）：{v1}");
+    assert!(
+        hit_ids(&v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "新文件第一次读取不得漏（B2）：{v1}"
+    );
     // 第一次读取（MCP）：同面。
     let mcp_v1 = mcp_find(&s, "b2newx", None);
-    assert!(hit_ids(&mcp_v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
-        "MCP 新文件第一次读取不得漏（B2）：{mcp_v1}");
+    assert!(
+        hit_ids(&mcp_v1, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "MCP 新文件第一次读取不得漏（B2）：{mcp_v1}"
+    );
 
     // 维护期间和收敛后均直读，不能因异步通知延迟而漏掉新文件。
-    assert!(wait_until(|| mode_of(&cli_find(&s, "b2newx", None)) == "direct", 80, 150),
-        "sidecar 在场时仍安全回退直读");
+    assert!(
+        wait_until(
+            || mode_of(&cli_find(&s, "b2newx", None)) == "direct",
+            80,
+            150
+        ),
+        "sidecar 在场时仍安全回退直读"
+    );
     let v2 = cli_find(&s, "b2newx", None);
     assert_eq!(mode_of(&v2), "direct", "收敛后仍保持直读：{v2}");
-    assert!(hit_ids(&v2, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
-        "direct 命中含新文件：{v2}");
+    assert!(
+        hit_ids(&v2, "hits").contains(&"01f9b200-0000-7000-8000-0000000000b2x".to_string()),
+        "direct 命中含新文件：{v2}"
+    );
     serve.kill().ok();
 }

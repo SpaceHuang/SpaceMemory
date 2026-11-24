@@ -20,6 +20,10 @@ use mem_core::error::MemResult;
 pub trait Git {
     /// path-scoped 提交：`git commit -m <msg> -- <paths…>`（含 events.jsonl 同批）。
     /// 返回提交 SHA；无 .git / git 不可用 → Ok(None)。
-    fn commit_paths(&self, workdir: &std::path::Path, paths: &[String], msg: &str)
-        -> MemResult<Option<String>>;
+    fn commit_paths(
+        &self,
+        workdir: &std::path::Path,
+        paths: &[String],
+        msg: &str,
+    ) -> MemResult<Option<String>>;
 }

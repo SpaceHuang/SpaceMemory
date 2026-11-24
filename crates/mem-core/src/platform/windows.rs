@@ -6,21 +6,21 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_PARAMETER, ERROR_SHARING_VIOLATION, HANDLE, STILL_ACTIVE,
-};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_SHARING_VIOLATION, GetLastError, HANDLE, STILL_ACTIVE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetVolumeInformationW, LockFileEx, MoveFileExW, UnlockFileEx,
-    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    MOVEFILE_REPLACE_EXISTING, OPEN_EXISTING,
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, GetVolumeInformationW,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING,
+    MoveFileExW, OPEN_EXISTING, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetEvent,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// 锁哨兵字节偏移（1 MiB）：owner JSON 驻留 0 偏移、锁范围与之不重叠——
@@ -40,7 +40,11 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     let from = to_wide(source);
     let to = to_wide(target);
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
-    if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// 文件字节范围锁句柄（Drop 即解锁+关闭）。
@@ -73,7 +77,11 @@ impl LockFile {
     /// （已被 [`Self::open_locked`] 取代的旧路径——保留给无锁竞争场景的直开语义。）
     #[allow(dead_code)]
     fn open(path: &Path) -> io::Result<File> {
-        OpenOptions::new().read(true).write(true).create(true).open(path)
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
     }
 
     /// 打开锁文件（read+write）。Windows 已知行为：任何句柄持有独占字节范围锁时，
@@ -81,7 +89,12 @@ impl LockFile {
     /// 语义（try）/ 重试（blocking）。
     fn open_locked(path: &Path, blocking: bool) -> io::Result<File> {
         loop {
-            match OpenOptions::new().read(true).write(true).create(true).open(path) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)
+            {
                 Ok(f) => return Ok(f),
                 Err(e) if e.raw_os_error() == Some(33) => {
                     if blocking {
@@ -112,7 +125,14 @@ impl LockFile {
         overlapped.Anonymous.Anonymous.OffsetHigh = (LOCK_OFFSET >> 32) as u32;
         loop {
             let ok = unsafe {
-                LockFileEx(file.as_raw_handle() as HANDLE, flags, 0, LOCK_RANGE, 0, &mut overlapped)
+                LockFileEx(
+                    file.as_raw_handle() as HANDLE,
+                    flags,
+                    0,
+                    LOCK_RANGE,
+                    0,
+                    &mut overlapped,
+                )
             };
             if ok != 0 {
                 return Ok(());
@@ -135,7 +155,13 @@ impl LockFile {
         overlapped.Anonymous.Anonymous.Offset = (LOCK_OFFSET & 0xFFFF_FFFF) as u32;
         overlapped.Anonymous.Anonymous.OffsetHigh = (LOCK_OFFSET >> 32) as u32;
         unsafe {
-            UnlockFileEx(file.as_raw_handle() as HANDLE, 0, LOCK_RANGE, 0, &mut overlapped);
+            UnlockFileEx(
+                file.as_raw_handle() as HANDLE,
+                0,
+                LOCK_RANGE,
+                0,
+                &mut overlapped,
+            );
         }
     }
 
@@ -202,9 +228,9 @@ pub fn process_alive(pid: u32) -> bool {
 
 /// temp + 原子改名落盘（R3.1/红线6）：同目录临时文件 + MoveFileEx(REPLACE_EXISTING)。
 pub fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = target.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录")
-    })?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录"))?;
     let name = target
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -231,9 +257,7 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     let wide = to_wide(&tmp);
     let twide = to_wide(target);
-    let ok = unsafe {
-        MoveFileExW(wide.as_ptr(), twide.as_ptr(), MOVEFILE_REPLACE_EXISTING)
-    };
+    let ok = unsafe { MoveFileExW(wide.as_ptr(), twide.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
     if ok == 0 {
         let err = io::Error::last_os_error();
         let _ = std::fs::remove_file(&tmp);
@@ -248,9 +272,9 @@ pub fn create_new(target: &Path, bytes: &[u8]) -> io::Result<()> {
     //（非 .md 后缀，不进记录枚举）并同步，再以**不覆盖**的 MoveFileExW 原子发布：
     // 目标已存在 → ERROR_ALREADY_EXISTS 且目标分毫不动（输者协议依据）。
     // 此前直接对正式路径 create_new+write，崩溃/短写会在规范路径留下半条记录。
-    let dir = target.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录")
-    })?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录"))?;
     let name = target
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -305,7 +329,10 @@ pub fn fs_name_for(path: &Path) -> Option<String> {
     if ok == 0 {
         return None;
     }
-    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
     Some(String::from_utf16_lossy(&fs_name[..len]))
 }
 
@@ -384,10 +411,10 @@ struct UsnRecordV2 {
 /// 记录文件的 FRN（File Reference Number）。
 pub fn file_frn(path: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
-    
+
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+        BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+        OPEN_EXISTING,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -410,9 +437,7 @@ pub fn file_frn(path: &Path) -> Option<u64> {
         if ok == 0 {
             return None;
         }
-        Some(
-            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
-        )
+        Some(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
     }
 }
 
@@ -538,7 +563,9 @@ impl UsnWatcher {
                 break;
             }
             while offset + std::mem::size_of::<UsnRecordV2>() <= available {
-                let rec = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const UsnRecordV2) };
+                let rec = unsafe {
+                    std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const UsnRecordV2)
+                };
                 if rec.record_length == 0 {
                     break;
                 }
@@ -568,9 +595,8 @@ impl UsnWatcher {
 }
 
 // DeviceIoControl 从 Win32::System::IO。
-use windows_sys::Win32::System::IO::DeviceIoControl;
 use std::os::windows::io::FromRawHandle;
-
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
 // ===================== RDC 订阅（ReadDirectoryChangesW，H7） =====================
 //
@@ -583,8 +609,8 @@ use std::os::windows::io::FromRawHandle;
 // 证明 → 直读），与 USN journal 被删同等处理。open question 39：RDC 为实施侧
 // 裁决，待设计收口。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const ERROR_NOTIFY_ENUM_DIR: u32 = 1022;
 
@@ -700,7 +726,6 @@ impl RdcWatcher {
             .ok()
             .flatten()
     }
-
 }
 
 impl Drop for RdcWatcher {
@@ -896,12 +921,11 @@ fn rdc_read_loop(handle: HANDLE, probe_event: HANDLE, inner: &Arc<RdcInner>, ign
 }
 
 use windows_sys::Win32::Storage::FileSystem::{
-    ReadDirectoryChangesW, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_DELETE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
+    ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
-
 
 #[cfg(test)]
 mod rdc_tests {
@@ -933,11 +957,18 @@ mod rdc_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(saw_change, "同尺寸写入必须产生通知（内核写操作触发，非 stat 比对）");
+        assert!(
+            saw_change,
+            "同尺寸写入必须产生通知（内核写操作触发，非 stat 比对）"
+        );
         // 消化后归零。
         let n = w.fresh_undigested().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(w.fresh_undigested(), Some(0), "消化后未消化计数为 0（残留 {n}）");
+        assert_eq!(
+            w.fresh_undigested(),
+            Some(0),
+            "消化后未消化计数为 0（残留 {n}）"
+        );
         // 同尺寸保 mtime 写入（红线21 立法场景）：仍被捕获。
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(watch.join("a.md"), b"two").unwrap(); // 同字节数
@@ -951,7 +982,10 @@ mod rdc_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(saw_again, "同尺寸内容修改必须被 RDC 捕获（B4/H7 场景的根本保障）");
+        assert!(
+            saw_again,
+            "同尺寸内容修改必须被 RDC 捕获（B4/H7 场景的根本保障）"
+        );
     }
 
     #[test]
@@ -991,8 +1025,14 @@ mod rdc_tests {
 
         let observed = w.observe_undigested();
 
-        assert!(observed.is_some_and(|n| n > 0), "观测必须先排空已完成的 RDC 通知");
-        assert!(!watch.join(".rdc-sentinel").exists(), "观测不得写入标记文件");
+        assert!(
+            observed.is_some_and(|n| n > 0),
+            "观测必须先排空已完成的 RDC 通知"
+        );
+        assert!(
+            !watch.join(".rdc-sentinel").exists(),
+            "观测不得写入标记文件"
+        );
         assert!(
             w.observe_undigested().is_some_and(|n| n > 0),
             "只读观测不得消费变更信号"
@@ -1022,5 +1062,4 @@ mod rdc_tests {
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("Drop 应取消并等待 I/O 完成后 join worker");
     }
-
 }

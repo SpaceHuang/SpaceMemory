@@ -2,15 +2,19 @@
 //! brief_bytes=1 拒收、MCP/CLI trace frontier 可执行续读。
 
 use assert_cmd::Command;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn mem() -> Command {
     Command::cargo_bin("mem").expect("mem 二进制")
 }
 
 fn j(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("输出不是 JSON：{e}\n{}", String::from_utf8_lossy(&out.stdout)))
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "输出不是 JSON：{e}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }
 
 fn wait_until(mut cond: impl FnMut() -> bool, tries: usize, ms: u64) -> bool {
@@ -62,7 +66,10 @@ fn r10_body_nfc_nfd_matrix_direct_indexed_equal() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
-    mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
+    mem()
+        .args(["--store", &s, "init", &s, "--principal", "codex_main"])
+        .output()
+        .unwrap();
     let (_nfc, _nfd, hello) = seed_nfc_nfd_store(&dir);
 
     // sidecar 物化。
@@ -72,19 +79,31 @@ fn r10_body_nfc_nfd_matrix_direct_indexed_equal() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
     // 等物化收敛：index.sqlite 文件存在 ≠ 物化完成——等待 find 命中数稳定为 3
     //（3 条 seed 记录全部入索引）。r10 复现的 0 命中系查询早于物化完成的时序。
     // 4 条 = init 自举 principal + 3 条手写 memory。
     assert!(
         wait_until(
             || {
-                let o = mem().args(["--store", &s, "list", "--limit", "50"]).output().unwrap();
+                let o = mem()
+                    .args(["--store", &s, "list", "--limit", "50"])
+                    .output()
+                    .unwrap();
                 let v = j(&o);
-                eprintln!("DBG list items={} mode={:?}", v["items"].as_array().map(|a| a.len()).unwrap_or(0), v["read_mode"]);
+                eprintln!(
+                    "DBG list items={} mode={:?}",
+                    v["items"].as_array().map(|a| a.len()).unwrap_or(0),
+                    v["read_mode"]
+                );
                 v["items"].as_array().map(|a| a.len()).unwrap_or(0) == 4
             },
-            50, 100
+            50,
+            100
         ),
         "sidecar 初始物化应收录全部 4 条记录"
     );
@@ -121,7 +140,10 @@ fn r10_body_nfc_nfd_matrix_direct_indexed_equal() {
         }
     }
     // hello 记录可经正文查询找到（ID 验证）。
-    let oh = mem().args(["--store", &s, "find", "ello"]).output().unwrap();
+    let oh = mem()
+        .args(["--store", &s, "find", "ello"])
+        .output()
+        .unwrap();
     let vh = j(&oh);
     let hit_ids: Vec<&str> = vh["hits"]
         .as_array()
@@ -139,19 +161,35 @@ fn r10_cross_value_boundary_no_false_hit() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
-    mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
+    mem()
+        .args(["--store", &s, "init", &s, "--principal", "codex_main"])
+        .output()
+        .unwrap();
     // payload 值 "plain"（尾 in）+ 正文 "body"（头 bo）——拼接跨界 "inbo"/"nbo" 不得命中。
-    mem().args(["--store", &s, "add", "memory",
-"--principal",
-"codex_main", "--payload",
-        r#"{"title":"plain"}"#]).output().unwrap();
+    mem()
+        .args([
+            "--store",
+            &s,
+            "add",
+            "memory",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"title":"plain"}"#,
+        ])
+        .output()
+        .unwrap();
     let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_mem"))
         .args(["serve", "--store", &s, "--idle-secs", "9"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    assert!(wait_until(|| dir.join("index/index.sqlite").is_file(), 50, 100));
+    assert!(wait_until(
+        || dir.join("index/index.sqlite").is_file(),
+        50,
+        100
+    ));
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     for q in ["inbo", "nbod", "y\" + \"ti"] {
@@ -171,7 +209,10 @@ fn r10_brief_bytes_1_rejected_loudly() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
-    mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
+    mem()
+        .args(["--store", &s, "init", &s, "--principal", "codex_main"])
+        .output()
+        .unwrap();
     let mem_json = dir.join("mem.json");
     let mut cfg: Value = serde_json::from_slice(&std::fs::read(&mem_json).unwrap()).unwrap();
     cfg["budgets"]["brief_bytes"] = json!(1);
@@ -181,6 +222,9 @@ fn r10_brief_bytes_1_rejected_loudly() {
     let o = mem().args(["--store", &s, "brief"]).output().unwrap();
     assert!(!o.status.success(), "brief 在 brief_bytes=1 下必须拒收");
     assert!(String::from_utf8_lossy(&o.stderr).contains("最小为 2"));
-    let o = mem().args(["--store", &s, "show", "01a1"]).output().unwrap();
+    let o = mem()
+        .args(["--store", &s, "show", "01a1"])
+        .output()
+        .unwrap();
     assert!(!o.status.success(), "show 在 brief_bytes=1 下必须拒收");
 }

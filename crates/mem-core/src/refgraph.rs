@@ -43,7 +43,9 @@ pub fn audit_dag(store: &Store, types: &TypeSet) -> MemResult<Vec<CycleReport>> 
             nodes.push(&r.record.envelope.id);
             for e in &r.record.envelope.refs {
                 if e.rel == rel {
-                    adj.entry(&r.record.envelope.id).or_default().push(&e.target);
+                    adj.entry(&r.record.envelope.id)
+                        .or_default()
+                        .push(&e.target);
                 }
             }
         }
@@ -182,7 +184,9 @@ pub fn trace_from(
         .iter()
         .find(|r| r.record.envelope.id == start_id)
         .map(|r| r.record.envelope.id.as_str())
-        .ok_or_else(|| crate::error::MemError::MissingRecord { id_or_path: start_id.into() })?;
+        .ok_or_else(|| crate::error::MemError::MissingRecord {
+            id_or_path: start_id.into(),
+        })?;
     let mut out = Vec::new();
     let mut skipped = 0usize;
     let mut depth_truncated = false;
@@ -236,7 +240,11 @@ pub fn trace_from(
                 }
                 continue;
             }
-            out.push(TraceNode { id: n.to_string(), rel, depth });
+            out.push(TraceNode {
+                id: n.to_string(),
+                rel,
+                depth,
+            });
         }
         if out.len() >= max_nodes {
             return Ok(TraceOutcome {

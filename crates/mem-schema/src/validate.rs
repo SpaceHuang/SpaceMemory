@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::decl::{Grade, RefSpec};
 use crate::Violation;
+use crate::decl::{Grade, RefSpec};
 
 /// 分档裁决结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

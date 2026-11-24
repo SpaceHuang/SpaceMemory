@@ -38,9 +38,7 @@ impl FromStr for Token {
         let (ver, digest) = rest
             .split_once('@')
             .ok_or_else(|| format!("令牌必须形如 v<版本>@<64hex>：{s}"))?;
-        let version: u64 = ver
-            .parse()
-            .map_err(|_| format!("令牌版本非法：{s}"))?;
+        let version: u64 = ver.parse().map_err(|_| format!("令牌版本非法：{s}"))?;
         if version == 0 {
             return Err(format!("令牌版本必须 ≥ 1：{s}"));
         }
@@ -48,7 +46,10 @@ impl FromStr for Token {
             // 禁截断摘要（红线19）：64 字符全摘要才在密码学意义上支撑"必被检出"。
             return Err(format!("令牌摘要必须为 64 位十六进制（全 SHA-256）：{s}"));
         }
-        Ok(Token { version, digest: digest.to_ascii_lowercase() })
+        Ok(Token {
+            version,
+            digest: digest.to_ascii_lowercase(),
+        })
     }
 }
 
@@ -61,7 +62,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// 文件字节的修订令牌。
 pub fn for_bytes(version: u64, bytes: &[u8]) -> Token {
-    Token { version, digest: sha256_hex(bytes) }
+    Token {
+        version,
+        digest: sha256_hex(bytes),
+    }
 }
 
 /// 锁内 CAS 比较：版本**与**全摘要都必须一致（红线19）。

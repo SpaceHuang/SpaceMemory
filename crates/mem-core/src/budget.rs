@@ -35,7 +35,9 @@ pub fn apply_byte_budget(
     let mut kept = Vec::new();
     let mut truncated = false;
     for item in items {
-        let sz = serde_json::to_string(&item).map(|s| s.len() + 1).unwrap_or(usize::MAX);
+        let sz = serde_json::to_string(&item)
+            .map(|s| s.len() + 1)
+            .unwrap_or(usize::MAX);
         if estimated + sz <= byte_budget {
             estimated += sz;
             kept.push(item);
@@ -84,5 +86,13 @@ pub fn paginate<T>(all: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, bool, O
     let page: Vec<T> = all.into_iter().skip(offset).take(limit).collect();
     let taken = page.len();
     let remaining = total.saturating_sub(offset + taken);
-    (page, remaining > 0, if remaining > 0 { Some(offset + taken) } else { None })
+    (
+        page,
+        remaining > 0,
+        if remaining > 0 {
+            Some(offset + taken)
+        } else {
+            None
+        },
+    )
 }

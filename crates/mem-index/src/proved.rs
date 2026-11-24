@@ -36,18 +36,29 @@ pub struct ProvedIndex {
 
 impl ProvedIndex {
     fn new(index: Index) -> Self {
-        Self { conn: Mutex::new(index) }
+        Self {
+            conn: Mutex::new(index),
+        }
     }
 
     /// cmd_view 既有快路径的兼容面（R10 检索执行器之外的既有索引消费者——
     /// 类型单维查询，SQL 层 LIMIT/OFFSET，排序 modified DESC, id DESC）。
-    pub fn query_by_type(&self, type_name: &str, limit: usize, offset: usize) -> MemResult<Vec<crate::sqlite::IndexRow>> {
+    pub fn query_by_type(
+        &self,
+        type_name: &str,
+        limit: usize,
+        offset: usize,
+    ) -> MemResult<Vec<crate::sqlite::IndexRow>> {
         let conn = self.conn.lock().expect("索引连接锁");
         conn.query_by_type(type_name, limit, offset)
     }
 
     /// cmd_brief 既有快路径的兼容面（全类型最近 N 条）。
-    pub fn query_all(&self, limit: usize, offset: usize) -> MemResult<Vec<crate::sqlite::IndexRow>> {
+    pub fn query_all(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> MemResult<Vec<crate::sqlite::IndexRow>> {
         let conn = self.conn.lock().expect("索引连接锁");
         conn.query_all(limit, offset)
     }
@@ -68,10 +79,12 @@ pub fn open_proved(store: &Store, hello: Option<&Hello>) -> Proved {
         Err(e) => {
             return Proved {
                 mode: ReadMode::Direct {
-                    reason: format!("索引只读打开或 schema 门禁失败（读路径不建库，红线8/18）：{e}"),
+                    reason: format!(
+                        "索引只读打开或 schema 门禁失败（读路径不建库，红线8/18）：{e}"
+                    ),
                 },
                 index: None,
-            }
+            };
         }
     };
     // 4) epoch 代际核对：检查点必须与索引同物化代——索引被删重建（epoch 重置）
@@ -91,9 +104,11 @@ pub fn open_proved(store: &Store, hello: Option<&Hello>) -> Proved {
     match store.read_compatible_missing_features() {
         Err(error) => {
             return Proved {
-                mode: ReadMode::Direct { reason: format!("返回读取前数据特性复核失败：{error}") },
+                mode: ReadMode::Direct {
+                    reason: format!("返回读取前数据特性复核失败：{error}"),
+                },
                 index: None,
-            }
+            };
         }
         Ok(missing) if !missing.is_empty() => {
             return Proved {
@@ -101,11 +116,14 @@ pub fn open_proved(store: &Store, hello: Option<&Hello>) -> Proved {
                     reason: format!("读取期间出现只读兼容特性 {missing:?}，放弃索引快路径"),
                 },
                 index: None,
-            }
+            };
         }
         Ok(_) => {}
     }
-    Proved { mode, index: Some(ProvedIndex::new(index)) }
+    Proved {
+        mode,
+        index: Some(ProvedIndex::new(index)),
+    }
 }
 
 impl FindPrefilter for ProvedIndex {
@@ -114,7 +132,11 @@ impl FindPrefilter for ProvedIndex {
     /// 超集（载荷折叠列是全部值的折叠拼接：值内命中 ⊆ 拼接命中；id 前缀 LIKE 与
     /// 谓词同形），各自超集的交集仍是超集。**负词项与过滤不下推**：LIKE 命中不
     /// 代表记录命中，对近似条件取反会把真命中错误排除——只在精筛施加（红线8）。
-    fn candidates(&self, terms_folded: &[String], types: Option<&[String]>) -> MemResult<Vec<PrefilterRow>> {
+    fn candidates(
+        &self,
+        terms_folded: &[String],
+        types: Option<&[String]>,
+    ) -> MemResult<Vec<PrefilterRow>> {
         let conn = self.conn.lock().expect("索引连接锁");
         let conn = &conn.conn;
         if types.map(|t| t.is_empty()).unwrap_or(false) {
@@ -205,5 +227,8 @@ impl FindPrefilter for ProvedIndex {
 }
 
 fn sq_err(e: rusqlite::Error) -> mem_core::error::MemError {
-    mem_core::error::MemError::Corrupt { path: "index/index.sqlite".into(), reason: e.to_string() }
+    mem_core::error::MemError::Corrupt {
+        path: "index/index.sqlite".into(),
+        reason: e.to_string(),
+    }
 }

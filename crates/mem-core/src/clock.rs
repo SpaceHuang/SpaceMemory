@@ -65,7 +65,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// RFC 3339 UTC（`YYYY-MM-DDTHH:MM:SSZ`）→ epoch 秒；格式非法 → None。
 pub fn parse_rfc3339_to_epoch(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
         return None;
     }
     let num = |a: usize, n: usize| -> Option<i64> { s.get(a..a + n)?.parse::<i64>().ok() };
@@ -97,20 +104,34 @@ mod tests {
     #[test]
     fn known_timestamps() {
         // 2026-11-04T09:12:00Z = 1793742720
-        assert_eq!(format_rfc3339(UNIX_EPOCH + Duration::from_secs(1_793_783_520)), "2026-11-04T09:12:00Z");
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(1_793_783_520)),
+            "2026-11-04T09:12:00Z"
+        );
         assert_eq!(format_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
         // 闰年 2024-02-29
-        assert_eq!(format_rfc3339(UNIX_EPOCH + Duration::from_secs(1_709_164_800)), "2024-02-29T00:00:00Z");
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
+            "2024-02-29T00:00:00Z"
+        );
     }
 
     #[test]
     fn parse_roundtrip() {
-        assert_eq!(parse_rfc3339_to_epoch("2026-11-04T09:12:00Z"), Some(1_793_783_520));
+        assert_eq!(
+            parse_rfc3339_to_epoch("2026-11-04T09:12:00Z"),
+            Some(1_793_783_520)
+        );
         assert_eq!(parse_rfc3339_to_epoch("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_rfc3339_to_epoch("2026-11-04"), None);
         // 往返。
         let t = now_rfc3339();
-        assert_eq!(format_rfc3339(UNIX_EPOCH + std::time::Duration::from_secs(parse_rfc3339_to_epoch(&t).unwrap())), t);
+        assert_eq!(
+            format_rfc3339(
+                UNIX_EPOCH + std::time::Duration::from_secs(parse_rfc3339_to_epoch(&t).unwrap())
+            ),
+            t
+        );
     }
 
     #[test]

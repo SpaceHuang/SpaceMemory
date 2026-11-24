@@ -16,7 +16,7 @@ use mem_core::find::{self, FilterCond, FindParams, FindPrefilter, PrefilterRow};
 use mem_core::freshness::ReadMode;
 use mem_core::store::{OpenMode, Store};
 use mem_schema::TypeSet;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------- 夹具 ----------
 
@@ -603,15 +603,17 @@ fn filter_combined_with_terms() {
         vec![d001]
     );
     // 词项命中但过滤不中 → 零命中。
-    assert!(ids(&run(
-        &f,
-        Some("linha"),
-        &conds(&[("status", "geometry")]),
-        None,
-        50,
-        0
-    ))
-    .is_empty());
+    assert!(
+        ids(&run(
+            &f,
+            Some("linha"),
+            &conds(&[("status", "geometry")]),
+            None,
+            50,
+            0
+        ))
+        .is_empty()
+    );
     // find 不收空查询（R10.9）：execute 层同样拒收。
     let e = run_err(&f, Some("   "), &conds(&[]), None);
     assert_eq!(kind_of(&e), "query_invalid");

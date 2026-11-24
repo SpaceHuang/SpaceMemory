@@ -37,7 +37,10 @@ pub const DUPLICATE_FILTER_FIELD: &str = "duplicate_filter_field";
 pub const INVALID_FILTER_VALUE: &str = "invalid_filter_value";
 
 fn reject(kind: &str, message: impl Into<String>) -> MemError {
-    MemError::ParamRejected { kind: kind.to_string(), message: message.into() }
+    MemError::ParamRejected {
+        kind: kind.to_string(),
+        message: message.into(),
+    }
 }
 
 // ---------- 查询文法（决策①，§2.2） ----------
@@ -66,9 +69,18 @@ pub fn parse_query(query: &str) -> MemResult<ParsedQuery> {
     let mut negative = Vec::new();
     for term in query.split_whitespace() {
         match term.strip_prefix('-') {
-            Some("") => positive.push(Term { raw: term.to_string(), folded: fold(term) }),
-            Some(rest) => negative.push(Term { raw: term.to_string(), folded: fold(rest) }),
-            None => positive.push(Term { raw: term.to_string(), folded: fold(term) }),
+            Some("") => positive.push(Term {
+                raw: term.to_string(),
+                folded: fold(term),
+            }),
+            Some(rest) => negative.push(Term {
+                raw: term.to_string(),
+                folded: fold(rest),
+            }),
+            None => positive.push(Term {
+                raw: term.to_string(),
+                folded: fold(term),
+            }),
         }
     }
     if positive.is_empty() {
@@ -82,9 +94,18 @@ pub fn parse_query(query: &str) -> MemResult<ParsedQuery> {
 
 /// 组合谓词（§2.3，外层包装，谓词本体不变）：
 /// 命中(r) := ∀p ∈ 肯定词项: record_matches(r, fold(p)) ∧ ∀n ∈ 否定词项: ¬record_matches(r, fold(n))。
-pub fn record_matches_query(env: &Envelope, payload: &serde_json::Value, body: &[u8], q: &ParsedQuery) -> bool {
-    q.positive.iter().all(|t| record_matches(&env.id, &env.aliases, payload, body, &t.folded))
-        && q.negative.iter().all(|t| !record_matches(&env.id, &env.aliases, payload, body, &t.folded))
+pub fn record_matches_query(
+    env: &Envelope,
+    payload: &serde_json::Value,
+    body: &[u8],
+    q: &ParsedQuery,
+) -> bool {
+    q.positive
+        .iter()
+        .all(|t| record_matches(&env.id, &env.aliases, payload, body, &t.folded))
+        && q.negative
+            .iter()
+            .all(|t| !record_matches(&env.id, &env.aliases, payload, body, &t.folded))
 }
 
 // ---------- 过滤执行器（决策③④，§2.4） ----------
@@ -138,9 +159,17 @@ fn number_eq(a: &serde_json::Number, b: &serde_json::Number) -> bool {
         return x == y;
     }
     // 剩余组合至少一侧是 Float 变体（整数变体的 as_f64 恒 Some，需按变体区分）。
-    let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) else { return false };
-    let a_int = a.as_i64().map(i128::from).or_else(|| a.as_u64().map(i128::from));
-    let b_int = b.as_i64().map(i128::from).or_else(|| b.as_u64().map(i128::from));
+    let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) else {
+        return false;
+    };
+    let a_int = a
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| a.as_u64().map(i128::from));
+    let b_int = b
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| b.as_u64().map(i128::from));
     match (a_int, b_int) {
         (Some(i), None) => float_eq_int(y, i),
         (None, Some(i)) => float_eq_int(x, i),
@@ -160,9 +189,9 @@ fn float_eq_int(f: f64, int: i128) -> bool {
 fn array_elem_matches(elem: &serde_json::Value, text: &str) -> bool {
     match elem {
         serde_json::Value::String(s) => fold(s) == fold(text),
-        serde_json::Value::Number(n) => {
-            parse_number_text(text).map(|p| number_eq(&p, n)).unwrap_or(false)
-        }
+        serde_json::Value::Number(n) => parse_number_text(text)
+            .map(|p| number_eq(&p, n))
+            .unwrap_or(false),
         serde_json::Value::Bool(b) => text == b.to_string(),
         _ => false, // 嵌套数组/对象/null：不命中不计错
     }
@@ -170,23 +199,36 @@ fn array_elem_matches(elem: &serde_json::Value, text: &str) -> bool {
 
 /// 过滤值等值（按记录自身类型的声明形态裁定；字段缺失/形态不符 → 不命中不计错，
 /// R8.7/R10.10 降级承接）。
-fn filter_value_matches(shape: &FilterShape, payload: &serde_json::Value, field: &str, text: &str) -> bool {
-    let Some(actual) = payload.get(field) else { return false };
+fn filter_value_matches(
+    shape: &FilterShape,
+    payload: &serde_json::Value,
+    field: &str,
+    text: &str,
+) -> bool {
+    let Some(actual) = payload.get(field) else {
+        return false;
+    };
     match shape {
-        FilterShape::Text => {
-            actual.as_str().map(|s| fold(s) == fold(text)).unwrap_or(false)
-        }
-        FilterShape::Number => {
-            actual.as_number().map(|n| {
-                parse_number_text(text).map(|p| number_eq(&p, n)).unwrap_or(false)
-            }).unwrap_or(false)
-        }
-        FilterShape::Bool => {
-            actual.as_bool().map(|b| text == b.to_string()).unwrap_or(false)
-        }
-        FilterShape::Array => {
-            actual.as_array().map(|a| a.iter().any(|e| array_elem_matches(e, text))).unwrap_or(false)
-        }
+        FilterShape::Text => actual
+            .as_str()
+            .map(|s| fold(s) == fold(text))
+            .unwrap_or(false),
+        FilterShape::Number => actual
+            .as_number()
+            .map(|n| {
+                parse_number_text(text)
+                    .map(|p| number_eq(&p, n))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false),
+        FilterShape::Bool => actual
+            .as_bool()
+            .map(|b| text == b.to_string())
+            .unwrap_or(false),
+        FilterShape::Array => actual
+            .as_array()
+            .map(|a| a.iter().any(|e| array_elem_matches(e, text)))
+            .unwrap_or(false),
         FilterShape::Unsupported => false,
     }
 }
@@ -217,7 +259,11 @@ pub fn filter_declaration_audit(types: &TypeSet) -> Vec<String> {
 /// 交集裁定可命中记录，声明检查作用域必须与之一致，否则只被 --type 类型声明的
 /// 过滤字段会被误报 unknown_filter_field；交集为空 → 一切过滤报 unknown_filter_field
 /// （与"交集内记录恒空、过滤条件永不命中"一致）。
-fn candidate_types(types: &TypeSet, type_narrow: Option<&str>, view_types: &[String]) -> Vec<String> {
+fn candidate_types(
+    types: &TypeSet,
+    type_narrow: Option<&str>,
+    view_types: &[String],
+) -> Vec<String> {
     let mut base: Vec<String> = if !view_types.is_empty() {
         view_types.to_vec()
     } else {
@@ -249,7 +295,10 @@ fn resolve_filters(
         if !seen.insert(f.field.as_str()) {
             return Err(reject(
                 DUPLICATE_FILTER_FIELD,
-                format!("过滤字段重复：{}（CLI --filter 可重复但同一字段只能出现一次）", f.field),
+                format!(
+                    "过滤字段重复：{}（CLI --filter 可重复但同一字段只能出现一次）",
+                    f.field
+                ),
             ));
         }
     }
@@ -264,7 +313,10 @@ fn resolve_filters(
         let declaring: Vec<&str> = candidate_types
             .iter()
             .filter(|t| {
-                types.get(t).map(|d| d.filter_fields().contains_key(&f.field)).unwrap_or(false)
+                types
+                    .get(t)
+                    .map(|d| d.filter_fields().contains_key(&f.field))
+                    .unwrap_or(false)
             })
             .map(|t| t.as_str())
             .collect();
@@ -281,7 +333,12 @@ fn resolve_filters(
             .into_iter()
             .filter(|t| {
                 let d = types.get(t).expect("declaring 已核验存在");
-                shape_admits_text(d.filter_fields().get(&f.field).expect("declaring 已核验声明"), &f.text)
+                shape_admits_text(
+                    d.filter_fields()
+                        .get(&f.field)
+                        .expect("declaring 已核验声明"),
+                    &f.text,
+                )
             })
             .map(|t| t.to_string())
             .collect();
@@ -294,7 +351,11 @@ fn resolve_filters(
                 ),
             ));
         }
-        out.push(ResolvedFilter { field: f.field.clone(), text: f.text.clone(), compatible });
+        out.push(ResolvedFilter {
+            field: f.field.clone(),
+            text: f.text.clone(),
+            compatible,
+        });
     }
     Ok(out)
 }
@@ -339,7 +400,9 @@ fn record_passes(
     if !resolved.is_empty() {
         // 精筛按每条记录自身类型的声明裁定等值（评审 B2）；未声明类型 / 未声明
         // 字段 / 形态不符声明 → 不命中、不报错（§2.4 降级承接）。
-        let Some(decl) = types.get(&env.r#type) else { return false };
+        let Some(decl) = types.get(&env.r#type) else {
+            return false;
+        };
         for f in resolved {
             match decl.filter_fields().get(&f.field) {
                 Some(shape) => {
@@ -375,7 +438,11 @@ pub trait FindPrefilter: Send + Sync {
     /// 超集候选：正词项折叠串合取（可为空 = 无文本条件）+ 可选类型收窄。
     /// 每词项 LIKE 条件是其谓词命中的超集（只多不会漏，红线8）；负词项与过滤
     /// 不下推（§2.1）。失败 → 调用方回退 direct（不转空命中）。
-    fn candidates(&self, terms_folded: &[String], types: Option<&[String]>) -> MemResult<Vec<PrefilterRow>>;
+    fn candidates(
+        &self,
+        terms_folded: &[String],
+        types: Option<&[String]>,
+    ) -> MemResult<Vec<PrefilterRow>>;
 
     /// 坏记录清单：(rel, 告警行) 按 rel 升序最多 cap 条 + 是否还有更多。
     /// 失败 → 调用方回退 direct（禁止空告警的 indexed，决策⑦）。
@@ -436,10 +503,7 @@ pub fn execute(params: FindParams) -> MemResult<FindOutcome> {
     store.read_compatible_missing_features()?;
     let cap = params.store.config().budgets.list_limit_max as usize;
     let pq = params.query.map(parse_query).transpose()?;
-    let view_types: Vec<String> = params
-        .view
-        .map(|v| v.types.clone())
-        .unwrap_or_default();
+    let view_types: Vec<String> = params.view.map(|v| v.types.clone()).unwrap_or_default();
     let cands = candidate_types(params.types, params.type_narrow, &view_types);
     let resolved = resolve_filters(params.types, &cands, params.filters)?;
 
@@ -510,7 +574,14 @@ fn try_indexed(
         for row in &rows {
             // 文件已消失（删除竞态残影）→ 跳过；路径漂移 → 按 id 兜底解析。
             if let Some(rec) = read_candidate(params.store, &row.rel, &row.id) {
-                if record_passes(&rec, pq, params.view, resolved, params.types, params.type_narrow) {
+                if record_passes(
+                    &rec,
+                    pq,
+                    params.view,
+                    resolved,
+                    params.types,
+                    params.type_narrow,
+                ) {
                     hits.push(Hit {
                         id: rec.record.envelope.id.clone(),
                         type_name: rec.record.envelope.r#type.clone(),
@@ -524,7 +595,16 @@ fn try_indexed(
         }
         hits
     };
-    Ok(assemble(params.mode.clone(), hits, bad, bad_more, params.limit, params.offset, pq, &params.filters))
+    Ok(assemble(
+        params.mode.clone(),
+        hits,
+        bad,
+        bad_more,
+        params.limit,
+        params.offset,
+        pq,
+        &params.filters,
+    ))
 }
 
 /// direct 路径（§2.1 4b）：全量直读真相层 → 同一精筛 → 命中序分页；告警取自
@@ -540,12 +620,22 @@ fn run_direct(
     // 与 indexed 同序（modified DESC, id DESC）——两执行器命中面与顺序结构性等价。
     let mut records = scan.records;
     records.sort_by(|a, b| {
-        b.record.envelope.modified.cmp(&a.record.envelope.modified)
+        b.record
+            .envelope
+            .modified
+            .cmp(&a.record.envelope.modified)
             .then(b.record.envelope.id.cmp(&a.record.envelope.id))
     });
     let mut hits = Vec::new();
     for rec in &records {
-        if record_passes(rec, pq, params.view, resolved, params.types, params.type_narrow) {
+        if record_passes(
+            rec,
+            pq,
+            params.view,
+            resolved,
+            params.types,
+            params.type_narrow,
+        ) {
             hits.push(Hit {
                 id: rec.record.envelope.id.clone(),
                 type_name: rec.record.envelope.r#type.clone(),
@@ -560,7 +650,16 @@ fn run_direct(
     bad.sort_by(|a, b| a.0.cmp(&b.0));
     let bad_more = bad.len() > cap;
     bad.truncate(cap);
-    Ok(assemble(mode, hits, bad, bad_more, params.limit, params.offset, pq, &params.filters))
+    Ok(assemble(
+        mode,
+        hits,
+        bad,
+        bad_more,
+        params.limit,
+        params.offset,
+        pq,
+        &params.filters,
+    ))
 }
 
 /// 逐候选回读真相层（红线8：索引不 gate 正确性——精筛按磁盘真相裁定）。
@@ -570,7 +669,11 @@ fn read_candidate(store: &Store, rel: &str, id: &str) -> Option<Scanned> {
         if let Ok(rec) = crate::record::Record::from_bytes(&bytes) {
             if rec.envelope.id == id {
                 let token = crate::token::for_bytes(rec.envelope.version, &bytes);
-                return Some(Scanned { rel: rel.to_string(), record: rec, token });
+                return Some(Scanned {
+                    rel: rel.to_string(),
+                    record: rec,
+                    token,
+                });
             }
         }
     }
@@ -598,9 +701,16 @@ fn assemble(
         hits: page,
         truncated,
         resume_offset: resume,
-        positive_terms: pq.map(|q| q.positive.iter().map(|t| t.raw.clone()).collect()).unwrap_or_default(),
-        negative_terms: pq.map(|q| q.negative.iter().map(|t| t.raw.clone()).collect()).unwrap_or_default(),
-        filters_applied: filters.iter().map(|f| (f.field.clone(), f.text.clone())).collect(),
+        positive_terms: pq
+            .map(|q| q.positive.iter().map(|t| t.raw.clone()).collect())
+            .unwrap_or_default(),
+        negative_terms: pq
+            .map(|q| q.negative.iter().map(|t| t.raw.clone()).collect())
+            .unwrap_or_default(),
+        filters_applied: filters
+            .iter()
+            .map(|f| (f.field.clone(), f.text.clone()))
+            .collect(),
         warnings,
         warnings_truncated: bad_more,
     }

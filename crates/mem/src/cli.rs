@@ -12,7 +12,11 @@ use crate::commands;
 
 /// mem —— Agent 记忆与状态层（第二记忆）机制层 CLI（§3.3）。
 #[derive(Parser)]
-#[command(name = "mem", version, about = "SpaceMemory 机制层：记录/台账/事件/维护")]
+#[command(
+    name = "mem",
+    version,
+    about = "SpaceMemory 机制层：记录/台账/事件/维护"
+)]
 pub struct Cli {
     /// 数据目录（默认 $MEM_STORE 或 ~/.agent-memory）。
     #[arg(long, global = true)]
@@ -116,7 +120,10 @@ pub enum Cmd {
         payload: String,
         #[arg(long, help = "正文文件路径；'-' = stdin")]
         body: Option<String>,
-        #[arg(long, help = "归属身份（短名或记录 ID）；缺省时从 --session 台账继承；两者皆无则拒绝（principal 类型豁免）")]
+        #[arg(
+            long,
+            help = "归属身份（短名或记录 ID）；缺省时从 --session 台账继承；两者皆无则拒绝（principal 类型豁免）"
+        )]
         principal: Option<String>,
         #[arg(long)]
         session: Option<String>,
@@ -179,9 +186,7 @@ pub enum Cmd {
         offset: Option<usize>,
     },
     /// 绑定缺省视图指针（显式声明；禁止环境推断，红线11）
-    Bind {
-        view: String,
-    },
+    Bind { view: String },
     /// 全库校验（坏条目、断链、历史空洞、半成品计划、--deep 摘要）
     Verify {
         #[arg(long)]

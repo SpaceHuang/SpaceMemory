@@ -55,7 +55,9 @@ pub fn scan_current_drift(store: &Store, limit: usize) -> MemResult<DriftScan> {
     for c in candidates {
         let last = log.events.iter().rev().find(|e| e.id == c.id);
         let last_state = last.map(event::triple_from_event);
-        let last_path = last.map(|e| e.path.clone()).unwrap_or_else(|| c.lock_rel.clone());
+        let last_path = last
+            .map(|e| e.path.clone())
+            .unwrap_or_else(|| c.lock_rel.clone());
         // 损坏记录：verify 域，不进漂移（R6.2 隔离）。
         let cur = match event::current_state_for_id(store, &c.lock_rel, Some(&c.id)) {
             Ok(t) => t,
@@ -85,7 +87,10 @@ pub fn scan_current_drift(store: &Store, limit: usize) -> MemResult<DriftScan> {
             _ => "未登记变更（backfill 待执行）",
         };
         let token = match (&cur.version, &cur.digest) {
-            (Some(v), Some(d)) => Some(Token { version: *v, digest: d.clone() }),
+            (Some(v), Some(d)) => Some(Token {
+                version: *v,
+                digest: d.clone(),
+            }),
             _ => None,
         };
         let mtime = cur_path
@@ -170,10 +175,18 @@ pub fn diff_since(
         .into_iter()
         .map(|(id, history)| {
             let last_event = history.last().cloned().expect("分组非空");
-            RecordChanges { id, last_event, history }
+            RecordChanges {
+                id,
+                last_event,
+                history,
+            }
         })
         .collect();
     let current_drift = scan_current_drift(store, drift_limit)?;
     store.read_compatible_missing_features()?;
-    Ok(DiffResult { changes_since, changes_truncated, current_drift })
+    Ok(DiffResult {
+        changes_since,
+        changes_truncated,
+        current_drift,
+    })
 }

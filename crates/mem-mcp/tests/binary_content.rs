@@ -4,7 +4,7 @@
 //! 直接驱动 mem_mcp::protocol::handle_request（与 mem bin 的 stdio 装配同一入口）。
 
 use mem_core::store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -22,8 +22,16 @@ fn b64_encode(data: &[u8]) -> String {
             | c.get(2).map(|b| *b as u32).unwrap_or(0);
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -94,9 +102,10 @@ fn call(root: &std::path::Path, id: i64, name: &str, args: Value) -> Value {
         "params": {"name": name, "arguments": args}
     });
     let resp = mem_mcp::handle_request(root, &req).expect("tools/call 必有应答");
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
-    serde_json::from_str(text)
-        .unwrap_or_else(|e| panic!("工具输出非 JSON：{e}\n{text}"))
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出非 JSON：{e}\n{text}"))
 }
 
 /// PNG 头 + 非 UTF-8 字节 + "abs" 编巧合。
@@ -118,17 +127,28 @@ fn acceptance4_protocol_full_chain_b64_paging() {
     let src_bytes = png_like_bytes();
 
     // 写入：base64 保真通道解码后按原始字节落盘（既有裁决 M4）。
-    let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "principal": "codex_main", "payload": {"title": "protocol-image"},
-        "body_b64": b64_encode(&src_bytes),
-    }));
+    let added = call(
+        &dir,
+        1,
+        "mem_add",
+        json!({
+            "type": "memory", "principal": "codex_main", "payload": {"title": "protocol-image"},
+            "body_b64": b64_encode(&src_bytes),
+        }),
+    );
     assert_eq!(added["created"], true, "{added}");
     let id = added["id"].as_str().unwrap().to_string();
 
     // 定位：类型过滤 list（检索能力本身归 R10，另一提案）。
     let listed = call(&dir, 2, "mem_list", json!({"type": "memory"}));
-    assert!(listed["items"].as_array().unwrap()
-        .iter().any(|i| i["id"] == added["id"]), "{listed}");
+    assert!(
+        listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == added["id"]),
+        "{listed}"
+    );
 
     // 钻取分页：页 = brief_bytes 个原始字节，base64 交付；body=null、body_utf8=false。
     let mem_json = dir.join("mem.json");
@@ -139,7 +159,12 @@ fn acceptance4_protocol_full_chain_b64_paging() {
     let mut assembled = Vec::new();
     let mut offset = 0usize;
     for _ in 0..1000 {
-        let v = call(&dir, 3, "mem_show", json!({"id": id, "body_offset": offset}));
+        let v = call(
+            &dir,
+            3,
+            "mem_show",
+            json!({"id": id, "body_offset": offset}),
+        );
         assert_eq!(v["body_utf8"], false, "恒有机判字段（BD3）：{v}");
         assert_eq!(v["body"], Value::Null, "非文本正文文本通道关闭（BD2）");
         let b64 = v["body_b64"].as_str().expect("body_b64 分页：{v}");
@@ -161,9 +186,14 @@ fn mem_show_text_body_utf8_multipage_assembly() {
     let dir = tmp.path().join("store");
     init_store(&dir);
     let body_text = "协议档正文分页".repeat(10);
-    let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "principal": "codex_main", "payload": {"title": "text"}, "body": body_text,
-    }));
+    let added = call(
+        &dir,
+        1,
+        "mem_add",
+        json!({
+            "type": "memory", "principal": "codex_main", "payload": {"title": "text"}, "body": body_text,
+        }),
+    );
     let id = added["id"].as_str().unwrap().to_string();
     let mem_json = dir.join("mem.json");
     let mut cfg: Value = serde_json::from_slice(&std::fs::read(&mem_json).unwrap()).unwrap();
@@ -173,9 +203,18 @@ fn mem_show_text_body_utf8_multipage_assembly() {
     let mut joined = String::new();
     let mut offset = 0usize;
     for _ in 0..1000 {
-        let v = call(&dir, 2, "mem_show", json!({"id": id, "body_offset": offset}));
+        let v = call(
+            &dir,
+            2,
+            "mem_show",
+            json!({"id": id, "body_offset": offset}),
+        );
         assert_eq!(v["body_utf8"], true);
-        assert_eq!(v["body_b64"], Value::Null, "合法正文不走 base64 通道（自适应，BD2）");
+        assert_eq!(
+            v["body_b64"],
+            Value::Null,
+            "合法正文不走 base64 通道（自适应，BD2）"
+        );
         joined.push_str(v["body"].as_str().unwrap());
         if v["body_truncated"].as_bool().unwrap() {
             offset = v["resume"]["body_offset"].as_u64().unwrap() as usize;
@@ -183,7 +222,10 @@ fn mem_show_text_body_utf8_multipage_assembly() {
             break;
         }
     }
-    assert_eq!(joined, body_text, "文本通道切点码点对齐——跨页拼装恒等（G2）");
+    assert_eq!(
+        joined, body_text,
+        "文本通道切点码点对齐——跨页拼装恒等（G2）"
+    );
 }
 
 // ---------- mem_restore_body：与 CLI restore-body 同批义务（R11.5 对等） ----------
@@ -194,9 +236,14 @@ fn mem_restore_body_file_source_and_echo() {
     let dir = tmp.path().join("store");
     init_store(&dir);
     let src_bytes = png_like_bytes();
-    let added = call(&dir, 1, "mem_add", json!({
-        "type": "memory", "principal": "codex_main", "payload": {"title": "restore"}, "body_b64": b64_encode(&src_bytes),
-    }));
+    let added = call(
+        &dir,
+        1,
+        "mem_add",
+        json!({
+            "type": "memory", "principal": "codex_main", "payload": {"title": "restore"}, "body_b64": b64_encode(&src_bytes),
+        }),
+    );
     let id = added["id"].as_str().unwrap().to_string();
     let hit = call(&dir, 2, "mem_show", json!({"id": id}));
     let rel = hit["rel"].as_str().unwrap().to_string();
@@ -214,17 +261,28 @@ fn mem_restore_body_file_source_and_echo() {
     let backup = tmp.path().join("backup.md");
     std::fs::write(&backup, &pristine).unwrap();
     // 恢复（file 源；git 缺席的店 file 仍可用）。
-    let out = call(&dir, 4, "mem_restore_body", json!({
-        "id": id, "expect": expect,
-        "source": format!("file:{}", backup.to_str().unwrap()),
-    }));
+    let out = call(
+        &dir,
+        4,
+        "mem_restore_body",
+        json!({
+            "id": id, "expect": expect,
+            "source": format!("file:{}", backup.to_str().unwrap()),
+        }),
+    );
     assert_eq!(out["source"]["form"], "file", "{out}");
-    assert_eq!(out["source"]["body_sha256_source"], json!(sha256_hex(&body)));
+    assert_eq!(
+        out["source"]["body_sha256_source"],
+        json!(sha256_hex(&body))
+    );
     assert_eq!(out["version"], json!(2), "版本 +1");
     // 取回：恢复后字节 == 写入字节（协议档全链闭合）。
     let v = call(&dir, 5, "mem_show", json!({"id": id}));
-    assert_eq!(sha256_hex(&b64_decode(v["body_b64"].as_str().unwrap())), sha256_hex(&src_bytes),
-        "恢复后正文与写入字节一致：{v}");
+    assert_eq!(
+        sha256_hex(&b64_decode(v["body_b64"].as_str().unwrap())),
+        sha256_hex(&src_bytes),
+        "恢复后正文与写入字节一致：{v}"
+    );
 }
 
 // ---------- 工具面：mem_restore_body 定义在列（14→15，BD4 占位名） ----------
@@ -237,10 +295,18 @@ fn tools_list_includes_restore_body() {
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
     let resp = mem_mcp::handle_request(&dir, &req).unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 16, "工具面：基线 14 + mem_find（R10）+ mem_restore_body（R11 BD4）= 16：{}", tools.len());
+    assert_eq!(
+        tools.len(),
+        16,
+        "工具面：基线 14 + mem_find（R10）+ mem_restore_body（R11 BD4）= 16：{}",
+        tools.len()
+    );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"mem_restore_body"), "{names:?}");
     // mem_show 描述声明 body_utf8/body_b64（BD2 形状随工具面可见）。
     let show = tools.iter().find(|t| t["name"] == "mem_show").unwrap();
-    assert!(show["description"].as_str().unwrap().contains("body_b64"), "{show}");
+    assert!(
+        show["description"].as_str().unwrap().contains("body_b64"),
+        "{show}"
+    );
 }

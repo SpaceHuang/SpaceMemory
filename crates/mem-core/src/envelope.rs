@@ -41,10 +41,7 @@ pub fn new_uuid_v7() -> String {
     uuid::Uuid::now_v7().hyphenated().to_string()
 }
 
-fn take_str(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Option<String> {
+fn take_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
@@ -79,7 +76,11 @@ impl Envelope {
                         .as_object()
                         .ok_or_else(|| "refs 元素必须是 object".to_string())?;
                     refs.push(Ref {
-                        rel: ro.get("rel").and_then(|v| v.as_str()).ok_or("refs[].rel 缺失")?.to_string(),
+                        rel: ro
+                            .get("rel")
+                            .and_then(|v| v.as_str())
+                            .ok_or("refs[].rel 缺失")?
+                            .to_string(),
                         target: ro
                             .get("target")
                             .and_then(|v| v.as_str())
@@ -96,9 +97,13 @@ impl Envelope {
                 let mut out = Vec::new();
                 for v in a {
                     // M7：非字符串元素此前静默变 ""——R6.1 要求可识别，响亮拒收。
-                    out.push(v.as_str().ok_or_else(|| {
-                        "envelope.aliases 元素必须是字符串（R6.1，不静默）".to_string()
-                    })?.to_string());
+                    out.push(
+                        v.as_str()
+                            .ok_or_else(|| {
+                                "envelope.aliases 元素必须是字符串（R6.1，不静默）".to_string()
+                            })?
+                            .to_string(),
+                    );
                 }
                 out
             }
@@ -115,8 +120,16 @@ impl Envelope {
 
         // 未知键保留。
         const KNOWN: &[&str] = &[
-            "id", "type", "created", "modified", "version", "principal", "refs",
-            "aliases", "evidence_cutoff_seq", "commit",
+            "id",
+            "type",
+            "created",
+            "modified",
+            "version",
+            "principal",
+            "refs",
+            "aliases",
+            "evidence_cutoff_seq",
+            "commit",
         ];
         let mut extra = BTreeMap::new();
         for (k, v) in obj {

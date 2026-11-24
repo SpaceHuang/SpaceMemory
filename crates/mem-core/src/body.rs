@@ -71,7 +71,11 @@ pub fn body_page_text(
 /// 字节分页（G2 字节通道：任意字节按原始字节分页；页 = byte_budget 个原始字节）。
 /// 返回 (本页字节, 是否截断, 下一偏移)；调用方选择保真交付形态（CLI 落文件 /
 /// MCP base64）。
-pub fn body_page_bytes(body: &[u8], offset: usize, byte_budget: usize) -> (&[u8], bool, Option<usize>) {
+pub fn body_page_bytes(
+    body: &[u8],
+    offset: usize,
+    byte_budget: usize,
+) -> (&[u8], bool, Option<usize>) {
     let off = offset.min(body.len());
     let rest = &body[off..];
     let take = rest.len().min(byte_budget);
@@ -109,7 +113,11 @@ fn descriptor_for(record_id: &str, body_len: usize, digest_prefix: &str) -> Stri
         "[非文本正文 {} 字节 sha256:{digest_prefix}…，取回：mem show {record_id} --body-out <路径>]",
         byte_count_display(body_len),
     );
-    debug_assert!(d.len() <= 128, "描述符模板上界 128 字节（BD3）：{}", d.len());
+    debug_assert!(
+        d.len() <= 128,
+        "描述符模板上界 128 字节（BD3）：{}",
+        d.len()
+    );
     d
 }
 
@@ -204,7 +212,11 @@ mod tests {
         let (page, truncated, next) = body_page_text(body, 0, 2).unwrap();
         assert_eq!(page, "几");
         assert!(truncated);
-        assert_eq!(next, Some(3), "next 必须前进（原偏移 + 空页 = 调用方死循环）");
+        assert_eq!(
+            next,
+            Some(3),
+            "next 必须前进（原偏移 + 空页 = 调用方死循环）"
+        );
     }
 
     #[test]
@@ -224,7 +236,10 @@ mod tests {
     #[test]
     fn text_page_returns_none_for_invalid_utf8() {
         let bin: &[u8] = &[0x89, b'P', b'N', b'G', 0xFF, 0x00];
-        assert!(body_page_text(bin, 0, 16).is_none(), "非文本正文不走文本通道（G2）");
+        assert!(
+            body_page_text(bin, 0, 16).is_none(),
+            "非文本正文不走文本通道（G2）"
+        );
     }
 
     // ---------- 字节通道 ----------
@@ -265,7 +280,11 @@ mod tests {
     fn descriptor_bounded_and_actionable() {
         let body: Vec<u8> = (0..=255).collect();
         let d = non_text_descriptor("01980000-0000-7000-8000-00000000dead", &body);
-        assert!(d.len() <= 128, "总长上界 128 字节（BD3）：{} —— {d}", d.len());
+        assert!(
+            d.len() <= 128,
+            "总长上界 128 字节（BD3）：{} —— {d}",
+            d.len()
+        );
         assert!(d.contains(&format!("{} 字节", body.len())), "含字节数：{d}");
         assert!(d.contains("sha256:"), "含正文摘要前缀：{d}");
         assert!(d.contains("--body-out"), "含取回指引：{d}");
@@ -288,7 +307,11 @@ mod tests {
         let id = "01980000-0000-7000-8000-00000000dead";
         for len in [1_048_576usize, 1_000_000_000, usize::MAX] {
             let d = descriptor_for(id, len, "ab12cd");
-            assert!(d.len() <= 128, "len={len} 描述符 {} 字节 > 128：{d}", d.len());
+            assert!(
+                d.len() <= 128,
+                "len={len} 描述符 {} 字节 > 128：{d}",
+                d.len()
+            );
             assert!(d.contains("--body-out"), "取回指引保留：{d}");
             assert!(d.contains("sha256:"), "摘要前缀保留：{d}");
         }

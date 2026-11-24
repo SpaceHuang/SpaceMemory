@@ -32,8 +32,9 @@ pub fn run() {
     // sidecar 空闲自退（D2）：由核心循环内部判定。
     // B3 接线 + r4 B2：物化器返回索引代际（meta.epoch）——收敛原语把它写进检查点，
     // 读路径核对"检查点与索引同代"才采信快路径。
-    let maintainer = |store: &Store, permit: &mem_core::store::IndexMaintenancePermit<'_>|
-        -> mem_core::error::MemResult<mem_core::freshness::MaintainOutcome> {
+    let maintainer = |store: &Store,
+                      permit: &mem_core::store::IndexMaintenancePermit<'_>|
+     -> mem_core::error::MemResult<mem_core::freshness::MaintainOutcome> {
         let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
         let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
         idx.set_body_texts_under_maintenance(permit)?;

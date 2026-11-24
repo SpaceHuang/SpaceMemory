@@ -11,15 +11,27 @@ use std::path::PathBuf;
 const EXPECTED_MIN: usize = 16; // 7 类型 × 2 + CONVENTIONS.md + bootstrap/principal.payload.json
 
 fn repo_asset_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/builtin-types")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/builtin-types")
 }
 
 #[test]
 fn assets_are_nonempty_and_cover_all_builtin_types() {
     let list = mem_assets::assets();
-    assert!(list.len() >= EXPECTED_MIN, "assets() 登记数 = {}，应 ≥ {}", list.len(), EXPECTED_MIN);
-    for t in ["task", "memory", "project", "topic", "principal", "view", "edge"] {
+    assert!(
+        list.len() >= EXPECTED_MIN,
+        "assets() 登记数 = {}，应 ≥ {}",
+        list.len(),
+        EXPECTED_MIN
+    );
+    for t in [
+        "task",
+        "memory",
+        "project",
+        "topic",
+        "principal",
+        "view",
+        "edge",
+    ] {
         let schema = format!("types/{t}/schema.json");
         let conv = format!("types/{t}/conventions.md");
         assert!(list.iter().any(|(p, _)| *p == schema), "缺 {schema}");
@@ -35,8 +47,8 @@ fn assets_are_nonempty_and_cover_all_builtin_types() {
 fn embedded_bytes_equal_repo_files() {
     let dir = repo_asset_dir();
     for (path, bytes) in mem_assets::assets() {
-        let on_disk = std::fs::read(dir.join(path))
-            .unwrap_or_else(|e| panic!("仓库缺源文件 {path}: {e}"));
+        let on_disk =
+            std::fs::read(dir.join(path)).unwrap_or_else(|e| panic!("仓库缺源文件 {path}: {e}"));
         assert_eq!(*bytes, on_disk, "内嵌字节与仓库文件不一致：{path}");
     }
 }

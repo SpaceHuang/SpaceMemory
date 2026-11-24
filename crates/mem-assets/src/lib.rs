@@ -17,7 +17,14 @@
 
 macro_rules! asset {
     ($p:literal) => {
-        ($p, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/builtin-types/", $p)) as &'static [u8])
+        (
+            $p,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/builtin-types/",
+                $p
+            )) as &'static [u8],
+        )
     };
 }
 
@@ -43,7 +50,6 @@ pub fn assets() -> &'static [(&'static str, &'static [u8])] {
         asset!("bootstrap/principal.payload.json"),
     ]
 }
-
 
 /// 播种来源（packaging.md §2 清单：外部优先、嵌入兜底）。
 #[derive(Debug, PartialEq)]
@@ -84,11 +90,17 @@ pub fn resolve_seed_files(
     }
     for dir in candidates {
         if dir.is_dir() {
-            return SeedSource { files: walk_dir(&dir), origin: SeedOrigin::External(dir) };
+            return SeedSource {
+                files: walk_dir(&dir),
+                origin: SeedOrigin::External(dir),
+            };
         }
     }
     SeedSource {
-        files: assets().iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect(),
+        files: assets()
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_vec()))
+            .collect(),
         origin: SeedOrigin::Embedded,
     }
 }
@@ -99,7 +111,11 @@ fn walk_dir(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 let p = e.path();
-                let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                let r = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
                 if p.is_dir() {
                     walk(&p, &r, out);
                 } else if let Ok(b) = std::fs::read(&p) {
@@ -141,9 +157,16 @@ mod tests {
         // exe 旁目录名为固定 builtin-types——把 exe-side 改造到正确位置。
         std::fs::rename(&exe_side, exe_dir.join("builtin-types")).unwrap();
         let s = resolve_seed_files(Some(&tpl), Some(&exe_dir));
-        assert_eq!(s.origin, SeedOrigin::External(tpl.clone()), "模板覆盖必须最优先");
-        assert!(s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
-            && String::from_utf8_lossy(b).contains("tpl")), "字节必须来自模板目录（原样搬运）");
+        assert_eq!(
+            s.origin,
+            SeedOrigin::External(tpl.clone()),
+            "模板覆盖必须最优先"
+        );
+        assert!(
+            s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
+                && String::from_utf8_lossy(b).contains("tpl")),
+            "字节必须来自模板目录（原样搬运）"
+        );
     }
 
     #[test]
@@ -151,11 +174,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let exe_dir = tmp.path().join("bin");
         std::fs::create_dir_all(exe_dir.join("builtin-types/types/memory")).unwrap();
-        std::fs::write(exe_dir.join("builtin-types/types/memory/schema.json"), b"exe-side\n").unwrap();
+        std::fs::write(
+            exe_dir.join("builtin-types/types/memory/schema.json"),
+            b"exe-side\n",
+        )
+        .unwrap();
         let s = resolve_seed_files(None, Some(&exe_dir));
-        assert_eq!(s.origin, SeedOrigin::External(exe_dir.join("builtin-types")));
-        assert!(s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
-            && String::from_utf8_lossy(b).contains("exe-side")), "exe 旁外部目录优先于内嵌");
+        assert_eq!(
+            s.origin,
+            SeedOrigin::External(exe_dir.join("builtin-types"))
+        );
+        assert!(
+            s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
+                && String::from_utf8_lossy(b).contains("exe-side")),
+            "exe 旁外部目录优先于内嵌"
+        );
     }
 
     #[test]
@@ -167,10 +200,15 @@ mod tests {
         std::fs::create_dir_all(share.join("types/memory")).unwrap();
         std::fs::write(share.join("types/memory/schema.json"), b"brew\n").unwrap();
         let s = resolve_seed_files(None, Some(&exe_dir));
-        assert_eq!(s.origin, SeedOrigin::External(share),
-            "share 布局候选必须被覆盖（packaging.md §2 清单第 3 项）");
-        assert!(s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
-            && String::from_utf8_lossy(b).contains("brew")));
+        assert_eq!(
+            s.origin,
+            SeedOrigin::External(share),
+            "share 布局候选必须被覆盖（packaging.md §2 清单第 3 项）"
+        );
+        assert!(
+            s.files.iter().any(|(p, b)| p == "types/memory/schema.json"
+                && String::from_utf8_lossy(b).contains("brew"))
+        );
     }
 
     #[test]
@@ -179,9 +217,21 @@ mod tests {
         let exe_dir = tmp.path().join("empty-bin");
         std::fs::create_dir_all(&exe_dir).unwrap();
         let s = resolve_seed_files(Some(&tmp.path().join("missing")), Some(&exe_dir));
-        assert_eq!(s.origin, SeedOrigin::Embedded, "外部全缺 → 内嵌兜底（混合分发，开放问题40）");
-        assert_eq!(s.files.len(), 16, "内嵌两件套登记处逐条 include_bytes（7 类型×2 + conventions + bootstrap）");
+        assert_eq!(
+            s.origin,
+            SeedOrigin::Embedded,
+            "外部全缺 → 内嵌兜底（混合分发，开放问题40）"
+        );
+        assert_eq!(
+            s.files.len(),
+            16,
+            "内嵌两件套登记处逐条 include_bytes（7 类型×2 + conventions + bootstrap）"
+        );
         assert!(s.files.iter().any(|(p, _)| p == "types/task/schema.json"));
-        assert!(s.files.iter().any(|(p, _)| p == "bootstrap/principal.payload.json"));
+        assert!(
+            s.files
+                .iter()
+                .any(|(p, _)| p == "bootstrap/principal.payload.json")
+        );
     }
 }

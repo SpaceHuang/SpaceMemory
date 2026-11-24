@@ -52,8 +52,24 @@ impl GitProcess {
         Command::new("git")
             .arg("-C")
             .arg(&self.workdir)
-            .args(["-c", &format!("user.name={}", self.committer.split('<').next().unwrap_or("mem").trim())])
-            .args(["-c", &format!("user.email={}", self.committer.split('<').nth(1).map(|s| s.trim_end_matches('>')).unwrap_or("mem@local"))])
+            .args([
+                "-c",
+                &format!(
+                    "user.name={}",
+                    self.committer.split('<').next().unwrap_or("mem").trim()
+                ),
+            ])
+            .args([
+                "-c",
+                &format!(
+                    "user.email={}",
+                    self.committer
+                        .split('<')
+                        .nth(1)
+                        .map(|s| s.trim_end_matches('>'))
+                        .unwrap_or("mem@local")
+                ),
+            ])
             .args(args)
             .output()
     }
@@ -89,7 +105,9 @@ impl Git for GitProcess {
                     // 取 SHA。
                     if let Ok(sha_out) = self.git(&["rev-parse", "HEAD"]) {
                         if sha_out.status.success() {
-                            return Ok(Some(String::from_utf8_lossy(&sha_out.stdout).trim().to_string()));
+                            return Ok(Some(
+                                String::from_utf8_lossy(&sha_out.stdout).trim().to_string(),
+                            ));
                         }
                     }
                     return Ok(None);
@@ -133,7 +151,11 @@ impl Git for GitProcess {
 impl CommitSink for GitProcess {
     fn commit(&self, paths: &[String]) -> MemResult<Option<String>> {
         let wd = self.workdir.clone();
-        self.commit_paths(&wd, paths, "mem: 记录写入（含 events.jsonl 同批，D3/高优1）")
+        self.commit_paths(
+            &wd,
+            paths,
+            "mem: 记录写入（含 events.jsonl 同批，D3/高优1）",
+        )
     }
 }
 
@@ -170,7 +192,11 @@ impl GitProcess {
             .args(["show", &format!("HEAD:{rel}")])
             .output()
             .map_err(|e| MemError::Git(format!("git show 失败：{e}")))?;
-        Ok(if out.status.success() { Some(out.stdout) } else { None })
+        Ok(if out.status.success() {
+            Some(out.stdout)
+        } else {
+            None
+        })
     }
 }
 
@@ -184,11 +210,20 @@ impl mem_core::ops::BodyHistory for GitProcess {
     fn file_bytes_at(&self, rel: &str, rev: &str) -> MemResult<Option<Vec<u8>>> {
         require_git_dir(&self.workdir)?;
         let git = |args: &[&str]| -> std::io::Result<std::process::Output> {
-            Command::new("git").arg("-C").arg(&self.workdir).args(args).output()
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.workdir)
+                .args(args)
+                .output()
         };
         let spec = format!("{rev}:{rel}");
-        let rev_ok = git(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
-            .map_err(|e| MemError::Git(format!("git rev-parse 失败：{e}")))?;
+        let rev_ok = git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .map_err(|e| MemError::Git(format!("git rev-parse 失败：{e}")))?;
         if !rev_ok.status.success() {
             return Err(MemError::Git(format!(
                 "取历史版本失败（{spec}）：版本引用无效"
@@ -261,7 +296,16 @@ mod tests {
     }
 
     fn run(dir: &std::path::Path, args: &[&str]) {
-        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?} 失败：{}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

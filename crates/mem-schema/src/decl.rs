@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::Violation;
 use crate::error::LoadError;
 use crate::validate;
-use crate::Violation;
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 /// 派生 rel 缺省名（x-dag 检查的边；可被根级 `x-derived-rel` 覆盖）。
@@ -167,7 +167,13 @@ impl TypeDecl {
                         .get("existence")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    refs.insert(field.clone(), RefSpec { target_type: target, existence });
+                    refs.insert(
+                        field.clone(),
+                        RefSpec {
+                            target_type: target,
+                            existence,
+                        },
+                    );
                 }
             }
         }
@@ -263,7 +269,10 @@ impl TypeDecl {
                     }
                     _ => e.instance_path.to_string(),
                 };
-                Violation { path, message: e.to_string() }
+                Violation {
+                    path,
+                    message: e.to_string(),
+                }
             })
             .collect()
     }

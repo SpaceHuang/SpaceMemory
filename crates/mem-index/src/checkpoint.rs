@@ -17,8 +17,10 @@ pub fn refresh(store: &Store) -> MemResult<Checkpoint> {
         entries: freshness::stat_snapshot(store),
         index_epoch: 0, // 由收敛原语覆盖为真实代际；此路径仅为兼容保留
     };
-    freshness::save_checkpoint(store, &cp, &_permit)
-        .map_err(|e| MemError::Corrupt { path: "index/checkpoint.json".into(), reason: e.to_string() })?;
+    freshness::save_checkpoint(store, &cp, &_permit).map_err(|e| MemError::Corrupt {
+        path: "index/checkpoint.json".into(),
+        reason: e.to_string(),
+    })?;
     Ok(cp)
 }
 

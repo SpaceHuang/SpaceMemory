@@ -13,16 +13,20 @@
 
 use assert_cmd::Command;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn mem() -> Command {
     Command::cargo_bin("mem").expect("mem 二进制")
 }
 
 fn j(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("输出不是 JSON：{e}\n{}", String::from_utf8_lossy(&out.stdout)))
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "输出不是 JSON：{e}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }
 
 fn find_ascii(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -34,7 +38,7 @@ fn file_mtime_nanos(path: &std::path::Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GENERIC_READ};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileTime, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileTime, OPEN_EXISTING,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -71,8 +75,8 @@ fn set_mtime_nanos(path: &std::path::Path, ft100: u64) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, SetFileTime, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        SetFileTime,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -107,11 +111,21 @@ fn maintenance_race_second_write_not_confirmed_early() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("store");
     let s = dir.to_str().unwrap().to_string();
-    mem().args(["--store", &s, "init", &s, "--principal", "codex_main"]).output().unwrap();
+    mem()
+        .args(["--store", &s, "init", &s, "--principal", "codex_main"])
+        .output()
+        .unwrap();
     let out_t = mem()
-        .args(["--store", &s, "add", "memory",
-"--principal",
-"codex_main", "--payload", r#"{"title":"race-target"}"#])
+        .args([
+            "--store",
+            &s,
+            "add",
+            "memory",
+            "--principal",
+            "codex_main",
+            "--payload",
+            r#"{"title":"race-target"}"#,
+        ])
         .output()
         .unwrap();
     assert!(out_t.status.success());
@@ -134,12 +148,9 @@ fn maintenance_race_second_write_not_confirmed_early() {
     let (pause_tx, pause_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let (complete_tx, complete_rx) = std::sync::mpsc::channel();
-    let maintainer = move |
-        store: &mem_core::store::Store,
-        permit: &mem_core::store::IndexMaintenancePermit<'_>,
-    |
-        -> mem_core::error::MemResult<mem_core::freshness::MaintainOutcome>
-    {
+    let maintainer = move |store: &mem_core::store::Store,
+                           permit: &mem_core::store::IndexMaintenancePermit<'_>|
+          -> mem_core::error::MemResult<mem_core::freshness::MaintainOutcome> {
         let mut idx = mem_index::Index::open_store_under_maintenance(store, permit)?;
         let (_, _, scan_entries) = idx.rebuild_with_entries_under_maintenance(permit)?;
         idx.set_body_texts_under_maintenance(permit)?;
@@ -158,7 +169,11 @@ fn maintenance_race_second_write_not_confirmed_early() {
 
             // 发完成信号前先验证等长改写、正文摘要改变、路径与 mtime 恢复。
             let edited_bytes = std::fs::read(&target2).unwrap();
-            assert_eq!(edited_bytes.len(), original_size, "竞态改写必须保持文件尺寸");
+            assert_eq!(
+                edited_bytes.len(),
+                original_size,
+                "竞态改写必须保持文件尺寸"
+            );
             assert_ne!(
                 mem_core::token::sha256_hex(&edited_bytes),
                 original_digest,
@@ -203,13 +218,15 @@ fn maintenance_race_second_write_not_confirmed_early() {
     complete_rx
         .recv_timeout(std::time::Duration::from_secs(8))
         .expect("改写、摘要变化与 mtime 恢复复核后才发完成信号");
-    assert!(injected.load(Ordering::SeqCst), "完成信号必须对应已完成的改写");
+    assert!(
+        injected.load(Ordering::SeqCst),
+        "完成信号必须对应已完成的改写"
+    );
 
     let rewritten_record = mem_core::ops::get(&store, &target_id).unwrap();
     let rewritten_token = rewritten_record.token;
     assert_ne!(
-        rewritten_token.digest,
-        original_token.digest,
+        rewritten_token.digest, original_token.digest,
         "改写后的记录令牌摘要必须不同于改写前"
     );
     assert_eq!(rewritten_record.rel, target_rel, "改写不能改变记录路径");
@@ -244,7 +261,9 @@ fn maintenance_race_second_write_not_confirmed_early() {
         .unwrap();
     let v = j(&out);
     assert!(
-        v["read_mode"].as_object().is_some_and(|m| m.contains_key("direct")),
+        v["read_mode"]
+            .as_object()
+            .is_some_and(|m| m.contains_key("direct")),
         "RDC 不提供查询新鲜度证明，生产查询必须直读：{v}"
     );
     let hit_token = v["hits"][0]["token"].as_str().unwrap_or("").to_string();

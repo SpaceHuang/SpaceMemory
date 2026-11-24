@@ -36,7 +36,11 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     let to = std::ffi::CString::new(target.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target 路径含 NUL"))?;
     let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 impl std::fmt::Debug for LockFile {
@@ -47,7 +51,11 @@ impl std::fmt::Debug for LockFile {
 
 impl LockFile {
     fn open(path: &Path) -> io::Result<File> {
-        OpenOptions::new().read(true).write(true).create(true).open(path)
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
     }
 
     fn open_existing(path: &Path) -> io::Result<File> {
@@ -55,8 +63,14 @@ impl LockFile {
     }
 
     fn lock(file: &File, exclusive: bool, blocking: bool) -> io::Result<()> {
-        let mut op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
-        if !blocking { op |= libc::LOCK_NB; }
+        let mut op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        if !blocking {
+            op |= libc::LOCK_NB;
+        }
         let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
         if rc == -1 {
             Err(io::Error::last_os_error())
@@ -66,7 +80,9 @@ impl LockFile {
     }
 
     fn unlock(file: &File) {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN); }
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 
     pub fn acquire_exclusive(path: &Path) -> io::Result<LockFile> {
@@ -124,9 +140,9 @@ pub fn process_alive(pid: u32) -> bool {
 
 /// temp + 原子改名落盘（rename(2) 原子替换）。
 pub fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = target.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录")
-    })?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录"))?;
     let name = target
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -163,9 +179,9 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
 pub fn create_new(target: &Path, bytes: &[u8]) -> io::Result<()> {
     // r4 B5：崩溃原子 + 唯一性——temp 写完 sync 后用 link(2) 原子发布（目标已存在
     // → EEXIST 且目标不动），再 unlink temp。macOS rename(2) 是覆盖语义，不可用。
-    let dir = target.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录")
-    })?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target 无父目录"))?;
     let name = target
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
