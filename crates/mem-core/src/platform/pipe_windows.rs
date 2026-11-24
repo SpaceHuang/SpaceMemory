@@ -24,6 +24,8 @@ const ERROR_PIPE_LISTENING: u32 = 536;
 const CONNECT_POLL_MS: u32 = 100;
 /// 握手读/写的重叠等待上限（客户端异常时防服务卡死；超时即断开重建）。
 const IO_TIMEOUT_MS: u32 = 2000;
+/// 放弃挂起 I/O 后的完成事件等待上限（有界排干；异常等待源不再无限阻塞）。
+const IO_DRAIN_TIMEOUT_MS: u32 = 5000;
 
 fn to_wide(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
@@ -167,14 +169,18 @@ impl PipeServer {
         self.recreate()
     }
 
-    /// 放弃一次挂起的重叠 I/O：只取消**该次**操作并阻塞收割完成，此时缓冲区
-    /// 与 OVERLAPPED 仍在本调用栈上存活——之后才允许 recreate 关闭句柄。
-    /// 与 RDC 的 `cancel_and_drain_rdc` 同一纪律（Cancel 只发请求，完成必须收割）。
+    /// 放弃一次挂起的重叠 I/O：先取消**该次**操作，再**有界**等待其完成事件
+    /// 并读取一次结果——此时缓冲区与 OVERLAPPED 仍在本调用栈上存活，之后才
+    /// 允许 recreate 关闭句柄。与 RDC 的 `cancel_and_drain_rdc` 同一纪律
+    /// （Cancel 只发请求，完成必须收割），但不采用 `GetOverlappedResult`
+    /// 的无限阻塞形态：等待源异常时它曾把 CI runner 的测试进程挂死
+    /// （run 45310735000 卡 2 小时）；超时后句柄关闭会兜底取消残余 I/O。
     fn abandon_io(&mut self, ov: &mut OVERLAPPED) {
         unsafe {
             CancelIoEx(self.handle, ov);
+            WaitForSingleObject(ov.hEvent, IO_DRAIN_TIMEOUT_MS);
             let mut ignored = 0u32;
-            let _ = GetOverlappedResult(self.handle, ov, &mut ignored, 1);
+            let _ = GetOverlappedResult(self.handle, ov, &mut ignored, 0);
         }
     }
 
@@ -209,10 +215,12 @@ impl Drop for PipeServer {
     fn drop(&mut self) {
         unsafe {
             if self.pending_connect {
-                // 连接仍挂起：取消并阻塞收割完成后才关句柄（OVERLAPPED 在 Box 上）。
+                // 连接仍挂起：取消并**有界**等待完成后才关句柄（OVERLAPPED 在
+                // Box 上，地址稳定）；无限阻塞形态曾挂死 runner 测试进程。
                 CancelIoEx(self.handle, self.connect_ov.as_ref());
+                WaitForSingleObject(self.connect_ov.hEvent, IO_DRAIN_TIMEOUT_MS);
                 let mut ignored = 0u32;
-                let _ = GetOverlappedResult(self.handle, self.connect_ov.as_mut(), &mut ignored, 1);
+                let _ = GetOverlappedResult(self.handle, self.connect_ov.as_mut(), &mut ignored, 0);
             }
             DisconnectNamedPipe(self.handle);
             CloseHandle(self.handle);
