@@ -4,21 +4,25 @@
 //! `try_serve_one` 非阻塞尝试：无客户端连接 → false；有 → 读请求、写应答、断开、
 //! 重建监听实例。客户端见 `pipe_client_exchange`。
 //!
-//! ## 重叠 I/O 所有权纪律（评审 B1）
+//! ## 重叠 I/O 所有权与收割纪律（评审 B1，两轮收敛）
 //!
 //! 带 `FILE_FLAG_OVERLAPPED` 的操作在完成（含取消完成）之前，内核随时可能写其
 //! `OVERLAPPED` 与数据缓冲区。因此：
 //!
-//! 1. 所有 OVERLAPPED 与读写缓冲都由句柄**持有**（Box 固定地址），绝不以栈局部
-//!    承载挂起操作——栈帧可能先于完成消失（曾致 0xC0000005，CI runner 实测）；
-//! 2. 放弃（超时）一个挂起操作时：取消 + 有界排干；若确认完成 → 槽位可复用；
-//!    若仍 `ERROR_IO_INCOMPLETE` → **整个槽位泄漏给进程生命周期**（迟到完成写入
-//!    的仍是有效内存），换新槽继续——泄漏是唯一既不用后释放也不无限阻塞的终点；
-//! 3. 复用槽位前必须先收割上一次放弃的 I/O（正常路径是无等待的 no-op）。
+//! 1. 所有 OVERLAPPED 与读写缓冲由句柄**持有**（Box/字段固定地址），绝不以栈
+//!    局部承载挂起操作——栈帧可能先于完成消失（曾致 0xC0000005，CI 实测）；
+//! 2. 放弃（超时 / 完成投递异常）一个操作时：对**原句柄**取消 + 有界排干。
+//!    确认到达终态（成功/失败/取消）→ 槽位可复用并重建实例；仍
+//!    `ERROR_IO_INCOMPLETE` → **暂停服务**（保留原句柄与槽位，下一轮入口再
+//!    排干）——绝不复用未确认的槽位发起新 I/O，绝不用新句柄收割旧 I/O，
+//!    绝不把非终态错误当作完成证明；
+//! 3. 仅 Drop（进程即将释放一切）遇到仍未投递的取消完成时，才把整槽连同
+//!    句柄一起泄漏给进程生命周期——迟到完成写入的仍是有效内存。泄漏是唯一
+//!    既不用后释放也不无限阻塞的终点。
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_PIPE_CONNECTED, GetLastError,
-    HANDLE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -35,7 +39,7 @@ const PIPE_UNLIMITED_INSTANCES: u32 = 255;
 const ERROR_IO_PENDING: u32 = 997;
 const ERROR_PIPE_LISTENING: u32 = 536;
 const CONNECT_POLL_MS: u32 = 100;
-/// 握手读/写的重叠等待上限（客户端异常时防服务卡死；超时即放弃并重建）。
+/// 握手读/写的重叠等待上限（客户端异常时防服务卡死；超时即放弃）。
 const IO_TIMEOUT_MS: u32 = 2000;
 /// 放弃挂起 I/O 后的完成事件等待上限（有界排干；异常等待源不再无限阻塞）。
 const IO_DRAIN_TIMEOUT_MS: u32 = 5000;
@@ -50,6 +54,10 @@ fn last_err() -> u32 {
     unsafe { GetLastError() }
 }
 
+/// Drop 时因取消完成仍未投递而泄漏的槽计数（防御路径，正常恒 0；测试断言用）。
+static DROPPED_LEAKED_SLOTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 服务端单实例管道。
 pub struct PipeServer {
     handle: HANDLE,
@@ -62,15 +70,17 @@ pub struct PipeServer {
     /// CI runner 实测崩溃）。
     connect_ov: Box<OVERLAPPED>,
     /// 读/写共享的 I/O 槽（操作串行）：OVERLAPPED、读缓冲、写应答缓冲全部由
-    /// 句柄持有。放弃后未确认完成的操作仍被内核引用——槽位所有权持续有效，
-    /// 复用前经 `quiesce_io_slot` 收割，仍 INCOMPLETE 则整槽泄漏换新。
+    /// 句柄持有。放弃后未确认完成的操作仍被内核引用——槽位与句柄保持存活，
+    /// 服务暂停至下一轮入口排干确认。
     io_ov: Box<OVERLAPPED>,
     io_buf: Box<[u8; 256]>,
     io_reply: Vec<u8>,
-    /// 读/写槽存在放弃后未确认完成的 I/O（下一次进入前必须收割）。
+    /// 读/写槽存在放弃后未确认完成的 I/O（服务暂停，入口排干后才可复用）。
     io_outstanding: bool,
-    /// 因放弃未完成而整槽泄漏的次数（防御路径，正常恒 0；测试断言用）。
-    abandoned_leaked: usize,
+    /// 仅测试注入（debug 构建）：强制本实例的读收割走 INCOMPLETE 分支，
+    /// 验证该分支绝不复用槽位写应答。按实例注入——并行测试互不串扰。
+    #[cfg(debug_assertions)]
+    force_read_reap_incomplete: bool,
 }
 
 /// 打开命名管道服务端实例与其完成事件（不含首次 ConnectNamedPipe）。
@@ -116,7 +126,8 @@ impl PipeServer {
             io_buf: Box::new([0u8; 256]),
             io_reply: Vec::new(),
             io_outstanding: false,
-            abandoned_leaked: 0,
+            #[cfg(debug_assertions)]
+            force_read_reap_incomplete: false,
         };
         if !server.submit_connect() {
             return Err(std::io::Error::last_os_error().into());
@@ -149,6 +160,19 @@ impl PipeServer {
     /// CreateNamedPipeW 之后才 Drop，重建必败 → 服务端永久失聪。
     /// 读/写全部走重叠 I/O（句柄带 FILE_FLAG_OVERLAPPED，空 OVERLAPPED 未定义）。
     pub fn try_serve_one(&mut self, make_reply: impl FnOnce() -> Vec<u8>) -> bool {
+        // 入口收割：上一放弃的 I/O 未确认完成时，对**同一仍存活句柄**做一次
+        // 有界排干；确认完成 → 重建实例继续服务；仍 INCOMPLETE → 本轮暂停
+        //（所有等待有界，调用方按节奏重试；句柄与槽位保持存活——绝不重建、
+        // 绝不换槽，杜绝新旧句柄错配与未确认复用）。
+        if self.io_outstanding {
+            if !Self::drain_slot_bounded(self.handle, self.io_ov.as_mut()) {
+                return false;
+            }
+            self.io_outstanding = false;
+            if !self.recreate() {
+                return false;
+            }
+        }
         unsafe {
             if self.pending_connect {
                 // 等待连接完成（短轮询）。
@@ -170,8 +194,6 @@ impl PipeServer {
                 }
                 self.pending_connect = false;
             }
-            // 复用读/写槽前收割上次放弃的 I/O（正常路径为 no-op）。
-            self.quiesce_io_slot();
             // 读请求（重叠 I/O，缓冲由句柄持有）。
             ResetEvent(self.event);
             self.io_ov.hEvent = self.event;
@@ -186,17 +208,29 @@ impl PipeServer {
                 return self.recreate();
             }
             if WaitForSingleObject(self.event, IO_TIMEOUT_MS) != WAIT_OBJECT_0 {
-                self.abandon_io();
+                if !self.abandon_io() {
+                    return false;
+                }
                 return self.recreate();
             }
             let mut got = 0u32;
-            let okr = GetOverlappedResult(self.handle, self.io_ov.as_mut(), &mut got, 0);
-            if okr == 0 && last_err() == ERROR_IO_INCOMPLETE {
-                // 事件已置位但结果读取仍报未完成（防御分支）：标记槽位未确认，
-                // 交由 recreate 后的下一次进入收割。
-                self.io_outstanding = true;
+            let mut okr = GetOverlappedResult(self.handle, self.io_ov.as_mut(), &mut got, 0);
+            let mut reap_err = last_err();
+            #[cfg(debug_assertions)]
+            if self.force_read_reap_incomplete {
+                // 测试注入：把收割结果伪装成未完成（评审 B1-1 回归入口）。
+                okr = 0;
+                reap_err = ERROR_IO_INCOMPLETE;
             }
-            if okr == 0 && last_err() != ERROR_BROKEN_PIPE && last_err() != ERROR_IO_INCOMPLETE {
+            if okr == 0 && reap_err == ERROR_IO_INCOMPLETE {
+                // 完成投递异常：请求是否读出不可确认——**绝不复用该槽位写应答**
+                //（评审 B1-1）。放弃并按放弃纪律处理；放弃在原句柄上执行。
+                if !self.abandon_io() {
+                    return false;
+                }
+                return self.recreate();
+            }
+            if okr == 0 && reap_err != ERROR_BROKEN_PIPE {
                 return self.recreate();
             }
             // 只在请求已读完后构造应答，避免使用接受连接前的旧新鲜度快照。
@@ -214,7 +248,9 @@ impl PipeServer {
             );
             if okw == 0 && last_err() == ERROR_IO_PENDING {
                 if WaitForSingleObject(self.event, IO_TIMEOUT_MS) != WAIT_OBJECT_0 {
-                    self.abandon_io();
+                    if !self.abandon_io() {
+                        return false;
+                    }
                     return self.recreate();
                 }
             }
@@ -223,53 +259,25 @@ impl PipeServer {
         self.recreate()
     }
 
-    /// 放弃一次挂起的读/写：取消该操作并**有界**等待完成投递。
-    ///
-    /// 完成已确认 → 槽位可直接复用；仍 `ERROR_IO_INCOMPLETE`（取消完成投递在
-    /// 极端调度下可迟于有界等待——run 45310735000 的无界排干即因此被弃用）→
-    /// 置 `io_outstanding`：槽位所有权由句柄**继续持有**（Box 地址稳定，迟到
-    /// 完成写入的仍是有效内存），下一次进入前经 `quiesce_io_slot` 收割或泄漏。
-    /// 无限阻塞排干与「超时即释放栈上结构」都曾被否决：前者挂死（2 小时），
-    /// 后者用后释放（0xC0000005）。
-    fn abandon_io(&mut self) {
-        unsafe {
-            CancelIoEx(self.handle, self.io_ov.as_ref());
-            WaitForSingleObject(self.io_ov.hEvent, IO_DRAIN_TIMEOUT_MS);
-            let mut ignored = 0u32;
-            let ok = GetOverlappedResult(self.handle, self.io_ov.as_mut(), &mut ignored, 0);
-            if ok == 0 && last_err() == ERROR_IO_INCOMPLETE {
-                self.io_outstanding = true;
-            }
+    /// 放弃一次挂起的读/写：在**原句柄**上取消该操作并**有界**等待完成投递。
+    /// 返回 true = 已确认到达终态（成功/失败/取消都是终态），槽位可复用、
+    /// 句柄可关闭；返回 false = 仍 `ERROR_IO_INCOMPLETE` → 置未确认标记，
+    /// 服务暂停（句柄与槽位保持存活，下一轮入口排干）。此时**不得**关闭句柄、
+    /// 不得复用槽位——取消完成投递在极端调度下可迟于有界等待（run
+    /// 45310735000 的无界排干即因此被弃用），而无限阻塞与「超时即释放」都
+    /// 曾被否决：前者挂死（2 小时），后者用后释放（0xC0000005）。
+    fn abandon_io(&mut self) -> bool {
+        let confirmed = Self::drain_slot_bounded(self.handle, self.io_ov.as_mut());
+        if !confirmed {
+            self.io_outstanding = true;
         }
-    }
-
-    /// 复用读/写槽前的收割：对放弃后未确认完成的 I/O 再做一次有界排干。
-    /// 仍 INCOMPLETE → 整槽泄漏给进程生命周期（迟到完成写入的仍是有效内存），
-    /// 换新槽继续——泄漏只发生在取消完成投递异常迟延的防御路径，正常恒 0。
-    fn quiesce_io_slot(&mut self) {
-        if !self.io_outstanding {
-            return;
-        }
-        if Self::drain_slot_bounded(self.handle, self.io_ov.as_mut()) {
-            self.io_outstanding = false;
-            return;
-        }
-        let io_ov = unsafe { std::ptr::read(&self.io_ov) };
-        std::mem::forget(io_ov);
-        let io_buf = unsafe { std::ptr::read(&self.io_buf) };
-        std::mem::forget(io_buf);
-        let io_reply = unsafe { std::ptr::read(&self.io_reply) };
-        std::mem::forget(io_reply);
-        self.io_ov = Box::new(unsafe { std::mem::zeroed() });
-        self.io_buf = Box::new([0u8; 256]);
-        self.io_reply = Vec::new();
-        self.io_outstanding = false;
-        self.abandoned_leaked += 1;
+        confirmed
     }
 
     /// 对一个可能挂起的操作执行有界排干：取消 + 等待完成事件（至多
-    /// `IO_DRAIN_TIMEOUT_MS`）+ 非阻塞读取结果。返回 true = 已确认完成
-    ///（成功/失败/取消都是终态）；false = 仍 `ERROR_IO_INCOMPLETE`。
+    /// `IO_DRAIN_TIMEOUT_MS`）+ 非阻塞读取结果。返回 true 仅当确认到达终态：
+    /// 成功，或取消完成（`ERROR_OPERATION_ABORTED`）；`ERROR_IO_INCOMPLETE`
+    /// 与其余错误一律按未完成处理——不把任何非终态错误当作完成证明。
     /// 自由函数：调用点（含 Drop）同时借用句柄字段与槽位，避免 &mut self 冲突。
     fn drain_slot_bounded(handle: HANDLE, ov: &mut OVERLAPPED) -> bool {
         unsafe {
@@ -277,13 +285,13 @@ impl PipeServer {
             WaitForSingleObject(ov.hEvent, IO_DRAIN_TIMEOUT_MS);
             let mut ignored = 0u32;
             let ok = GetOverlappedResult(handle, ov, &mut ignored, 0);
-            !(ok == 0 && last_err() == ERROR_IO_INCOMPLETE)
+            ok != 0 || last_err() == ERROR_OPERATION_ABORTED
         }
     }
 
     /// 关闭当前实例并重建监听（旧实例先行关闭——见函数级注释）。
-    /// 读/写槽的所有权跨实例持续（挂起 I/O 的缓冲不因重建而释放）；
-    /// 重建失败时句柄置空，Drop 的关闭按有效性跳过。
+    /// 调用前提：无未确认完成的挂起 I/O（放弃未确认时服务已暂停，入口排干
+    /// 确认后才可到达此处）。
     fn recreate(&mut self) -> bool {
         unsafe {
             CloseHandle(self.handle);
@@ -309,9 +317,10 @@ impl PipeServer {
 
 impl Drop for PipeServer {
     fn drop(&mut self) {
+        let mut leaked_slot = false;
         unsafe {
             if self.pending_connect && is_valid_handle(self.handle) {
-                // 连接仍挂起：取消并**有界**等待完成投递；仍 INCOMPLETE →
+                // 连接仍挂起：取消并**有界**等待完成投递；未到达终态 →
                 // 连接槽泄漏给进程生命周期（迟到完成写入的仍是有效内存），
                 // 严禁在完成前释放。
                 CancelIoEx(self.handle, self.connect_ov.as_ref());
@@ -319,9 +328,10 @@ impl Drop for PipeServer {
                 let mut ignored = 0u32;
                 let ok =
                     GetOverlappedResult(self.handle, self.connect_ov.as_mut(), &mut ignored, 0);
-                if ok == 0 && last_err() == ERROR_IO_INCOMPLETE {
+                if !(ok != 0 || last_err() == ERROR_OPERATION_ABORTED) {
                     let connect_ov = std::ptr::read(&self.connect_ov);
                     std::mem::forget(connect_ov);
+                    leaked_slot = true;
                 }
             }
             if self.io_outstanding && is_valid_handle(self.handle) {
@@ -332,14 +342,20 @@ impl Drop for PipeServer {
                     std::mem::forget(io_buf);
                     let io_reply = std::ptr::read(&self.io_reply);
                     std::mem::forget(io_reply);
+                    leaked_slot = true;
                 }
             }
-            if is_valid_handle(self.handle) {
-                DisconnectNamedPipe(self.handle);
-                CloseHandle(self.handle);
-            }
-            if is_valid_handle(self.event) {
-                CloseHandle(self.event);
+            if leaked_slot {
+                // 句柄也随槽泄漏：关闭句柄会在完成投递前撤销内核仍引用的对象。
+                DROPPED_LEAKED_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                if is_valid_handle(self.handle) {
+                    DisconnectNamedPipe(self.handle);
+                    CloseHandle(self.handle);
+                }
+                if is_valid_handle(self.event) {
+                    CloseHandle(self.event);
+                }
             }
         }
     }
@@ -393,6 +409,7 @@ pub fn pipe_client_exchange(name: &str, request: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod pipe_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn unique_pipe_name() -> String {
         format!(
@@ -405,17 +422,37 @@ mod pipe_tests {
         )
     }
 
-    /// 驱动服务端直到服务到一次连接或超时。
-    fn serve_until(server: &mut PipeServer, reply: &[u8], secs: u64) -> bool {
+    /// 边驱动服务端边等客户端完成交换。try_serve_one 的 true 也可能是
+    /// 「放弃后重建」而非已服务——必须以客户端实际拿到应答为准。客户端经
+    /// channel 回传：即使其内部阻塞，本函数也在时限内返回可见结果，测试
+    /// 不被无超时的客户端读挂死。返回客户端收到的应答（None = 未得到）。
+    fn drive_exchange(
+        server: &mut PipeServer,
+        name: &str,
+        req: &[u8],
+        reply: &[u8],
+        secs: u64,
+    ) -> Option<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let name = name.to_string();
+            let req = req.to_vec();
+            move || {
+                let got = exchange_with_retry(&name, &req);
+                let _ = tx.send(got);
+            }
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-        loop {
-            if server.try_serve_one(|| reply.to_vec()) {
-                return true;
+        let mut got = None;
+        while std::time::Instant::now() < deadline {
+            server.try_serve_one(|| reply.to_vec());
+            if let Ok(v) = rx.try_recv() {
+                got = v;
+                break;
             }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        got
     }
 
     /// 客户端带重试：recreate 窗口（旧实例已断开、新实例未建）内连接会失败，
@@ -436,21 +473,16 @@ mod pipe_tests {
         let name = unique_pipe_name();
         let mut server = PipeServer::create(&name).unwrap();
         for _ in 0..5 {
-            let client = std::thread::spawn({
-                let name = name.clone();
-                move || exchange_with_retry(&name, b"ping")
-            });
-            assert!(serve_until(&mut server, b"pong", 5), "服务端应答超时");
-            assert_eq!(client.join().unwrap().as_deref(), Some(&b"pong"[..]));
+            let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+            assert_eq!(got.as_deref(), Some(&b"pong"[..]), "服务端应答超时");
         }
-        assert_eq!(server.abandoned_leaked, 0, "正常路径不得触发泄漏");
+        assert!(!server.io_outstanding, "正常路径不得留下未确认槽位");
     }
 
     #[test]
     fn pipe_server_recovers_when_client_connects_but_never_sends_request() {
-        // 客户端连接后保持沉默：读等待超时 → 放弃该次 I/O（取消 + 有界排干）
-        // 并重建实例；重建后的新客户端必须照常服务，且取消完成在排干窗口内
-        // 到达时不产生泄漏。
+        // 客户端连接后保持沉默：读等待超时 → 放弃该次 I/O（取消 + 有界排干，
+        // 取消完成按时投递 → 确认终态）→ 重建实例；重建后的新客户端必须照常服务。
         let name = unique_pipe_name();
         let mut server = PipeServer::create(&name).unwrap();
         let silent = std::thread::spawn({
@@ -473,35 +505,27 @@ mod pipe_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         silent.join().unwrap();
-        let client = std::thread::spawn({
-            let name = name.clone();
-            move || exchange_with_retry(&name, b"ping")
-        });
-        assert!(
-            serve_until(&mut server, b"pong", 5),
-            "重建后新客户端应被服务"
-        );
-        assert_eq!(client.join().unwrap().as_deref(), Some(&b"pong"[..]));
-        assert_eq!(server.abandoned_leaked, 0, "取消完成按时投递时不得泄漏");
+        let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+        assert_eq!(got.as_deref(), Some(&b"pong"[..]), "重建后新客户端应被服务");
+        assert!(!server.io_outstanding, "取消完成按时投递时不进入暂停态");
     }
 
     #[test]
     fn pipe_server_abandoned_write_keeps_reply_alive_and_recovers() {
         // 写侧放弃窗口：客户端发请求后长时间不读，应答超过管道缓冲（4096）
         // 使 WriteFile 挂起至超时被放弃。应答缓冲由句柄持有（内核仍可能读取
-        // 它），槽位标记未确认完成；后续收割/复用不得崩溃，新客户端照常服务。
+        // 它）；放弃在原句柄上确认终态后重建，新客户端照常服务。
         let name = unique_pipe_name();
         let mut server = PipeServer::create(&name).unwrap();
         let quiet_reader = std::thread::spawn({
             let name = name.clone();
             move || {
-                let c = std::fs::OpenOptions::new()
+                let mut c = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&name)
                     .expect("不读应答的客户端连接");
                 use std::io::Write;
-                let mut c = c;
                 c.write_all(b"ping").unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(4500));
             }
@@ -515,24 +539,19 @@ mod pipe_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         quiet_reader.join().unwrap();
-        let client = std::thread::spawn({
-            let name = name.clone();
-            move || exchange_with_retry(&name, b"ping")
-        });
-        assert!(
-            serve_until(&mut server, b"pong", 5),
+        let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+        assert_eq!(
+            got.as_deref(),
+            Some(&b"pong"[..]),
             "写放弃重建后新客户端应被服务"
         );
-        assert_eq!(client.join().unwrap().as_deref(), Some(&b"pong"[..]));
-        assert_eq!(server.abandoned_leaked, 0, "取消完成按时投递时不得泄漏");
     }
 
     #[test]
-    fn quiesce_leaks_slot_when_abandoned_io_still_incomplete() {
-        // 故障注入（B1）：排干后仍 ERROR_IO_INCOMPLETE 的防御分支——整槽泄漏
-        // 给进程生命周期并换新槽，服务继续可用；绝不提前释放挂起 I/O 的存储。
-        // 取消完成投递不会确定性迟到，故以私有状态构造该分支的入口条件：
-        // OVERLAPPED.Internal = STATUS_PENDING 即内核视角「仍未完成」。
+    fn unconfirmed_io_pauses_service_on_same_handle_until_confirmed() {
+        // 故障注入（B1-2）：排干后仍 ERROR_IO_INCOMPLETE——服务在**同一句柄**上
+        // 暂停（句柄与槽位保持存活），绝不重建换句柄、绝不复用槽位；人工确认
+        // 完成后下一轮入口排干通过，服务恢复且全程零泄漏。
         const STATUS_PENDING: usize = 0x103;
         let name = unique_pipe_name();
         let mut server = PipeServer::create(&name).unwrap();
@@ -543,23 +562,50 @@ mod pipe_tests {
             // 源正是该防御分支针对的异常场景），排干走非阻塞读取。
             server.io_ov.Internal = STATUS_PENDING;
         }
-        server.quiesce_io_slot();
-        assert_eq!(server.abandoned_leaked, 1, "未确认完成的槽位必须泄漏换新");
-        assert!(!server.io_outstanding, "泄漏后槽位标记复位");
-        // 换新后的槽位照常服务完整一轮。
-        let client = std::thread::spawn({
-            let name = name.clone();
-            move || exchange_with_retry(&name, b"ping")
-        });
-        assert!(serve_until(&mut server, b"pong", 5));
-        assert_eq!(client.join().unwrap().as_deref(), Some(&b"pong"[..]));
-        assert_eq!(server.abandoned_leaked, 1);
+        let handle_before = server.handle;
+        assert!(
+            !server.try_serve_one(|| b"pong".to_vec()),
+            "未确认完成时本轮必须暂停服务"
+        );
+        assert_eq!(server.handle, handle_before, "暂停期间句柄不得更换");
+        assert!(server.io_outstanding, "暂停态保持未确认标记");
+        // 人工确认完成（终态）：下一轮入口排干通过 → 重建 → 服务恢复。
+        unsafe {
+            *server.io_ov = std::mem::zeroed();
+        }
+        let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+        assert_eq!(got.as_deref(), Some(&b"pong"[..]), "确认后服务必须恢复");
+        assert!(!server.io_outstanding);
+    }
+
+    #[test]
+    fn read_reap_incomplete_never_reuses_slot_for_reply() {
+        // 故障注入（B1-1）：读收割返回 ERROR_IO_INCOMPLETE——请求是否读出不可
+        // 确认，服务必须放弃本轮（不写应答、不复用槽位），按放弃纪律处理后
+        // 重建；新客户端在新实例上照常得到应答。
+        let name = unique_pipe_name();
+        let mut server = PipeServer::create(&name).unwrap();
+        #[cfg(debug_assertions)]
+        {
+            server.force_read_reap_incomplete = true;
+        }
+        let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+        // 本轮实例被放弃：客户端在该实例上收不到应答（None）。
+        assert_eq!(got, None, "INCOMPLETE 轮不得有应答写出");
+        #[cfg(debug_assertions)]
+        {
+            server.force_read_reap_incomplete = false;
+        }
+        // 新实例：完整应答恢复。
+        let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
+        assert_eq!(got.as_deref(), Some(&b"pong"[..]), "重建后新客户端应被服务");
+        assert!(!server.io_outstanding, "真实已完成的读经排干应确认为终态");
     }
 
     #[test]
     fn dropping_server_with_pending_connect_reaps_before_close() {
         // 连接仍挂起时 Drop：取消并收割完成后才关句柄（OVERLAPPED 在 Box 上，
-        // 地址稳定）；仍 INCOMPLETE 时整槽泄漏。不挂不崩即通过。
+        // 地址稳定）；仍 INCOMPLETE 时整槽连同句柄泄漏。不挂不崩即通过。
         let name = unique_pipe_name();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -569,5 +615,26 @@ mod pipe_tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("挂起连接下的 Drop 应取消收割后及时返回");
+    }
+
+    #[test]
+    fn drop_leaks_slot_when_completion_still_pending() {
+        // 故障注入（B1 终点）：Drop 时取消完成仍未投递——整槽连同句柄泄漏给
+        // 进程生命周期（迟到完成写入的仍是有效内存），并以进程级计数登记。
+        const STATUS_PENDING: usize = 0x103;
+        let before = DROPPED_LEAKED_SLOTS.load(Ordering::Relaxed);
+        let name = unique_pipe_name();
+        let mut server = PipeServer::create(&name).unwrap();
+        server.io_outstanding = true;
+        unsafe {
+            *server.io_ov = std::mem::zeroed();
+            server.io_ov.Internal = STATUS_PENDING;
+        }
+        drop(server);
+        assert_eq!(
+            DROPPED_LEAKED_SLOTS.load(Ordering::Relaxed),
+            before + 1,
+            "未确认完成的槽在 Drop 必须泄漏而非释放"
+        );
     }
 }
