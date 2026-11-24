@@ -82,4 +82,4 @@ CLI `brief` 也存在对应的实际竞态：`open_proved` 和 `scan_ledgers` �
 - `cargo check --workspace --all-targets`：通过。
 - `cargo test --workspace`：全量通过（Windows 开发机，含新增 3 项回归与既有全部测试面）。
 - 触及文件 `rustfmt` 与 `git diff --check`：通过。
-- CI 双平台复验：随本次推送执行，结果登记于嵌入式契约设计文档日志。
+- CI 双平台复验：run 45420241205 全绿（windows-latest 4m56s / macos-latest 2m51s）。首跑（run 45413814333）Windows job 在 30 分钟上限被终止——取证显示 lib 测试二进制 54/56 项已正常打印完成，未完成两项的代码路径全部等待 ≤5 秒有界；与 run 3 同签名、中间隔同代码全绿（run 5），判读为 runner agent 偶发僵死而非产品代码问题（详见嵌入式契约设计文档日志）。
