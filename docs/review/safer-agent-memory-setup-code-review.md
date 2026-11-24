@@ -5,6 +5,7 @@
 - 差异基线：`origin/main` `a82ab5ffb37e8eb3adc93fc7720901ae8db59e12`（24 个提交）
 - 重点范围：嵌入式下游兼容契约、写许可与事件恢复、索引物化及证明、Windows RDC/命名管道、CLI/MCP 读取路径
 - 结论：**存在 2 项阻断，不建议按当前状态合并或发布。**
+- 最新重审：HEAD `b16214d` 的 B1 仍未关闭，B2 仅部分修复；**仍有阻断，不建议按当前状态合并或发布。**详见文末重审记录。
 
 ## B1 · 排干超时后仍释放挂起 I/O 的缓冲区，重新引入访问违例风险
 
@@ -83,3 +84,85 @@ CLI `brief` 也存在对应的实际竞态：`open_proved` 和 `scan_ledgers` �
 - `cargo test --workspace`：全量通过（Windows 开发机，含新增 3 项回归与既有全部测试面）。
 - 触及文件 `rustfmt` 与 `git diff --check`：通过。
 - CI 双平台复验：run 45420241205 全绿（windows-latest 4m56s / macos-latest 2m51s）。首跑（run 45413814333）Windows job 在 30 分钟上限被终止——取证显示 lib 测试二进制 54/56 项已正常打印完成，未完成两项的代码路径全部等待 ≤5 秒有界；与 run 3 同签名、中间隔同代码全绿（run 5），判读为 runner agent 偶发僵死而非产品代码问题（详见嵌入式契约设计文档日志）。
+
+---
+
+# 重审记录（2026-11-24）
+
+- 评审对象：HEAD `b16214d`，重点复核修复提交 `971b6e2`（B1）与 `f0a04b2`（B2）。
+- 结论：**B1 未关闭；B2 的三类直接索引查询已修复，但 `find` 的只读兼容降级仍有缺口。两项仍按阻断处理。**
+- 本节只评价修复后的代码；首轮结论与修复提交的自述保留原文，不以修复记录代替复核结论。
+
+## B1 仍未关闭：两条路径都能在旧 I/O 未完成时复用槽位
+
+### 1. 读取返回 `ERROR_IO_INCOMPLETE` 后仍立即复用同一 OVERLAPPED 写应答
+
+位置：`crates/mem-core/src/platform/pipe_windows.rs:193-218`。
+
+`GetOverlappedResult` 对读请求返回 `ERROR_IO_INCOMPLETE` 时，代码只设置 `io_outstanding = true`，没有返回、重建或更换槽位。控制流随后执行 `make_reply()`，并把同一个 `io_ov` 交给 `WriteFile`。因此该标记没有阻止下一次重叠 I/O 复用仍在挂起读操作中的 `OVERLAPPED`；写应答缓冲也成为同一槽位的一部分。
+
+这正是取消纪律禁止的“完成前复用”。该分支虽然属于异常等待源的防御路径，但代码已经显式承认它可发生，就不能在检测到后继续复用。
+
+### 2. 重建后用新管道句柄收割旧 I/O，其他错误还会被当作完成证明
+
+位置：`crates/mem-core/src/platform/pipe_windows.rs:249-280`、`:287-305`、`:327-335`。
+
+实际顺序如下：
+
+1. 旧管道句柄 H 上的读/写超时，`abandon_io` 将旧 `io_ov` 标为未完成；
+2. `recreate` 关闭 H 和旧事件，再创建新句柄 H2 并覆盖 `self.handle` / `self.event`；
+3. 下一次服务在 `quiesce_io_slot` 中调用 `drain_slot_bounded(self.handle, self.io_ov)`，实际组合是 **H2 + 旧 H 的 OVERLAPPED**；
+4. `drain_slot_bounded` 只把 `ERROR_IO_INCOMPLETE` 视为未完成，其他错误一律返回 `true`，随后清除 `io_outstanding` 并复用槽位。
+
+微软对 [GetOverlappedResult](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult) 的要求是：`hFile` 必须为启动该重叠操作时使用的同一句柄。H2 不能提供旧 H 上操作的结果；参数错误或句柄错误也不是旧 I/O 已完成/已取消的证明。当前“除 INCOMPLETE 外均算终态”的判定会把这些错误变成复用许可。Drop 在未确认槽位上同样使用当前句柄，因而不能修复该问题。
+
+新增故障注入 `quiesce_leaks_slot_when_abandoned_io_still_incomplete` 在任何 recreate 之前直接调用 `quiesce_io_slot`，此时 `self.handle` 仍是原句柄，没有覆盖上述真实顺序；现有测试也没有覆盖“读结果 INCOMPLETE 后不得 WriteFile”。所以全绿不能关闭这两项内存生命周期风险。
+
+**修复门槛**：检测到读 I/O 仍未完成时不得继续写应答或复用该槽位。每个未确认操作必须保留能合法取得其完成结果的原管道句柄及完成上下文，直到确认终态；不能用新实例句柄代替。只有确认完成后才可释放或复用 `OVERLAPPED`、事件和缓冲区。回归须覆盖真实的 `abandon → recreate → 迟到完成/再次收割` 顺序，以及读结果 INCOMPLETE 后不发起写入；不能只在 recreate 前手工设置 `OVERLAPPED.Internal`。
+
+## B2 部分修复：`find` 最终复核丢弃只读兼容缺项，仍返回 indexed
+
+位置：`crates/mem-core/src/find.rs:501-531`，`crates/mem-index/src/proved.rs:104-122`、`:129-225`。
+
+已确认修复的部分：`query_all` / `query_by_type` / `neighbors` 已在收集行之后、返回之前重读磁盘配置；CLI brief 的无视图快路径会因查询失败转直读，不兼容缺项最终会被拒绝。新增既有只读句柄回归也验证了三类查询对不兼容缺项的拒绝。
+
+但统一检索入口仍有以下序列：
+
+1. `open_proved` 构造时磁盘兼容，取得索引句柄；
+2. 另一进程登记一个**声明为只读兼容**、当前构建不支持的特性；
+3. `find::execute` 通过 `candidates` / `bad_records` 完成 indexed 查询；这两个直接 SQL 查询本身没有返回边界复核；
+4. 最终复核执行 `store.read_compatible_missing_features()?`，但只传播 `Err`，把表示只读兼容缺项的 `Ok(non_empty)` 直接丢弃；
+5. 原 `result` 原样返回，仍可为 indexed。
+
+契约要求“只读兼容但需要降级时走真相层直读并重新核验”（`docs/develop/embedded-downstream-contract-design.md:107-109`），不是允许继续使用索引。当前构建的只读兼容特性表为空，所以现有真实特性样本只能覆盖拒绝分支，不能覆盖此降级分支；但本分支正在实现这项前向兼容契约，空表不能作为保留该结构缺口的理由。
+
+**修复门槛**：`find::execute` 的最终返回边界必须检查缺项列表；若结果使用索引且列表非空，应放弃该结果并重跑直读，直读结果再按既有规则复核。也可让索引预取在返回边界拒绝任何缺项以触发现有直读兜底，但最终复核仍不能忽略 `Ok(non_empty)`。补受控能力表与交错回归，验证登记落在证明构造之后、最终返回之前时 CLI/MCP 统一检索不返回 indexed。
+
+## 重审验证
+
+在 HEAD `b16214d` 上实际执行：
+
+- `cargo check --workspace --all-targets`：通过，未报告编译警告；
+- `cargo test --workspace`：全部通过，包括 56 项 mem-core 单元测试、13 项 `index_paths`、14 项 CLI 测试及全部新增回归；
+- `git diff --check origin/main...HEAD`：通过。
+
+上述结果仅说明现有测试面全绿。B1 的“读 INCOMPLETE 后继续写”和“recreate 后以新句柄收割旧 I/O”、B2 的只读兼容缺项降级均未被现有回归覆盖。本轮重审未修改产品代码或测试，结论来自所引代码路径与 Win32 API 约束的静态核验。
+
+# 第二轮阻断处置记录（2026-11-24）
+
+## B1 处置（提交 `cb5e442`）
+
+按两项阻断点重写为**暂停-收割模型**：①读收割返回 `ERROR_IO_INCOMPLETE` 时不再落入写应答——请求是否读出不可确认，直接走放弃纪律（取消 + 原句柄有界排干），确认终态才重建，绝不复用该槽位构造应答；②放弃未确认完成时**保留原句柄并暂停服务**（`io_outstanding` 标记 + 下一轮入口对同一仍存活句柄再排干），排干与收割永远对准提交该 I/O 的句柄——重建只发生在确认终态之后，新旧句柄错配不复存在；③终态判定收紧：仅成功或 `ERROR_OPERATION_ABORTED` 算完成证明，其余错误一律按未完成处理（保守走暂停/泄漏终点）；④Drop 终点保留「泄漏整槽连同句柄给进程生命周期」并以进程级计数登记。注释中的所有权纪律一节同步改写。
+
+回归覆盖：①`read_reap_incomplete_never_reuses_slot_for_reply`——按实例注入强制读收割 INCOMPLETE（debug 专用字段，进程级标志曾造成并行串扰已改），断言被放弃实例上无应答写出、新实例恢复应答；②`unconfirmed_io_pauses_service_on_same_handle_until_confirmed`——注入未完成态，断言暂停轮返回 false、句柄不变、人工确认终态后入口排干通过、恢复服务且零泄漏；③`drop_leaks_slot_when_completion_still_pending`——Drop 注入未完成态，断言整槽连同句柄泄漏并计数；④既有行为回归（跨重建循环、沉默读放弃、写侧放弃、挂起连接 Drop）全部保留，测试驱动改写为「边驱动边以 channel 等客户端」（修复了驱动器把放弃重建误当已服务、客户端无超时读挂死测试进程的装置缺陷）。
+
+## B2 处置（提交 `1d59c25`）
+
+`find::execute` 最终复核不再丢弃 `Ok(non-empty)`：只读兼容缺项出现在返回边界时，**整趟改走真相层直读**并返回带缺项标识的直读结果（`FindParams` 加 `Clone` 以支持复核后重执行）。受控能力表：`Store::read_compatible_features()` 增加 **debug 构建专用**覆盖入口 `set_read_compatible_features_for_test`（发布构建恒为声明值，符号不存在），专用测试二进制 `find_read_compatible_fallback.rs`（进程隔离，避免并行串扰）覆盖前向兼容路径：索引句柄存活期间登记只读兼容特性 → 基线 indexed → 登记后同一句柄查询降级直读、reason 含缺项标识、命中与纯直读逐 ID 等价 → 再登记不兼容特性仍结构化拒绝。回归有效性已验证：撤除修复后该测试变红。
+
+## 验证（修复后 HEAD）
+
+- `cargo check --workspace --all-targets`：0 警告 0 错误。
+- `cargo test --workspace`：全量通过（Windows 开发机；含新增 4 项回归与既有全部测试面；pipe 测试并行与串行各三轮全绿）。
+- `git diff --check`：通过。
+- CI 双平台复验：随本次推送执行，结果登记于嵌入式契约设计文档日志。
