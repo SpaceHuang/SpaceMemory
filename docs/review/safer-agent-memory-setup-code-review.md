@@ -5,7 +5,7 @@
 - 差异基线：`origin/main` `a82ab5ffb37e8eb3adc93fc7720901ae8db59e12`（24 个提交）
 - 重点范围：嵌入式下游兼容契约、写许可与事件恢复、索引物化及证明、Windows RDC/命名管道、CLI/MCP 读取路径
 - 结论：**存在 2 项阻断，不建议按当前状态合并或发布。**
-- 最新重审：HEAD `b16214d` 的 B1 仍未关闭，B2 仅部分修复；**仍有阻断，不建议按当前状态合并或发布。**详见文末重审记录。
+- 最新重审：HEAD `9f22754` 的 B1/B2 均已关闭，**本轮未发现阻断**。详见文末第四轮重审记录。
 
 ## B1 · 排干超时后仍释放挂起 I/O 的缓冲区，重新引入访问违例风险
 
@@ -166,3 +166,84 @@ CLI `brief` 也存在对应的实际竞态：`open_proved` 和 `scan_ledgers` �
 - `cargo test --workspace`：全量通过（Windows 开发机；含新增 4 项回归与既有全部测试面；pipe 测试并行与串行各三轮全绿）。
 - `git diff --check`：通过。
 - CI 双平台复验：随本次推送执行，结果登记于嵌入式契约设计文档日志。
+
+---
+
+# 第三轮重审记录（2026-11-24）
+
+- 评审对象：HEAD `42b1cb1`，复核修复提交 `cb5e442`（B1）与 `1d59c25`（B2）。
+- 结论：**B2 已关闭；B1 的服务中暂停/收割路径已修复，但 Drop 的“泄漏整槽”仍会释放原字段，保留 1 项阻断。**
+
+## 已确认修复
+
+B1 的两项服务中路径已按上轮门槛修改：入口在未确认 I/O 上保留并使用原句柄排干，未确认则直接返回，不重建、不换槽（`crates/mem-core/src/platform/pipe_windows.rs:162-175`）；读收割为 `ERROR_IO_INCOMPLETE` 时转入放弃流程，不再落入 `WriteFile`（`pipe_windows.rs:216-255`）。终态判定也不再接受任意错误作为完成证明。
+
+B2 的最终复核现在显式处理 `Ok(non_empty)`：发现只读兼容缺项后以带缺项标识的 Direct 模式重跑真相层查询，不再返回 indexed 结果（`crates/mem-core/src/find.rs:531-546`）。新增独立测试二进制通过 debug 专用能力表构造只读兼容特性，验证既有索引句柄降级、结果与直读等价及不兼容特性拒绝；本轮实际运行通过。
+
+## B1 剩余阻断：`ptr::read + forget` 没有阻止原 Box/Vec 字段析构
+
+位置：`crates/mem-core/src/platform/pipe_windows.rs:318-360`，测试见 `pipe_windows.rs:620-639`。
+
+Drop 在未确认连接或读/写完成时采用以下形式：
+
+```rust
+let io_ov = std::ptr::read(&self.io_ov);
+std::mem::forget(io_ov);
+```
+
+[std::ptr::read](https://doc.rust-lang.org/std/ptr/fn.read.html) 的语义是读取一个按位副本且**保持源位置不变**，不是从 `self` 移出字段。[std::mem::forget](https://doc.rust-lang.org/std/mem/fn.forget.html) 只遗忘作为参数传入的那个副本，不会遗忘仍留在 `self.connect_ov`、`self.io_ov`、`self.io_buf`、`self.io_reply` 中的原所有者。
+
+`PipeServer` 实现了 `Drop`，但 Rust 会在其 `Drop::drop` 方法返回后继续自动析构各字段。因此当前顺序实际是：
+
+1. 复制 Box/Vec 的所有权位形并遗忘副本；
+2. `leaked_slot = true` 只跳过 `CloseHandle`，并不禁止字段析构；
+3. `Drop::drop` 返回，原 Box/Vec 字段自动析构并释放 `OVERLAPPED` 与读写缓冲区；
+4. 尚未完成的 `ConnectNamedPipe` / `ReadFile` / `WriteFile` 仍可能访问这些已释放地址。
+
+所以这里不是“整槽连同句柄泄漏”，而是“句柄泄漏、内存仍释放”，原 B1 的释放后使用风险在 Drop 终点依旧存在。`drop_leaks_slot_when_completion_still_pending` 只断言自定义原子计数加一；该计数在字段真正析构之前更新，且注入的伪 `OVERLAPPED` 没有真实迟到写入，因此测试全绿不能证明存储仍存活。
+
+**修复门槛**：真正移出并遗忘原所有者，或用 `ManuallyDrop` 等结构禁止原字段自动析构；若用替换/取出方式，必须确保留在 `self` 中、随后自动析构的是不再拥有这些分配的替代值。连接与读/写槽均须覆盖，并继续保持句柄和事件有效。回归应直接验证原所有者没有析构，而不是只检查手工计数；同时保留未确认完成时有界返回及确认完成后正常释放的行为。
+
+## 第三轮验证
+
+在 HEAD `42b1cb1` 上实际执行：
+
+- `cargo check --workspace --all-targets`：通过，未报告编译警告；
+- `cargo test --workspace`：全部通过，包括 58 项 mem-core 单元测试及新增 `find_read_compatible_fallback`；
+- `git diff --check origin/main...HEAD`：通过。
+
+本轮未修改产品代码或测试。剩余阻断由 Rust 所有权/析构语义与所引 Drop 实现直接确定；现有全绿结果未覆盖原字段是否实际泄漏。
+
+---
+
+# 第四轮重审记录（2026-11-24）
+
+- 评审对象：HEAD `9f22754`，复核第三轮 B1 修复提交 `9f22754`。
+- 结论：**B1/B2 均已关闭，本轮未发现阻断。**
+
+## B1 关闭确认
+
+`connect_ov`、`io_ov`、`io_buf`、`io_reply` 已改为 `ManuallyDrop` 字段（`crates/mem-core/src/platform/pipe_windows.rs:62-88`）。Drop 开始即通过 `ManuallyDrop::take` 将四份原所有者从 `self` 移出，之后由局部所有者显式处置（`pipe_windows.rs:330-343`）：
+
+- 连接或读/写操作已确认终态：对应 Box/Vec 被显式 `drop`，正常释放；
+- 操作仍未确认完成：已移出的 Box/Vec 被 `forget`，不再存在会于 `Drop::drop` 返回后自动释放同一分配的原字段；
+- 任一组槽位泄漏时，管道句柄与事件也保持有效，不执行关闭；其他已终态槽位仍正常释放。
+
+因此第三轮“只遗忘副本、原字段仍析构”的问题已消除，连接与读/写路径均满足每份存储恰好显式处置一次。既有暂停/原句柄收割、读 INCOMPLETE 不写应答、正常重建及 B2 降级代码未出现回退。增强后的 Drop 回归还会在 drop 后读取事前保存的 OVERLAPPED 地址，本轮实际运行通过。
+
+## 第四轮验证
+
+在 HEAD `9f22754` 上实际执行：
+
+- `cargo check --workspace --all-targets`：通过，未报告编译警告；
+- `cargo test --workspace`：全部通过，包括 58 项 mem-core 单元测试及既有 B1/B2 回归；
+- `cargo check --workspace --release`：通过；
+- `git diff --check origin/main...HEAD`：通过。
+
+验证环境为本机 Windows。迟到完成仍由故障注入构造，未另行制造真实内核确定性迟到；关闭结论同时基于 `ManuallyDrop` 的所有权与析构语义核验。本轮未修改产品代码或测试，仅更新评审记录。
+
+# 第四轮重审确认（2026-11-24，评审记录更新）
+
+重审结论：**B1/B2 均已关闭，未发现阻断。** B1 确认要点：槽位字段 `ManuallyDrop` 化，`Drop` 入口 `take` 移出原所有者；确认终态的槽位显式释放，未确认的槽位真正泄漏且原字段不会再次自动析构；泄漏时句柄与事件保持有效；正常路径、暂停收割、读 INCOMPLETE 分支均无回退；B2 只读兼容降级直读保持有效。验证：`cargo check --workspace --all-targets`、`cargo test --workspace`、`cargo check --workspace --release`、`git diff --check` 全部通过。
+
+CI 复验矩阵（提交 `9f22754`，含第三轮修复）：最终 run 45510914421 **双平台全绿**（windows-latest 3m6s / macos-latest 3m9s，含 release 消费者示例检查——cfg 影子绑定修复生效）。此前两次 macos-latest 因「hosted runner 容量不足未获取」失败（job 未运行，GitHub 容量告警注记在案，属基础设施排队而非产品问题）；其间 windows-latest 单平台已先行全绿（run 45436571297，3m35s）。
