@@ -418,7 +418,14 @@ impl Store {
     }
 
     /// 当前构建声明可按真相层直读的特性。未列出的缺项必须在打开阶段拒绝。
+    /// 发布构建恒为声明值；debug 构建可被 [`set_read_compatible_features_for_test`]
+    /// 临时覆盖（仅测试构造前向兼容场景——评审 B2 要求受控能力表覆盖降级直读
+    /// 路径；覆盖不得进入发布构建，对外承诺不可绕过）。
     pub fn read_compatible_features() -> &'static [&'static str] {
+        #[cfg(debug_assertions)]
+        if let Some(leaked) = READ_COMPATIBLE_OVERRIDE.lock().unwrap().as_ref() {
+            return leaked;
+        }
         &[]
     }
 
@@ -1104,6 +1111,22 @@ impl Store {
     pub fn abs(&self, rel: impl AsRef<std::path::Path>) -> PathBuf {
         self.root.join(rel)
     }
+}
+
+/// 测试专用的只读兼容表覆盖（仅 debug 构建存在）。集成测试用它构造
+/// 「未来真实特性被声明只读兼容」的前向兼容场景（评审 B2 要求受控能力表
+/// 覆盖降级直读路径）。表内容按调用泄漏为 'static——每次设置生效至进程
+/// 结束，各集成测试二进制进程隔离，互不可见。
+#[cfg(debug_assertions)]
+static READ_COMPATIBLE_OVERRIDE: std::sync::Mutex<Option<&'static [&'static str]>> =
+    std::sync::Mutex::new(None);
+
+/// 设置只读兼容覆盖表（仅 debug 构建暴露：集成测试经 dev profile 可见，
+/// `--release` 构建不存在该符号——与既有 debug-only fixture 纪律一致）。
+#[cfg(debug_assertions)]
+pub fn set_read_compatible_features_for_test(features: &'static [&'static str]) {
+    let leaked: &'static [&'static str] = Box::leak(features.to_vec().into_boxed_slice());
+    *READ_COMPATIBLE_OVERRIDE.lock().unwrap() = Some(leaked);
 }
 
 /// 磁盘兼容复核的无句柄形态（评审 B2）：索引等长活对象在**查询返回边界**

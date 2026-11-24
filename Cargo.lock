@@ -675,6 +675,7 @@ name = "mem-core"
 version = "1.0.0"
 dependencies = [
  "libc",
+ "mem-index",
  "mem-schema",
  "serde",
  "serde_json",

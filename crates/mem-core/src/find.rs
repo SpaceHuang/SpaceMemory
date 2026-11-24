@@ -481,6 +481,7 @@ pub struct FindOutcome {
 
 /// 执行参数。不变量：`prefilter` 为 Some 时 `mode` 必为 Indexed（两前端经
 /// open_proved 组装——拿到句柄即已证明，mode 是同一构造的产物）。
+#[derive(Clone)]
 pub struct FindParams<'a> {
     pub store: &'a Store,
     pub types: &'a TypeSet,
@@ -516,18 +517,32 @@ pub fn execute(params: FindParams) -> MemResult<FindOutcome> {
                     // 放弃本次 indexed 应答、回退 direct 全量应答——reason 携带真实
                     // 错误；不得把失败转为空命中或空告警（红线8/决策⑦）。
                     let fallback_mode = ReadMode::Direct { reason };
-                    run_direct(params, pq.as_ref(), &resolved, fallback_mode)
+                    run_direct(params.clone(), pq.as_ref(), &resolved, fallback_mode)
                 }
             }
         } else {
             let mode = params.mode.clone();
-            run_direct(params, pq.as_ref(), &resolved, mode)
+            run_direct(params.clone(), pq.as_ref(), &resolved, mode)
         }
     } else {
         let mode = params.mode.clone();
-        run_direct(params, pq.as_ref(), &resolved, mode)
+        run_direct(params.clone(), pq.as_ref(), &resolved, mode)
     };
-    store.read_compatible_missing_features()?;
+    // 最终复核（返回边界，评审 B2 前向兼容路径）：不兼容缺项 → 结构化拒绝；
+    // **只读兼容缺项出现时同样不得返回 indexed 结果**——整趟改走真相层直读
+    //（复制 open_proved 构造期复核的降级语义到返回边界，不能只拒绝不降级）。
+    match store.read_compatible_missing_features() {
+        Err(e) => return Err(e),
+        Ok(missing) if !missing.is_empty() => {
+            let fallback_mode = ReadMode::Direct {
+                reason: format!(
+                    "返回读取前出现只读兼容特性 {missing:?}——放弃 indexed 应答，整趟改走真相层直读"
+                ),
+            };
+            return run_direct(params.clone(), pq.as_ref(), &resolved, fallback_mode);
+        }
+        Ok(_) => {}
+    }
     result
 }
 
