@@ -68,13 +68,17 @@ pub struct PipeServer {
     /// 曾以栈局部承载挂起的异步 ConnectNamedPipe，create 返回即释放栈帧，而内核
     /// 在客户端真正连上时（任意未来时刻）仍写该结构 → 踩已释放栈（0xC0000005，
     /// CI runner 实测崩溃）。
-    connect_ov: Box<OVERLAPPED>,
+    /// 槽位字段全部 `ManuallyDrop`：正常 Drop 路径显式 `take` 后释放；泄漏
+    /// 终点 `take` 后 `forget`——`ptr::read+forget` 复制值的写法不能阻止
+    /// `Drop::drop` 返回后对原字段的自动析构（第三轮评审 B1：句柄泄漏、
+    /// 内存照放），`ManuallyDrop` 才真正把析构权收进句柄自己的手里。
+    connect_ov: std::mem::ManuallyDrop<Box<OVERLAPPED>>,
     /// 读/写共享的 I/O 槽（操作串行）：OVERLAPPED、读缓冲、写应答缓冲全部由
     /// 句柄持有。放弃后未确认完成的操作仍被内核引用——槽位与句柄保持存活，
     /// 服务暂停至下一轮入口排干确认。
-    io_ov: Box<OVERLAPPED>,
-    io_buf: Box<[u8; 256]>,
-    io_reply: Vec<u8>,
+    io_ov: std::mem::ManuallyDrop<Box<OVERLAPPED>>,
+    io_buf: std::mem::ManuallyDrop<Box<[u8; 256]>>,
+    io_reply: std::mem::ManuallyDrop<Vec<u8>>,
     /// 读/写槽存在放弃后未确认完成的 I/O（服务暂停，入口排干后才可复用）。
     io_outstanding: bool,
     /// 仅测试注入（debug 构建）：强制本实例的读收割走 INCOMPLETE 分支，
@@ -121,10 +125,15 @@ impl PipeServer {
             event,
             name: name.to_string(),
             pending_connect: false,
-            connect_ov: Box::new(unsafe { std::mem::zeroed() }),
-            io_ov: Box::new(unsafe { std::mem::zeroed() }),
-            io_buf: Box::new([0u8; 256]),
-            io_reply: Vec::new(),
+            // 零初始化的是内层 OVERLAPPED（FFI 合法），不是 Box 指针本身。
+            connect_ov: std::mem::ManuallyDrop::new(Box::new(unsafe {
+                std::mem::zeroed::<OVERLAPPED>()
+            })),
+            io_ov: std::mem::ManuallyDrop::new(Box::new(unsafe {
+                std::mem::zeroed::<OVERLAPPED>()
+            })),
+            io_buf: std::mem::ManuallyDrop::new(Box::new([0u8; 256])),
+            io_reply: std::mem::ManuallyDrop::new(Vec::new()),
             io_outstanding: false,
             #[cfg(debug_assertions)]
             force_read_reap_incomplete: false,
@@ -139,7 +148,7 @@ impl PipeServer {
     /// 前提：连接槽已收割（首次创建或上一连接已完成）。
     fn submit_connect(&mut self) -> bool {
         unsafe {
-            *self.connect_ov = std::mem::zeroed();
+            **self.connect_ov = std::mem::zeroed::<OVERLAPPED>();
             self.connect_ov.hEvent = self.event;
             let rc = ConnectNamedPipe(self.handle, self.connect_ov.as_mut());
             let pending =
@@ -214,14 +223,17 @@ impl PipeServer {
                 return self.recreate();
             }
             let mut got = 0u32;
-            let mut okr = GetOverlappedResult(self.handle, self.io_ov.as_mut(), &mut got, 0);
-            let mut reap_err = last_err();
+            let okr = GetOverlappedResult(self.handle, self.io_ov.as_mut(), &mut got, 0);
+            let reap_err = last_err();
+            // 测试注入（仅 debug 构建存在该影子绑定）：把收割结果伪装成未完成
+            //（评审 B1-1 回归入口）。cfg 影子让 mut 只存在于 debug——release
+            // 构建的 -D warnings 不会因无谓 mut 报错。
             #[cfg(debug_assertions)]
-            if self.force_read_reap_incomplete {
-                // 测试注入：把收割结果伪装成未完成（评审 B1-1 回归入口）。
-                okr = 0;
-                reap_err = ERROR_IO_INCOMPLETE;
-            }
+            let (okr, reap_err) = if self.force_read_reap_incomplete {
+                (0, ERROR_IO_INCOMPLETE)
+            } else {
+                (okr, reap_err)
+            };
             if okr == 0 && reap_err == ERROR_IO_INCOMPLETE {
                 // 完成投递异常：请求是否读出不可确认——**绝不复用该槽位写应答**
                 //（评审 B1-1）。放弃并按放弃纪律处理；放弃在原句柄上执行。
@@ -235,7 +247,7 @@ impl PipeServer {
             }
             // 只在请求已读完后构造应答，避免使用接受连接前的旧新鲜度快照。
             // 应答复制进句柄持有的缓冲：写挂起被放弃时内核仍可能读取它。
-            self.io_reply = make_reply();
+            *self.io_reply = make_reply();
             // 写应答（重叠 I/O）。
             ResetEvent(self.event);
             let mut written = 0u32;
@@ -317,33 +329,58 @@ impl PipeServer {
 
 impl Drop for PipeServer {
     fn drop(&mut self) {
+        // 先把全部槽位所有权从 self 中取出（ManuallyDrop::take）：此后这些
+        // 字段不再参与任何自动析构——「正常释放」与「泄漏」都在这里显式处置，
+        // 每份存储恰好处置一次（绝不出现句柄泄漏而内存照放的组合）。
+        // take 是 unsafe（它放弃析构保证）——此处恰是放弃保证的使用现场。
+        let (mut connect_ov, mut io_ov, io_buf, io_reply) = unsafe {
+            (
+                std::mem::ManuallyDrop::take(&mut self.connect_ov),
+                std::mem::ManuallyDrop::take(&mut self.io_ov),
+                std::mem::ManuallyDrop::take(&mut self.io_buf),
+                std::mem::ManuallyDrop::take(&mut self.io_reply),
+            )
+        };
         let mut leaked_slot = false;
         unsafe {
+            // ---- 连接槽：恰好处置一次（终态 → 释放；未确认 → 泄漏）----
+            let connect_terminal;
             if self.pending_connect && is_valid_handle(self.handle) {
                 // 连接仍挂起：取消并**有界**等待完成投递；未到达终态 →
                 // 连接槽泄漏给进程生命周期（迟到完成写入的仍是有效内存），
                 // 严禁在完成前释放。
-                CancelIoEx(self.handle, self.connect_ov.as_ref());
-                WaitForSingleObject(self.connect_ov.hEvent, IO_DRAIN_TIMEOUT_MS);
+                CancelIoEx(self.handle, connect_ov.as_ref());
+                WaitForSingleObject(connect_ov.hEvent, IO_DRAIN_TIMEOUT_MS);
                 let mut ignored = 0u32;
-                let ok =
-                    GetOverlappedResult(self.handle, self.connect_ov.as_mut(), &mut ignored, 0);
-                if !(ok != 0 || last_err() == ERROR_OPERATION_ABORTED) {
-                    let connect_ov = std::ptr::read(&self.connect_ov);
+                let ok = GetOverlappedResult(self.handle, connect_ov.as_mut(), &mut ignored, 0);
+                connect_terminal = ok != 0 || last_err() == ERROR_OPERATION_ABORTED;
+                if connect_terminal {
+                    drop(connect_ov);
+                } else {
                     std::mem::forget(connect_ov);
                     leaked_slot = true;
                 }
+            } else {
+                drop(connect_ov);
             }
+            // ---- 读/写槽：恰好处置一次 ----
+            let io_terminal;
             if self.io_outstanding && is_valid_handle(self.handle) {
-                if !Self::drain_slot_bounded(self.handle, self.io_ov.as_mut()) {
-                    let io_ov = std::ptr::read(&self.io_ov);
+                io_terminal = Self::drain_slot_bounded(self.handle, io_ov.as_mut());
+                if io_terminal {
+                    drop(io_ov);
+                    drop(io_buf);
+                    drop(io_reply);
+                } else {
                     std::mem::forget(io_ov);
-                    let io_buf = std::ptr::read(&self.io_buf);
                     std::mem::forget(io_buf);
-                    let io_reply = std::ptr::read(&self.io_reply);
                     std::mem::forget(io_reply);
                     leaked_slot = true;
                 }
+            } else {
+                drop(io_ov);
+                drop(io_buf);
+                drop(io_reply);
             }
             if leaked_slot {
                 // 句柄也随槽泄漏：关闭句柄会在完成投递前撤销内核仍引用的对象。
@@ -557,7 +594,7 @@ mod pipe_tests {
         let mut server = PipeServer::create(&name).unwrap();
         server.io_outstanding = true;
         unsafe {
-            *server.io_ov = std::mem::zeroed();
+            **server.io_ov = std::mem::zeroed::<OVERLAPPED>();
             // hEvent 置 NULL：等待立即以 WAIT_FAILED 返回（不真实的完成事件
             // 源正是该防御分支针对的异常场景），排干走非阻塞读取。
             server.io_ov.Internal = STATUS_PENDING;
@@ -571,7 +608,7 @@ mod pipe_tests {
         assert!(server.io_outstanding, "暂停态保持未确认标记");
         // 人工确认完成（终态）：下一轮入口排干通过 → 重建 → 服务恢复。
         unsafe {
-            *server.io_ov = std::mem::zeroed();
+            **server.io_ov = std::mem::zeroed::<OVERLAPPED>();
         }
         let got = drive_exchange(&mut server, &name, b"ping", b"pong", 5);
         assert_eq!(got.as_deref(), Some(&b"pong"[..]), "确认后服务必须恢复");
@@ -621,20 +658,29 @@ mod pipe_tests {
     fn drop_leaks_slot_when_completion_still_pending() {
         // 故障注入（B1 终点）：Drop 时取消完成仍未投递——整槽连同句柄泄漏给
         // 进程生命周期（迟到完成写入的仍是有效内存），并以进程级计数登记。
+        // 析构验证（第三轮评审 B1）：drop 后经事前保存的裸指针读取 OVERLAPPED
+        // ——字段必须仍存活且值稳定（释放后的 debug 堆会毒化填充，值改变或
+        // 崩溃即暴露「句柄泄漏而内存照放」）。
         const STATUS_PENDING: usize = 0x103;
         let before = DROPPED_LEAKED_SLOTS.load(Ordering::Relaxed);
         let name = unique_pipe_name();
         let mut server = PipeServer::create(&name).unwrap();
         server.io_outstanding = true;
         unsafe {
-            *server.io_ov = std::mem::zeroed();
+            **server.io_ov = std::mem::zeroed::<OVERLAPPED>();
             server.io_ov.Internal = STATUS_PENDING;
         }
+        let ov_ptr: *const OVERLAPPED = &**server.io_ov;
         drop(server);
         assert_eq!(
             DROPPED_LEAKED_SLOTS.load(Ordering::Relaxed),
             before + 1,
             "未确认完成的槽在 Drop 必须泄漏而非释放"
+        );
+        let internal = unsafe { (*ov_ptr).Internal };
+        assert_eq!(
+            internal as usize, STATUS_PENDING,
+            "泄漏槽位的 OVERLAPPED 必须仍然有效且未被析构"
         );
     }
 }
