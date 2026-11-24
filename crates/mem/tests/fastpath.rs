@@ -116,8 +116,13 @@ fn fastpath_end_to_end_via_production_binary() {
     // 探测轮询：sidecar 命名管道就绪需要时间——索引文件已物化 ≠ 握手可答
     //（基线曾出现"首次 probe=None 而紧随的 CLI list 已 indexed"的时序抖动）。
     // 只对"握手尚未应答"（None）轮询；应答即采纳（backend=none 的机器不被拖慢）。
+    // 预算 10s：2s 只够开发机，GitHub Windows runner 冷启动握手曾超过它
+    //（run 45307257493）；sidecar 提前退出则立即失败并携带退出状态。
     let mut backend_probe = None;
-    for _ in 0..20 {
+    for _ in 0..100 {
+        if let Ok(Some(status)) = serve.try_wait() {
+            panic!("sidecar 提前退出（status={status:?}），握手无从应答");
+        }
         match mem_core::sidecar::probe(&store) {
             Some(h) => {
                 backend_probe = Some(h);
@@ -127,7 +132,7 @@ fn fastpath_end_to_end_via_production_binary() {
         }
     }
     let backend_probe =
-        backend_probe.expect("sidecar 在场（索引已物化）——握手 2s 内必应答（idle 20s 内不会自退）");
+        backend_probe.expect("sidecar 10s 内未应答握手（进程存活，idle 20s 不会自退）");
     let subscribed = matches!(backend_probe.backend.as_str(), "usn" | "rdc");
     let out = mem()
         .args(["--store", &s, "list", "--type", "task"])
@@ -155,7 +160,8 @@ fn fastpath_end_to_end_via_production_binary() {
         // r11：单次 find 可能撞上 WAL 提交锁 → 直读兜底（正确行为）；仅在有
         // 查询时点证明的订阅上轮询 indexed。
         let mut fv = None;
-        for _ in 0..10 {
+        // 20 次：慢 runner 上每次 CLI 调用本身要数百毫秒，10 次预算曾偏紧。
+        for _ in 0..20 {
             let o = mem().args(["--store", &s, "find", "t1"]).output().unwrap();
             let v = j(&o);
             if v["read_mode"]
@@ -168,7 +174,7 @@ fn fastpath_end_to_end_via_production_binary() {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        let fv = fv.expect("有查询时点证明的订阅应进入 indexed 快路径");
+        let fv = fv.expect("有查询时点证明的订阅应在 20 次内进入 indexed 快路径");
         assert!(
             fv["read_mode"]["indexed"].is_object(),
             "find 走 FTS 快路径：{fv}"
